@@ -1,7 +1,7 @@
 use crate::{PixiPypiSource, PixiPypiSpec, VersionOrStar};
 use itertools::Itertools;
 use pep508_rs::{ExtraName, MarkerTree};
-use pixi_spec::{GitReference, GitSpec, SubdirectoryError};
+use pixi_spec::{GitReference, GitSpec, SubdirectoryError, Verbatim};
 use pixi_toml::{TomlFromStr, TomlWith};
 use std::fmt::Display;
 use std::path::PathBuf;
@@ -63,7 +63,7 @@ struct RawPyPiRequirement {
     marker: MarkerTree,
 
     // Path Only
-    pub path: Option<PathBuf>,
+    pub path: Option<Verbatim<PathBuf>>,
     pub editable: Option<bool>,
 
     // Git only
@@ -73,7 +73,7 @@ struct RawPyPiRequirement {
     pub rev: Option<String>,
 
     // Url only
-    pub url: Option<Url>,
+    pub url: Option<Verbatim<Url>>,
 
     // Git and Url only
     pub subdirectory: Option<String>,
@@ -189,8 +189,8 @@ impl<'de> toml_span::Deserialize<'de> for RawPyPiRequirement {
             .unwrap_or_default();
 
         let path = th
-            .optional::<TomlFromStr<_>>("path")
-            .map(TomlFromStr::into_inner);
+            .optional::<String>("path")
+            .map(|path| Verbatim::new_with_given(PathBuf::from_str(&path).unwrap(), path));
         let editable = th.optional("editable");
 
         let git = th

@@ -11,7 +11,7 @@ use std::{
 
 use pep440_rs::VersionSpecifiers;
 use pep508_rs::{ExtraName, MarkerTree};
-use pixi_spec::{GitSpec, Subdirectory};
+use pixi_spec::{GitSpec, Subdirectory, Verbatim};
 use serde::Serialize;
 use thiserror::Error;
 use url::Url;
@@ -42,8 +42,7 @@ pub enum PixiPypiSource {
     },
     /// From a local file system path (directory or file).
     Path {
-        path: PathBuf,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Verbatim<PathBuf>,
         editable: Option<bool>,
     },
     /// From a direct URL to a package archive.

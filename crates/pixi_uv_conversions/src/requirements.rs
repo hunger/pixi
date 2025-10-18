@@ -157,17 +157,19 @@ pub fn as_uv_req(
             }
         }
         PixiPypiSource::Path { path, editable } => {
-            let joined = project_root.join(path);
+            let joined = project_root.join(path.inner());
             let canonicalized =
                 dunce::canonicalize(&joined).map_err(|e| AsPep508Error::CanonicalizeError {
                     source: e,
                     path: joined.clone(),
                 })?;
-            let given = path
-                .to_str()
-                .map(|s| s.to_owned())
-                .unwrap_or_else(String::new);
-            let verbatim = VerbatimUrl::from_path(path, project_root)?.with_given(given);
+            let verbatim = {
+                let mut tmp = VerbatimUrl::from_path(path.inner(), project_root)?;
+                if let Some(g) = path.given() {
+                    tmp = tmp.with_given(g)
+                }
+                tmp
+            };
 
             if canonicalized.is_dir() {
                 RequirementSource::Directory {
@@ -180,7 +182,7 @@ pub fn as_uv_req(
                     editable: Some(false),
                     url: verbatim,
                     // TODO: we could see if we ever need this
-                    // AFAICS it would be useful for constrainging dependencies
+                    // AFAICS it would be useful for constraining dependencies
                     r#virtual: Some(false),
                 }
             } else if *editable == Some(true) {
@@ -193,16 +195,22 @@ pub fn as_uv_req(
                 RequirementSource::Path {
                     install_path: canonicalized.into_boxed_path(),
                     url: verbatim,
-                    ext: DistExtension::from_path(path)?,
+                    ext: DistExtension::from_path(path.inner())?,
                 }
             }
         }
         PixiPypiSource::Url { url, subdirectory } => {
             // We will clone the original URL and strip it's SHA256 fragment,
             // So that we can normalize the URL for comparison.
-            let mut location_url = url.clone();
+            let mut location_url = url.inner().clone();
             location_url.set_fragment(None);
-            let verbatim_url = VerbatimUrl::from_url(url.clone().into());
+            let verbatim_url = {
+                let mut tmp = VerbatimUrl::from_url(url.inner().clone().into());
+                if let Some(g) = url.given() {
+                    tmp = tmp.with_given(g);
+                }
+                tmp
+            };
 
             RequirementSource::Url {
                 subdirectory: if subdirectory.is_empty() {
