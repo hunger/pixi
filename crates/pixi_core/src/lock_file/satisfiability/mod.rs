@@ -58,7 +58,7 @@ use uv_pypi_types::ParsedUrlError;
 
 use super::{
     CondaPrefixUpdater, PixiRecordsByName, PypiRecordsByName,
-    outdated::EnvironmentBuildCache,
+    outdated::{BuildCacheKey, EnvironmentBuildCache},
     package_identifier::ConversionError,
     resolve::build_dispatch::{LazyBuildDispatch, UvBuildDispatchParams},
 };
@@ -397,6 +397,9 @@ pub enum PlatformUnsat {
 
     #[error("failed to read metadata for local package '{0}': {1}")]
     FailedToReadLocalMetadata(pep508_rs::PackageName, String),
+
+    #[error("failed to build metadata for local package '{0}': {1}")]
+    FailedToBuildLocalMetadata(pep508_rs::PackageName, String),
 
     #[error("local package '{0}' has dynamic {1} metadata that requires re-resolution")]
     LocalPackageHasDynamicMetadata(pep508_rs::PackageName, &'static str),
@@ -946,7 +949,7 @@ pub async fn verify_platform_satisfiability(
     uv_context: &OnceCell<UvResolutionContext>,
     project_config: &Config,
     project_env_vars: HashMap<EnvironmentName, EnvironmentVars>,
-    build_caches: &mut HashMap<EnvironmentName, EnvironmentBuildCache>,
+    build_caches: &mut HashMap<BuildCacheKey, Arc<EnvironmentBuildCache>>,
 ) -> Result<VerifiedIndividualEnvironment, Box<PlatformUnsat>> {
     // Convert the lock file into a list of conda and pypi packages
     let mut pixi_records: Vec<PixiRecord> = Vec::new();
@@ -1010,6 +1013,35 @@ pub async fn verify_platform_satisfiability(
         }
     };
 
+    // Get host platform records for building (we can only run Python on the host platform)
+    let best_platform = environment.best_platform();
+    let building_pixi_records = if platform == best_platform {
+        // Same platform, reuse the records
+        Ok(pixi_records_by_name.clone())
+    } else {
+        // Different platform - extract host platform records for building
+        let mut host_pixi_records: Vec<PixiRecord> = Vec::new();
+        let lock_best_platform = locked_environment
+            .lock_file()
+            .platform(&best_platform.to_string());
+        for package in lock_best_platform
+            .and_then(|p| locked_environment.packages(p))
+            .into_iter()
+            .flatten()
+        {
+            if let LockedPackageRef::Conda(conda) = package {
+                let url = conda.location().clone();
+                host_pixi_records.push(
+                    PixiRecord::from_conda_package_data(conda.clone(), project_root)
+                        .map_err(|e| PlatformUnsat::CorruptedEntry(url.to_string(), e))?,
+                );
+            }
+        }
+        PixiRecordsByName::from_unique_iter(host_pixi_records).map_err(|duplicate| {
+            PlatformUnsat::DuplicateEntry(duplicate.package_record().name.as_source().to_string())
+        })
+    };
+
     // Run satisfiability check - for local packages with dynamic metadata,
     // we use UV infrastructure to build metadata if available.
     verify_package_platform_satisfiability(
@@ -1023,6 +1055,7 @@ pub async fn verify_platform_satisfiability(
         project_config,
         project_env_vars,
         build_caches,
+        building_pixi_records,
     )
     .await
 }
@@ -1827,7 +1860,8 @@ pub(crate) async fn verify_package_platform_satisfiability(
     uv_context: &OnceCell<UvResolutionContext>,
     config: &Config,
     project_env_vars: HashMap<EnvironmentName, EnvironmentVars>,
-    build_caches: &mut HashMap<EnvironmentName, EnvironmentBuildCache>,
+    build_caches: &mut HashMap<BuildCacheKey, Arc<EnvironmentBuildCache>>,
+    building_pixi_records: Result<PixiRecordsByName, PlatformUnsat>,
 ) -> Result<VerifiedIndividualEnvironment, Box<PlatformUnsat>> {
     // Determine the dependencies requested by the environment
     let environment_dependencies = environment
@@ -2357,6 +2391,7 @@ pub(crate) async fn verify_package_platform_satisfiability(
                                             &project_env_vars,
                                             command_dispatcher.clone(),
                                             build_caches,
+                                            &building_pixi_records,
                                         )
                                         .await
                                         {
@@ -2379,17 +2414,17 @@ pub(crate) async fn verify_package_platform_satisfiability(
                                                 }
                                             }
                                             Err(e) => {
-                                                // Building failed - fall back to hash comparison
-                                                tracing::warn!(
-                                                    "Failed to build metadata for {}: {e}, falling back to hash comparison",
-                                                    record.name
-                                                );
-                                                if let Some(mismatch) =
-                                                    compare_source_tree_hash(&absolute_path, record)
-                                                {
-                                                    delayed_pypi_error
-                                                        .get_or_insert_with(|| Box::new(mismatch));
-                                                }
+                                                // Building failed - report as error
+                                                delayed_pypi_error.get_or_insert_with(|| {
+                                                    Box::new(
+                                                        PlatformUnsat::FailedToReadLocalMetadata(
+                                                            record.name.clone(),
+                                                            format!(
+                                                                "failed to build metadata: {e}"
+                                                            ),
+                                                        ),
+                                                    )
+                                                });
                                             }
                                         }
                                     }
@@ -2398,83 +2433,61 @@ pub(crate) async fn verify_package_platform_satisfiability(
                                     // No pyproject.toml - we cannot verify metadata statically.
                                     // Try to build metadata using UV if we're on the host platform.
                                     // For non-host platforms, we can't run binaries, so fall back to hash comparison.
-                                    let best_platform = environment.best_platform();
-                                    if platform != best_platform {
-                                        tracing::debug!(
-                                            "Package {} has no pyproject.toml - skipping build (platform {} != host {}), falling back to hash comparison",
-                                            record.name,
-                                            platform,
-                                            best_platform
-                                        );
-                                        if let Some(mismatch) =
-                                            compare_source_tree_hash(&absolute_path, record)
-                                        {
-                                            delayed_pypi_error
-                                                .get_or_insert_with(|| Box::new(mismatch));
-                                        }
-                                    } else {
-                                        tracing::debug!(
-                                            "Package {} has no pyproject.toml - building metadata with UV",
-                                            record.name
-                                        );
+                                    tracing::debug!(
+                                        "Package {} has no pyproject.toml - building metadata with UV",
+                                        record.name
+                                    );
 
-                                        let ctx = uv_context
-                                            .get_or_try_init(|| {
-                                                UvResolutionContext::from_config(config)
-                                            })
-                                            .map_err(|e| {
-                                                Box::new(PlatformUnsat::FailedToReadLocalMetadata(
-                                                    record.name.clone(),
-                                                    format!("failed to initialize UV context: {e}"),
-                                                ))
-                                            })?;
+                                    let ctx = uv_context
+                                        .get_or_try_init(|| {
+                                            UvResolutionContext::from_config(config)
+                                        })
+                                        .map_err(|e| {
+                                            Box::new(PlatformUnsat::FailedToReadLocalMetadata(
+                                                record.name.clone(),
+                                                format!("failed to initialize UV context: {e}"),
+                                            ))
+                                        })?;
 
-                                        // Build metadata using UV
-                                        match build_dynamic_metadata(
-                                            &absolute_path,
-                                            &record.name,
-                                            environment,
-                                            locked_pixi_records,
-                                            platform,
-                                            project_root,
-                                            ctx,
-                                            &project_env_vars,
-                                            command_dispatcher.clone(),
-                                            build_caches,
-                                        )
-                                        .await
-                                        {
-                                            Ok(built_metadata) => {
-                                                // Compare built metadata with locked metadata
-                                                if let Some(mismatch) =
-                                                    pypi_metadata::compare_metadata(
-                                                        record,
-                                                        &built_metadata,
+                                    // Build metadata using UV
+                                    match build_dynamic_metadata(
+                                        &absolute_path,
+                                        &record.name,
+                                        environment,
+                                        locked_pixi_records,
+                                        platform,
+                                        project_root,
+                                        ctx,
+                                        &project_env_vars,
+                                        command_dispatcher.clone(),
+                                        build_caches,
+                                        &building_pixi_records,
+                                    )
+                                    .await
+                                    {
+                                        Ok(built_metadata) => {
+                                            // Compare built metadata with locked metadata
+                                            if let Some(mismatch) = pypi_metadata::compare_metadata(
+                                                record,
+                                                &built_metadata,
+                                            ) {
+                                                delayed_pypi_error.get_or_insert_with(|| {
+                                                    Box::new(
+                                                        PlatformUnsat::LocalPackageMetadataMismatch(
+                                                            record.name.clone(),
+                                                            mismatch.into(),
+                                                        ),
                                                     )
-                                                {
-                                                    delayed_pypi_error.get_or_insert_with(|| {
-                                                        Box::new(
-                                                            PlatformUnsat::LocalPackageMetadataMismatch(
-                                                                record.name.clone(),
-                                                                mismatch.into(),
-                                                            ),
-                                                        )
-                                                    });
-                                                }
+                                                });
                                             }
-                                            Err(e) => {
-                                                // Building failed - fall back to hash comparison
-                                                tracing::warn!(
-                                                    "Failed to build metadata for {}: {e}, falling back to hash comparison",
-                                                    record.name
-                                                );
-                                                if let Some(mismatch) =
-                                                    compare_source_tree_hash(&absolute_path, record)
-                                                {
-                                                    delayed_pypi_error
-                                                        .get_or_insert_with(|| Box::new(mismatch));
-                                                }
-                                            }
+                                        }
+                                        Err(e) => {
+                                            delayed_pypi_error.get_or_insert_with(|| {
+                                                Box::new(PlatformUnsat::FailedToBuildLocalMetadata(
+                                                    record.name.clone(),
+                                                    e.to_string(),
+                                                ))
+                                            });
                                         }
                                     }
                                 }
@@ -2698,7 +2711,8 @@ async fn build_dynamic_metadata(
     uv_context: &UvResolutionContext,
     project_env_vars: &HashMap<EnvironmentName, EnvironmentVars>,
     command_dispatcher: CommandDispatcher,
-    build_caches: &mut HashMap<EnvironmentName, EnvironmentBuildCache>,
+    build_caches: &mut HashMap<BuildCacheKey, Arc<EnvironmentBuildCache>>,
+    building_pixi_records: &Result<PixiRecordsByName, PlatformUnsat>,
 ) -> Result<pypi_metadata::LocalPackageMetadata, PlatformUnsat> {
     let pypi_options = environment.pypi_options();
 
@@ -2734,9 +2748,11 @@ async fn build_dynamic_metadata(
 
     let index_strategy = to_index_strategy(pypi_options.index_strategy.as_ref());
 
-    // Get or create cache entry for this environment
-    let env_name = environment.name().clone();
-    let cache = build_caches.entry(env_name).or_default();
+    // Get or create cache entry for this environment and host platform
+    // We use best_platform() since the build prefix is shared across all target platforms
+    let best_platform = environment.best_platform();
+    let cache_key = BuildCacheKey::new(environment.name().clone(), best_platform);
+    let cache = build_caches.entry(cache_key).or_default();
 
     // Get or create index locations from cache
     let index_locations = cache
@@ -2897,12 +2913,18 @@ async fn build_dynamic_metadata(
 
     // Use cached lazy build dispatch dependencies
     let last_error = Arc::new(OnceCell::new());
+    // Use building_pixi_records (host platform) for installing Python and building,
+    // since we can only run binaries on the host platform
+    let building_records: miette::Result<Vec<PixiRecord>> = building_pixi_records
+        .as_ref()
+        .map(|r| r.records.clone())
+        .map_err(|e| miette::miette!("{}", e));
     let lazy_build_dispatch = LazyBuildDispatch::new(
         build_params,
         conda_prefix_updater,
         project_env_vars.clone(),
         environment.clone(),
-        Ok(locked_pixi_records.records.clone()),
+        building_records,
         pypi_options.no_build_isolation.clone(),
         &cache.lazy_build_dispatch_deps,
         None,
@@ -3273,7 +3295,7 @@ mod tests {
         let uv_context: OnceCell<UvResolutionContext> = OnceCell::new();
 
         // Create build caches for sharing between satisfiability and resolution
-        let mut build_caches: HashMap<EnvironmentName, EnvironmentBuildCache> = HashMap::new();
+        let mut build_caches: HashMap<BuildCacheKey, Arc<EnvironmentBuildCache>> = HashMap::new();
 
         // Verify individual environment satisfiability
         for env in project.environments() {
