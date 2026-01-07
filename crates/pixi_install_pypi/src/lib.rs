@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     pin::Pin,
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
@@ -82,10 +82,6 @@ async fn uninstall_outdated_site_packages(site_packages: &Path) -> miette::Resul
             dist_dirs.push(entry.path());
         }
     }
-
-    // Initialize the rayon thread pool to ensure it's configured with proper
-    // settings before using parallel iterators.
-    LazyLock::force(&RAYON_INITIALIZE);
 
     let installed = dist_dirs
         .into_par_iter()
