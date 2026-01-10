@@ -36,7 +36,7 @@ use rayon::prelude::*;
 use utils::elapsed;
 use uv_auth::store_credentials_from_url;
 use uv_client::{Connectivity, FlatIndexClient, RegistryClient};
-use uv_configuration::{BuildOptions, Constraints, IndexStrategy, RAYON_INITIALIZE};
+use uv_configuration::{BuildOptions, Constraints, IndexStrategy};
 use uv_dispatch::BuildDispatch;
 use uv_distribution::{BuiltWheelIndex, DistributionDatabase, RegistryWheelIndex};
 use uv_distribution_types::{
