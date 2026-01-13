@@ -2220,16 +2220,18 @@ pub(crate) async fn verify_package_platform_satisfiability(
 
                             if requirement.is_editable() {
                                 if let Err(err) =
-                                    pypi_satisfies_editable(&requirement, record, project_root)
+                                    pypi_satisfies_editable(&requirement, record, ctx.project_root)
                                 {
                                     delayed_pypi_error.get_or_insert(err);
                                 }
 
                                 FoundPackage::PyPi(PypiPackageIdx(idx), requirement.extras.to_vec())
                             } else {
-                                if let Err(err) =
-                                    pypi_satisfies_requirement(&requirement, record, project_root)
-                                {
+                                if let Err(err) = pypi_satisfies_requirement(
+                                    &requirement,
+                                    record,
+                                    ctx.project_root,
+                                ) {
                                     delayed_pypi_error.get_or_insert(err);
                                 }
 
