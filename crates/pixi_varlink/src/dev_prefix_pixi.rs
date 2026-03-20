@@ -12,6 +12,8 @@ use varlink::{self, CallTrait};
 pub enum ErrorKind {
     Varlink_Error,
     VarlinkReply_Error,
+    AuthenticationFailed(Option<AuthenticationFailed_Args>),
+    GlobalInstallFailed(Option<GlobalInstallFailed_Args>),
     WorkspaceNotFound(Option<WorkspaceNotFound_Args>),
 }
 impl ::std::fmt::Display for ErrorKind {
@@ -19,6 +21,12 @@ impl ::std::fmt::Display for ErrorKind {
         match self {
             ErrorKind::Varlink_Error => write!(f, "Varlink Error"),
             ErrorKind::VarlinkReply_Error => write!(f, "Varlink error reply"),
+            ErrorKind::AuthenticationFailed(v) => {
+                write!(f, "dev.prefix.pixi.AuthenticationFailed: {:#?}", v)
+            }
+            ErrorKind::GlobalInstallFailed(v) => {
+                write!(f, "dev.prefix.pixi.GlobalInstallFailed: {:#?}", v)
+            }
             ErrorKind::WorkspaceNotFound(v) => {
                 write!(f, "dev.prefix.pixi.WorkspaceNotFound: {:#?}", v)
             }
@@ -107,6 +115,32 @@ impl From<&varlink::Reply> for ErrorKind {
     #[allow(unused_variables)]
     fn from(e: &varlink::Reply) -> Self {
         match e {
+            varlink::Reply { error: Some(t), .. }
+                if t == "dev.prefix.pixi.AuthenticationFailed" =>
+            {
+                match e {
+                    varlink::Reply {
+                        parameters: Some(p),
+                        ..
+                    } => match serde_json::from_value(p.clone()) {
+                        Ok(v) => ErrorKind::AuthenticationFailed(v),
+                        Err(_) => ErrorKind::AuthenticationFailed(None),
+                    },
+                    _ => ErrorKind::AuthenticationFailed(None),
+                }
+            }
+            varlink::Reply { error: Some(t), .. } if t == "dev.prefix.pixi.GlobalInstallFailed" => {
+                match e {
+                    varlink::Reply {
+                        parameters: Some(p),
+                        ..
+                    } => match serde_json::from_value(p.clone()) {
+                        Ok(v) => ErrorKind::GlobalInstallFailed(v),
+                        Err(_) => ErrorKind::GlobalInstallFailed(None),
+                    },
+                    _ => ErrorKind::GlobalInstallFailed(None),
+                }
+            }
             varlink::Reply { error: Some(t), .. } if t == "dev.prefix.pixi.WorkspaceNotFound" => {
                 match e {
                     varlink::Reply {
@@ -125,6 +159,24 @@ impl From<&varlink::Reply> for ErrorKind {
 }
 #[allow(dead_code)]
 pub trait VarlinkCallError: varlink::CallTrait {
+    fn reply_authentication_failed(&mut self, r#challenge: String) -> varlink::Result<()> {
+        self.reply_struct(varlink::Reply::error(
+            "dev.prefix.pixi.AuthenticationFailed",
+            Some(
+                serde_json::to_value(AuthenticationFailed_Args { r#challenge })
+                    .map_err(varlink::map_context!())?,
+            ),
+        ))
+    }
+    fn reply_global_install_failed(&mut self, r#message: String) -> varlink::Result<()> {
+        self.reply_struct(varlink::Reply::error(
+            "dev.prefix.pixi.GlobalInstallFailed",
+            Some(
+                serde_json::to_value(GlobalInstallFailed_Args { r#message })
+                    .map_err(varlink::map_context!())?,
+            ),
+        ))
+    }
     fn reply_workspace_not_found(&mut self, r#path: String) -> varlink::Result<()> {
         self.reply_struct(varlink::Reply::error(
             "dev.prefix.pixi.WorkspaceNotFound",
@@ -156,8 +208,54 @@ pub struct r#WorkspaceInfo {
     pub r#environments: Vec<EnvironmentInfo>,
 }
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct AuthenticationFailed_Args {
+    pub r#challenge: String,
+}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct GlobalInstallFailed_Args {
+    pub r#message: String,
+}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct WorkspaceNotFound_Args {
     pub r#path: String,
+}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct ConfirmGlobalInstall_Reply {}
+impl varlink::VarlinkReply for ConfirmGlobalInstall_Reply {}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct ConfirmGlobalInstall_Args {
+    pub r#challenge: String,
+}
+#[allow(dead_code)]
+pub trait Call_ConfirmGlobalInstall: VarlinkCallError + Send {
+    fn reply(&mut self) -> varlink::Result<()> {
+        self.reply_struct(varlink::Reply::parameters(None))
+    }
+}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct GlobalInstall_Reply {
+    pub r#challenge: String,
+}
+impl varlink::VarlinkReply for GlobalInstall_Reply {}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct GlobalInstall_Args {
+    pub r#packages: Vec<String>,
+    pub r#channels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#environment: Option<String>,
+    pub r#expose: Vec<String>,
+    pub r#with: Vec<String>,
+    pub r#force_reinstall: bool,
+    pub r#no_shortcuts: bool,
+    pub r#client_home: String,
+}
+#[allow(dead_code)]
+pub trait Call_GlobalInstall: VarlinkCallError + Send {
+    fn reply(&mut self, r#challenge: String) -> varlink::Result<()> {
+        self.reply_struct(GlobalInstall_Reply { r#challenge }.into())
+    }
 }
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct Info_Reply {
@@ -222,10 +320,30 @@ impl varlink::CallTrait for AsyncCall {
     }
 }
 impl VarlinkCallError for AsyncCall {}
+impl Call_ConfirmGlobalInstall for AsyncCall {}
+impl Call_GlobalInstall for AsyncCall {}
 impl Call_Info for AsyncCall {}
 #[async_trait]
 #[allow(dead_code)]
 pub trait VarlinkInterface {
+    async fn confirm_global_install(
+        &self,
+        call: &mut dyn Call_ConfirmGlobalInstall,
+        r#challenge: String,
+    ) -> varlink::Result<()>;
+    async fn global_install(
+        &self,
+        call: &mut dyn Call_GlobalInstall,
+        r#packages: Vec<String>,
+        r#channels: Vec<String>,
+        r#platform: Option<String>,
+        r#environment: Option<String>,
+        r#expose: Vec<String>,
+        r#with: Vec<String>,
+        r#force_reinstall: bool,
+        r#no_shortcuts: bool,
+        r#client_home: String,
+    ) -> varlink::Result<()>;
     async fn info(
         &self,
         call: &mut dyn Call_Info,
@@ -241,6 +359,22 @@ pub trait VarlinkInterface {
 }
 #[allow(dead_code)]
 pub trait VarlinkClientInterface {
+    fn confirm_global_install(
+        &self,
+        r#challenge: String,
+    ) -> varlink::AsyncMethodCall<ConfirmGlobalInstall_Args, ConfirmGlobalInstall_Reply, Error>;
+    fn global_install(
+        &self,
+        r#packages: Vec<String>,
+        r#channels: Vec<String>,
+        r#platform: Option<String>,
+        r#environment: Option<String>,
+        r#expose: Vec<String>,
+        r#with: Vec<String>,
+        r#force_reinstall: bool,
+        r#no_shortcuts: bool,
+        r#client_home: String,
+    ) -> varlink::AsyncMethodCall<GlobalInstall_Args, GlobalInstall_Reply, Error>;
     fn info(
         &self,
         r#manifest_path: Option<String>,
@@ -257,6 +391,41 @@ impl VarlinkClient {
     }
 }
 impl VarlinkClientInterface for VarlinkClient {
+    fn confirm_global_install(
+        &self,
+        r#challenge: String,
+    ) -> varlink::AsyncMethodCall<ConfirmGlobalInstall_Args, ConfirmGlobalInstall_Reply, Error>
+    {
+        varlink :: AsyncMethodCall :: < ConfirmGlobalInstall_Args , ConfirmGlobalInstall_Reply , Error > :: new (self . connection . clone () , "dev.prefix.pixi.ConfirmGlobalInstall" , ConfirmGlobalInstall_Args { r#challenge })
+    }
+    fn global_install(
+        &self,
+        r#packages: Vec<String>,
+        r#channels: Vec<String>,
+        r#platform: Option<String>,
+        r#environment: Option<String>,
+        r#expose: Vec<String>,
+        r#with: Vec<String>,
+        r#force_reinstall: bool,
+        r#no_shortcuts: bool,
+        r#client_home: String,
+    ) -> varlink::AsyncMethodCall<GlobalInstall_Args, GlobalInstall_Reply, Error> {
+        varlink::AsyncMethodCall::<GlobalInstall_Args, GlobalInstall_Reply, Error>::new(
+            self.connection.clone(),
+            "dev.prefix.pixi.GlobalInstall",
+            GlobalInstall_Args {
+                r#packages,
+                r#channels,
+                r#platform,
+                r#environment,
+                r#expose,
+                r#with,
+                r#force_reinstall,
+                r#no_shortcuts,
+                r#client_home,
+            },
+        )
+    }
     fn info(
         &self,
         r#manifest_path: Option<String>,
@@ -290,6 +459,54 @@ impl varlink::AsyncConnectionHandler for VarlinkInterfaceHandler {
                     let oneway = request.oneway.unwrap_or(false);
                     let mut call = AsyncCall::new(more, oneway);
                     match request.method.as_ref() {
+                        "dev.prefix.pixi.ConfirmGlobalInstall" => {
+                            if let Some(args) = request.parameters {
+                                let args: ConfirmGlobalInstall_Args = serde_json::from_value(args)
+                                    .map_err(|e| {
+                                        varlink::Error(
+                                            varlink::ErrorKind::InvalidParameter(e.to_string()),
+                                            None,
+                                            None,
+                                        )
+                                    })?;
+                                self.inner
+                                    .confirm_global_install(
+                                        &mut call as &mut dyn Call_ConfirmGlobalInstall,
+                                        args.r#challenge,
+                                    )
+                                    .await?;
+                            } else {
+                                call.reply_invalid_parameter("parameters".into())?;
+                            }
+                        }
+                        "dev.prefix.pixi.GlobalInstall" => {
+                            if let Some(args) = request.parameters {
+                                let args: GlobalInstall_Args = serde_json::from_value(args)
+                                    .map_err(|e| {
+                                        varlink::Error(
+                                            varlink::ErrorKind::InvalidParameter(e.to_string()),
+                                            None,
+                                            None,
+                                        )
+                                    })?;
+                                self.inner
+                                    .global_install(
+                                        &mut call as &mut dyn Call_GlobalInstall,
+                                        args.r#packages,
+                                        args.r#channels,
+                                        args.r#platform,
+                                        args.r#environment,
+                                        args.r#expose,
+                                        args.r#with,
+                                        args.r#force_reinstall,
+                                        args.r#no_shortcuts,
+                                        args.r#client_home,
+                                    )
+                                    .await?;
+                            } else {
+                                call.reply_invalid_parameter("parameters".into())?;
+                            }
+                        }
                         "dev.prefix.pixi.Info" => {
                             if let Some(args) = request.parameters {
                                 let args: Info_Args =
@@ -328,6 +545,6 @@ impl varlink::AsyncInterface for VarlinkInterfaceHandler {
         "dev.prefix.pixi"
     }
     fn get_description(&self) -> &'static str {
-        "# Pixi workspace management over varlink IPC\ninterface dev.prefix.pixi\n\ntype EnvironmentInfo (\n    name: string,\n    features: []string,\n    solve_group: ?string,\n    platforms: []string,\n    dependencies: []string,\n    pypi_dependencies: []string,\n    tasks: []string,\n    prefix: string\n)\n\ntype WorkspaceInfo (\n    name: string,\n    manifest_path: string,\n    version: ?string,\n    pixi_version: string,\n    environments: []EnvironmentInfo\n)\n\nmethod Info(manifest_path: ?string) -> (workspace: WorkspaceInfo)\n\nerror WorkspaceNotFound(path: string)\n"
+        "# Pixi workspace management over varlink IPC\ninterface dev.prefix.pixi\n\ntype EnvironmentInfo (\n    name: string,\n    features: []string,\n    solve_group: ?string,\n    platforms: []string,\n    dependencies: []string,\n    pypi_dependencies: []string,\n    tasks: []string,\n    prefix: string\n)\n\ntype WorkspaceInfo (\n    name: string,\n    manifest_path: string,\n    version: ?string,\n    pixi_version: string,\n    environments: []EnvironmentInfo\n)\n\nmethod Info(manifest_path: ?string) -> (workspace: WorkspaceInfo)\n\n# Install packages globally. Returns a challenge UUID. The client must create\n# .pixi-server-auth-<challenge> in client_home, then call ConfirmGlobalInstall.\nmethod GlobalInstall(\n    packages: []string,\n    channels: []string,\n    platform: ?string,\n    environment: ?string,\n    expose: []string,\n    with: []string,\n    force_reinstall: bool,\n    no_shortcuts: bool,\n    client_home: string\n) -> (challenge: string)\n\n# Confirm that the auth file was created. The server checks for the file\n# at <client_home>/.pixi-server-auth-<challenge> and proceeds if found.\nmethod ConfirmGlobalInstall(challenge: string) -> ()\n\nerror WorkspaceNotFound(path: string)\nerror GlobalInstallFailed(message: string)\nerror AuthenticationFailed(challenge: string)\n"
     }
 }

@@ -6932,6 +6932,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
  "varlink",
  "varlink_generator",
  "varlink_stdinterfaces",

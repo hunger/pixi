@@ -22,4 +22,24 @@ type WorkspaceInfo (
 
 method Info(manifest_path: ?string) -> (workspace: WorkspaceInfo)
 
+# Install packages globally. Returns a challenge UUID. The client must create
+# .pixi-server-auth-<challenge> in client_home, then call ConfirmGlobalInstall.
+method GlobalInstall(
+    packages: []string,
+    channels: []string,
+    platform: ?string,
+    environment: ?string,
+    expose: []string,
+    with: []string,
+    force_reinstall: bool,
+    no_shortcuts: bool,
+    client_home: string
+) -> (challenge: string)
+
+# Confirm that the auth file was created. The server checks for the file
+# at <client_home>/.pixi-server-auth-<challenge> and proceeds if found.
+method ConfirmGlobalInstall(challenge: string) -> ()
+
 error WorkspaceNotFound(path: string)
+error GlobalInstallFailed(message: string)
+error AuthenticationFailed(challenge: string)

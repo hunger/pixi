@@ -1,23 +1,125 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
 use async_trait::async_trait;
 use pixi_consts::consts;
 use pixi_core::WorkspaceLocator;
 use pixi_manifest::{FeaturesExt, HasFeaturesIter};
 
-use crate::dev_prefix_pixi::{Call_Info, EnvironmentInfo, VarlinkInterface, WorkspaceInfo};
+use crate::dev_prefix_pixi::{
+    Call_ConfirmGlobalInstall, Call_GlobalInstall, Call_Info, EnvironmentInfo, VarlinkInterface,
+    WorkspaceInfo,
+};
+
+/// Pending challenge: maps UUID to the client_home where the auth file should appear.
+struct PendingChallenge {
+    client_home: PathBuf,
+}
 
 pub struct PixiVarlinkService {
     #[allow(dead_code)]
     nonce: String,
+    pending: Mutex<HashMap<String, PendingChallenge>>,
 }
 
 impl PixiVarlinkService {
     pub fn new(nonce: String) -> Self {
-        Self { nonce }
+        Self {
+            nonce,
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn auth_file_path(client_home: &str, challenge: &str) -> PathBuf {
+        PathBuf::from(client_home).join(format!(".pixi-server-auth-{challenge}"))
     }
 }
 
 #[async_trait]
 impl VarlinkInterface for PixiVarlinkService {
+    async fn global_install(
+        &self,
+        call: &mut dyn Call_GlobalInstall,
+        packages: Vec<String>,
+        channels: Vec<String>,
+        platform: Option<String>,
+        environment: Option<String>,
+        expose: Vec<String>,
+        with: Vec<String>,
+        force_reinstall: bool,
+        no_shortcuts: bool,
+        client_home: String,
+    ) -> varlink::Result<()> {
+        tracing::info!(
+            client_home = %client_home,
+            packages = ?packages,
+            channels = ?channels,
+            platform = platform.as_deref(),
+            environment = environment.as_deref(),
+            expose = ?expose,
+            with = ?with,
+            force_reinstall,
+            no_shortcuts,
+            "GlobalInstall request",
+        );
+
+        let challenge = uuid::Uuid::new_v4().to_string();
+        tracing::debug!(challenge = %challenge, client_home = %client_home, "issuing challenge");
+
+        self.pending
+            .lock()
+            .expect("pending lock poisoned")
+            .insert(
+                challenge.clone(),
+                PendingChallenge {
+                    client_home: PathBuf::from(&client_home),
+                },
+            );
+
+        call.reply(challenge)
+    }
+
+    async fn confirm_global_install(
+        &self,
+        call: &mut dyn Call_ConfirmGlobalInstall,
+        challenge: String,
+    ) -> varlink::Result<()> {
+        tracing::debug!(challenge = %challenge, "ConfirmGlobalInstall request");
+
+        let pending = self
+            .pending
+            .lock()
+            .expect("pending lock poisoned")
+            .remove(&challenge);
+
+        let Some(pending) = pending else {
+            tracing::warn!(challenge = %challenge, "unknown challenge");
+            return call.reply_authentication_failed(challenge);
+        };
+
+        let auth_file = Self::auth_file_path(
+            pending.client_home.to_str().unwrap_or(""),
+            &challenge,
+        );
+
+        if auth_file.exists() {
+            tracing::info!(
+                challenge = %challenge,
+                path = %auth_file.display(),
+                "authentication succeeded",
+            );
+            call.reply()
+        } else {
+            tracing::warn!(
+                challenge = %challenge,
+                expected = %auth_file.display(),
+                "auth file not found",
+            );
+            call.reply_authentication_failed(challenge)
+        }
+    }
+
     async fn info(
         &self,
         call: &mut dyn Call_Info,

@@ -22,6 +22,20 @@ pub struct Args {
 pub enum RemoteCommand {
     /// Information about the system, workspace and environments for the current machine
     Info(crate::info::Args),
+    /// Subcommand for global package management via the remote server
+    Global(RemoteGlobalCommand),
+}
+
+#[derive(Parser, Debug)]
+pub struct RemoteGlobalCommand {
+    #[command(subcommand)]
+    pub command: RemoteGlobalSubCommand,
+}
+
+#[derive(Parser, Debug)]
+pub enum RemoteGlobalSubCommand {
+    /// Install packages globally on the remote server
+    Install(crate::global::install::Args),
 }
 
 pub async fn execute(args: Args) -> miette::Result<()> {
@@ -33,6 +47,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
 
     match args.command {
         Some(RemoteCommand::Info(info_args)) => crate::info::execute(info_args).await,
+        Some(RemoteCommand::Global(global)) => execute_global(&address, global).await,
         None => print_remote_version(&address).await,
     }
 }
@@ -47,5 +62,35 @@ async fn print_remote_version(address: &str) -> miette::Result<()> {
         writeln!(std::io::stdout(), "client: {local}").into_diagnostic()?;
         writeln!(std::io::stdout(), "server: {remote}").into_diagnostic()?;
     }
+    Ok(())
+}
+
+async fn execute_global(address: &str, cmd: RemoteGlobalCommand) -> miette::Result<()> {
+    match cmd.command {
+        RemoteGlobalSubCommand::Install(args) => execute_global_install(address, args).await,
+    }
+}
+
+async fn execute_global_install(
+    address: &str,
+    args: crate::global::install::Args,
+) -> miette::Result<()> {
+    let client_home = std::env::var("HOME")
+        .map_err(|_| miette::miette!("HOME environment variable not set"))?;
+
+    let install_args = pixi_varlink::client::GlobalInstallArgs {
+        packages: args.packages.specs.clone(),
+        channels: args.channels.iter().map(|c| c.to_string()).collect(),
+        platform: args.platform.map(|p| p.to_string()),
+        environment: args.environment.map(|e| e.to_string()),
+        expose: args.expose.iter().map(|m| m.to_string()).collect(),
+        with: args.with.iter().map(|s| s.to_string()).collect(),
+        force_reinstall: args.force_reinstall,
+        no_shortcuts: args.no_shortcuts,
+        client_home,
+    };
+
+    pixi_varlink::client::global_install(address, install_args).await?;
+    eprintln!("Server authorized and acknowledged global install request.");
     Ok(())
 }

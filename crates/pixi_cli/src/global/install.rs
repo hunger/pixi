@@ -40,29 +40,29 @@ pub struct Args {
     ///
     /// By default, if no channel is provided, `conda-forge` is used.
     #[clap(long = "channel", short = 'c', value_name = "CHANNEL")]
-    channels: Vec<NamedChannelOrUrl>,
+    pub channels: Vec<NamedChannelOrUrl>,
 
     /// The platform to install the packages for.
     ///
     /// This is useful when you want to install packages for a different platform than the one you are currently on.
     /// This is very often used when you want to install `osx-64` packages on `osx-arm64`.
     #[clap(short, long)]
-    platform: Option<Platform>,
+    pub platform: Option<Platform>,
 
     /// Ensures that all packages will be installed in the same environment
     #[clap(short, long)]
-    environment: Option<EnvironmentName>,
+    pub environment: Option<EnvironmentName>,
 
     /// Add one or more mapping which describe which executables are exposed.
     /// The syntax is `exposed_name=executable_name`, so for example `python3.10=python`.
     /// Alternatively, you can input only an executable_name and `executable_name=executable_name` is assumed.
     #[arg(long)]
-    expose: Vec<Mapping>,
+    pub expose: Vec<Mapping>,
 
     /// Add additional dependencies to the environment.
     /// Their executables will not be exposed.
     #[arg(long)]
-    with: Vec<MatchSpec>,
+    pub with: Vec<MatchSpec>,
 
     #[clap(flatten)]
     config: ConfigCli,
@@ -73,7 +73,7 @@ pub struct Args {
 
     /// Specifies that no shortcuts should be created for the installed packages.
     #[arg(action, long, alias = "no-shortcut")]
-    no_shortcuts: bool,
+    pub no_shortcuts: bool,
 
     /// Optional backend override (primarily for testing, not exposed in CLI)
     #[clap(skip)]

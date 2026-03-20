@@ -213,6 +213,7 @@ uv-requirements-txt = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
 uv-resolver = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
 uv-types = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
 uv-workspace = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
+uuid = { version = "1.22.0", features = ["v4"] }
 varlink = { git = "https://github.com/varlink/rust", default-features = false }
 varlink_generator = { git = "https://github.com/varlink/rust" }
 varlink_stdinterfaces = { git = "https://github.com/varlink/rust", default-features = false }
