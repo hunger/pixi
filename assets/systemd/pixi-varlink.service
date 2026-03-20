@@ -4,3 +4,6 @@ Description=Pixi Varlink Server
 [Service]
 Type=simple
 ExecStart=pixi varlink
+# Defaults shown below; override in a drop-in or environment file.
+# Environment=PIXI_CACHE_DIR=%h/.cache/rattler
+# Environment=PIXI_ENVS_DIR=%h/.local/share/pixi
