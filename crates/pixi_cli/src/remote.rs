@@ -75,8 +75,14 @@ async fn execute_global_install(
     address: &str,
     args: crate::global::install::Args,
 ) -> miette::Result<()> {
-    let client_home = std::env::var("HOME")
-        .map_err(|_| miette::miette!("HOME environment variable not set"))?;
+    let envs_dir = pixi_global::EnvRoot::from_env()
+        .await?
+        .path()
+        .to_path_buf();
+    // Ensure the directory exists before telling the server about it
+    tokio::fs::create_dir_all(&envs_dir)
+        .await
+        .map_err(|e| miette::miette!("failed to create {}: {e}", envs_dir.display()))?;
 
     let install_args = pixi_varlink::client::GlobalInstallArgs {
         packages: args.packages.specs.clone(),
@@ -87,10 +93,19 @@ async fn execute_global_install(
         with: args.with.iter().map(|s| s.to_string()).collect(),
         force_reinstall: args.force_reinstall,
         no_shortcuts: args.no_shortcuts,
-        client_home,
+        client_envs_dir: envs_dir.to_string_lossy().to_string(),
     };
 
-    pixi_varlink::client::global_install(address, install_args).await?;
-    eprintln!("Server authorized and acknowledged global install request.");
+    let result = pixi_varlink::client::global_install(address, install_args).await?;
+    pixi_varlink::client::create_symlinks(&result)?;
+
+    eprintln!(
+        "{} -> {}",
+        result.local_env_symlink.display(),
+        result.env_path.display()
+    );
+    for bin in &result.binaries {
+        eprintln!("{} -> {}", bin.local_symlink.display(), bin.server_path.display());
+    }
     Ok(())
 }

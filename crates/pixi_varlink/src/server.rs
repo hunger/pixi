@@ -4,21 +4,22 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use miette::IntoDiagnostic;
 use pixi_consts::consts;
 use pixi_core::WorkspaceLocator;
-use pixi_global::{EnvironmentName, Mapping, Project};
+use pixi_global::{BinDir, EnvironmentName, Mapping, Project};
 use pixi_manifest::{FeaturesExt, HasFeaturesIter};
 use rattler_conda_types::{MatchSpec, NamedChannelOrUrl, Platform};
 use sha2::{Digest, Sha256};
 
 use crate::dev_prefix_pixi::{
-    Call_ConfirmGlobalInstall, Call_GlobalInstall, Call_Info, EnvironmentInfo, VarlinkInterface,
-    WorkspaceInfo,
+    Call_ConfirmGlobalInstall, Call_GlobalInstall, Call_Info, EnvironmentInfo, ExposedBinary,
+    VarlinkInterface, WorkspaceInfo,
 };
 
 #[allow(dead_code)]
 struct PendingInstall {
-    client_home: String,
+    client_envs_dir: String,
     packages: Vec<String>,
     channels: Vec<String>,
     platform: Option<String>,
@@ -42,15 +43,15 @@ impl PixiVarlinkService {
         }
     }
 
-    fn auth_file_path(client_home: &str, challenge: &str) -> PathBuf {
-        PathBuf::from(client_home).join(format!(".pixi-server-auth-{challenge}"))
+    fn auth_file_path(client_envs_dir: &str, challenge: &str) -> PathBuf {
+        PathBuf::from(client_envs_dir).join(format!(".pixi-server-auth-{challenge}"))
     }
 
-    fn compute_env_name(&self, client_home: &str, environment: Option<&str>) -> String {
+    fn compute_env_name(&self, client_envs_dir: &str, environment: Option<&str>) -> String {
         let env = environment.unwrap_or("default");
         let mut hasher = Sha256::new();
         hasher.update(self.nonce.as_bytes());
-        hasher.update(client_home.as_bytes());
+        hasher.update(client_envs_dir.as_bytes());
         hasher.update(self.nonce.as_bytes());
         hasher.update(env.as_bytes());
         hasher.update(self.nonce.as_bytes());
@@ -61,11 +62,41 @@ impl PixiVarlinkService {
     }
 }
 
+/// Collect all files in a directory as (file_name, full_path) pairs.
+async fn list_binaries(bin_dir: &PathBuf) -> miette::Result<Vec<ExposedBinary>> {
+    let mut binaries = Vec::new();
+    let mut entries = tokio::fs::read_dir(bin_dir).await.into_diagnostic()?;
+    while let Some(entry) = entries.next_entry().await.into_diagnostic()? {
+        let path = entry.path();
+        if path.is_file() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            binaries.push(ExposedBinary {
+                name,
+                path: path.to_string_lossy().to_string(),
+            });
+        }
+    }
+    binaries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(binaries)
+}
+
+struct InstallResult {
+    env_path: PathBuf,
+    binaries: Vec<ExposedBinary>,
+}
+
 async fn perform_global_install(
     env_name: &EnvironmentName,
+    env_name_str: &str,
     pending: &PendingInstall,
-) -> miette::Result<()> {
-    let mut project = Project::discover_or_create()
+) -> miette::Result<InstallResult> {
+    let pixi_home = pixi_config::pixi_home()
+        .ok_or_else(|| miette::miette!("could not determine PIXI_HOME"))?;
+    let env_bin_dir = pixi_home.join(format!("{env_name_str}-bin"));
+    let env_path = pixi_home.join("envs").join(env_name_str);
+    let bin_dir = BinDir::from_path(env_bin_dir.clone()).await?;
+
+    let mut project = Project::discover_or_create_with_bin_dir(bin_dir)
         .await?
         .with_cli_config(pixi_config::Config::load_global());
 
@@ -99,7 +130,6 @@ async fn perform_global_install(
 
     let channel_config = project.global_channel_config().clone();
 
-    // Parse packages into GlobalSpecs
     let specs: Vec<pixi_global::project::GlobalSpec> = pending
         .packages
         .iter()
@@ -115,31 +145,26 @@ async fn perform_global_install(
         })
         .collect::<miette::Result<_>>()?;
 
-    // Force-reinstall: remove existing environment first
     if pending.force_reinstall && project.environment(env_name).is_some() {
         let _ = project.remove_environment(env_name).await?;
     }
 
-    // Set up channels
     let env_channels = if channels.is_empty() {
         project.config().default_channels()
     } else {
         channels
     };
 
-    // Create the environment if it doesn't exist
     if !project.manifest.parsed.envs.contains_key(env_name) {
         project
             .manifest
             .add_environment(env_name, Some(env_channels))?;
     }
 
-    // Set platform
     if let Some(platform) = platform {
         project.manifest.set_platform(env_name, platform)?;
     }
 
-    // Parse --with as GlobalSpecs for dependencies
     let with_global_specs: Vec<pixi_global::project::GlobalSpec> = with_specs
         .into_iter()
         .map(|spec| {
@@ -148,12 +173,10 @@ async fn perform_global_install(
         .collect::<Result<_, _>>()
         .map_err(|e| miette::miette!("invalid --with spec: {e}"))?;
 
-    // Add all dependencies
     for spec in specs.iter().chain(with_global_specs.iter()) {
         project.manifest.add_dependency(env_name, spec)?;
     }
 
-    // Set expose mappings
     if !expose_mappings.is_empty() {
         project.manifest.remove_all_exposed_mappings(env_name)?;
         for mapping in &expose_mappings {
@@ -161,22 +184,22 @@ async fn perform_global_install(
         }
     }
 
-    // Check if already in sync
     if project
         .environment_in_sync_internal(env_name, true)
         .await?
     {
         tracing::info!(env_name = %env_name, "environment already in sync");
         project.manifest.save().await?;
-        return Ok(());
+        return Ok(InstallResult {
+            env_path,
+            binaries: list_binaries(&env_bin_dir).await?,
+        });
     }
 
-    // Install the environment
     let environment_update = project
         .install_environment_with_options(env_name, pending.force_reinstall)
         .await?;
 
-    // Sync exposed names
     let with_package_names: Vec<_> = with_global_specs
         .iter()
         .filter_map(|spec| {
@@ -200,15 +223,12 @@ async fn perform_global_install(
         .sync_exposed_names(env_name, expose_type)
         .await?;
 
-    // Expose executables
     let _ = project
         .expose_executables_from_environment(env_name)
         .await?;
 
-    // Sync completions
     let _ = project.sync_completions(env_name).await?;
 
-    // Log installed packages
     let requested_names: Vec<_> = specs.iter().map(|s| s.name().clone()).collect();
     let changes = environment_update.user_requested_changes(&requested_names);
     for (name, change) in &changes {
@@ -216,7 +236,11 @@ async fn perform_global_install(
     }
 
     project.manifest.save().await?;
-    Ok(())
+
+    Ok(InstallResult {
+        env_path,
+        binaries: list_binaries(&env_bin_dir).await?,
+    })
 }
 
 #[async_trait]
@@ -232,10 +256,23 @@ impl VarlinkInterface for PixiVarlinkService {
         with: Vec<String>,
         force_reinstall: bool,
         no_shortcuts: bool,
-        client_home: String,
+        client_envs_dir: String,
     ) -> varlink::Result<()> {
+        let client_envs_dir = std::fs::canonicalize(&client_envs_dir)
+            .map_err(|e| {
+                varlink::error::Error(
+                    varlink::ErrorKind::InvalidParameter(format!(
+                        "cannot canonicalize client_envs_dir '{client_envs_dir}': {e}"
+                    )),
+                    None,
+                    None,
+                )
+            })?
+            .to_string_lossy()
+            .to_string();
+
         tracing::info!(
-            client_home = %client_home,
+            client_envs_dir = %client_envs_dir,
             packages = ?packages,
             channels = ?channels,
             platform = platform.as_deref(),
@@ -248,7 +285,7 @@ impl VarlinkInterface for PixiVarlinkService {
         );
 
         let challenge = uuid::Uuid::new_v4().to_string();
-        tracing::debug!(challenge = %challenge, client_home = %client_home, "issuing challenge");
+        tracing::debug!(challenge = %challenge, client_envs_dir = %client_envs_dir, "issuing challenge");
 
         self.pending
             .lock()
@@ -256,7 +293,7 @@ impl VarlinkInterface for PixiVarlinkService {
             .insert(
                 challenge.clone(),
                 PendingInstall {
-                    client_home,
+                    client_envs_dir,
                     packages,
                     channels,
                     platform,
@@ -289,7 +326,7 @@ impl VarlinkInterface for PixiVarlinkService {
             return call.reply_authentication_failed(challenge);
         };
 
-        let auth_file = Self::auth_file_path(&pending.client_home, &challenge);
+        let auth_file = Self::auth_file_path(&pending.client_envs_dir, &challenge);
 
         if !auth_file.exists() {
             tracing::warn!(
@@ -301,7 +338,7 @@ impl VarlinkInterface for PixiVarlinkService {
         }
 
         let env_name_str =
-            self.compute_env_name(&pending.client_home, pending.environment.as_deref());
+            self.compute_env_name(&pending.client_envs_dir, pending.environment.as_deref());
         let env_name = EnvironmentName::from_str(&env_name_str).map_err(|e| {
             varlink::error::Error(
                 varlink::ErrorKind::InvalidParameter(e.to_string()),
@@ -313,14 +350,26 @@ impl VarlinkInterface for PixiVarlinkService {
         tracing::info!(
             challenge = %challenge,
             env_name = %env_name,
-            client_home = %pending.client_home,
+            client_envs_dir = %pending.client_envs_dir,
             "authentication succeeded, installing",
         );
 
-        match perform_global_install(&env_name, &pending).await {
-            Ok(()) => {
-                tracing::info!(env_name = %env_name, "global install completed");
-                call.reply()
+        match perform_global_install(&env_name, &env_name_str, &pending).await {
+            Ok(result) => {
+                tracing::info!(
+                    env_name = %env_name,
+                    env_path = %result.env_path.display(),
+                    binaries = result.binaries.len(),
+                    "global install completed",
+                );
+                for bin in &result.binaries {
+                    tracing::debug!(name = %bin.name, path = %bin.path, "exposed binary");
+                }
+                call.reply(
+                    env_name_str.clone(),
+                    result.env_path.to_string_lossy().to_string(),
+                    result.binaries,
+                )
             }
             Err(err) => {
                 tracing::error!(env_name = %env_name, error = %err, "global install failed");

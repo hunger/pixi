@@ -344,11 +344,16 @@ impl Project {
     /// yet, and the function will try to create one from the existing
     /// installation. If that one fails, an empty one will be created.
     pub async fn discover_or_create() -> miette::Result<Self> {
+        let bin_dir = BinDir::from_env().await?;
+        Self::discover_or_create_with_bin_dir(bin_dir).await
+    }
+
+    /// Like [`discover_or_create`](Self::discover_or_create) but with a
+    /// custom binary directory instead of the default `$PIXI_HOME/bin`.
+    pub async fn discover_or_create_with_bin_dir(bin_dir: BinDir) -> miette::Result<Self> {
         let manifest_dir = Self::manifest_dir()?;
         let manifest_path = Self::default_manifest_path()?;
-        // Prompt user if the manifest is empty and the user wants to create one
 
-        let bin_dir = BinDir::from_env().await?;
         let env_root = EnvRoot::from_env().await?;
 
         if !manifest_path.exists() {

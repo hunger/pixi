@@ -20,10 +20,18 @@ type WorkspaceInfo (
     environments: []EnvironmentInfo
 )
 
+# An exposed binary from a global install.
+type ExposedBinary (
+    # The name the binary is exposed as (e.g. "rg")
+    name: string,
+    # The absolute path to the trampoline on the server
+    path: string
+)
+
 method Info(manifest_path: ?string) -> (workspace: WorkspaceInfo)
 
 # Install packages globally. Returns a challenge UUID. The client must create
-# .pixi-server-auth-<challenge> in client_home, then call ConfirmGlobalInstall.
+# .pixi-server-auth-<challenge> in client_envs_dir, then call ConfirmGlobalInstall.
 method GlobalInstall(
     packages: []string,
     channels: []string,
@@ -33,12 +41,17 @@ method GlobalInstall(
     with: []string,
     force_reinstall: bool,
     no_shortcuts: bool,
-    client_home: string
+    client_envs_dir: string
 ) -> (challenge: string)
 
-# Confirm that the auth file was created. The server checks for the file
-# at <client_home>/.pixi-server-auth-<challenge> and proceeds if found.
-method ConfirmGlobalInstall(challenge: string) -> ()
+# Confirm that the auth file was created. The server checks for the file,
+# installs the environment, and returns the environment name, its path on
+# the server, and the list of exposed binaries.
+method ConfirmGlobalInstall(challenge: string) -> (
+    env_name: string,
+    env_path: string,
+    binaries: []ExposedBinary
+)
 
 error WorkspaceNotFound(path: string)
 error GlobalInstallFailed(message: string)

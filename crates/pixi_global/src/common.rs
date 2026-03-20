@@ -37,11 +37,9 @@ use super::{
 pub struct BinDir(PathBuf);
 
 impl BinDir {
-    /// Create the binary executable directory from path
-    #[cfg(test)]
-    pub fn new(root: PathBuf) -> miette::Result<Self> {
-        let path = root.join("bin");
-        fs_err::create_dir_all(&path).into_diagnostic()?;
+    /// Create the binary executable directory from an explicit path.
+    pub async fn from_path(path: PathBuf) -> miette::Result<Self> {
+        tokio_fs::create_dir_all(&path).await.into_diagnostic()?;
         Ok(Self(path))
     }
 
@@ -52,8 +50,7 @@ impl BinDir {
             .ok_or(miette::miette!(
                 "Couldn't determine global binary executable directory"
             ))?;
-        tokio_fs::create_dir_all(&bin_dir).await.into_diagnostic()?;
-        Ok(Self(bin_dir))
+        Self::from_path(bin_dir).await
     }
 
     /// Asynchronously retrieves all files in the binary executable directory.
