@@ -1,0 +1,9 @@
+[Unit]
+Description=Pixi Varlink Socket
+
+[Socket]
+ListenStream=%t/pixi.sock
+FileDescriptorName=varlink
+
+[Install]
+WantedBy=sockets.target

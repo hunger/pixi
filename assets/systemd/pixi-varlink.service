@@ -1,0 +1,6 @@
+[Unit]
+Description=Pixi Varlink Server
+
+[Service]
+Type=simple
+ExecStart=pixi varlink
