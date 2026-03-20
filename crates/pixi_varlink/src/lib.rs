@@ -1,5 +1,6 @@
 #![allow(non_camel_case_types, non_snake_case)]
 
+pub mod client;
 mod dev_prefix_pixi;
 // Will be used by methods that need a pixi_api::Interface (Install, Add, etc.)
 #[allow(dead_code)]

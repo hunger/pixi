@@ -38,6 +38,7 @@ pub mod list;
 pub mod lock;
 pub(crate) mod match_spec_or_path;
 pub mod reinstall;
+pub mod remote;
 pub mod remove;
 pub mod run;
 pub mod search;
@@ -173,6 +174,7 @@ pub enum Command {
     List(list::Args),
     Lock(lock::Args),
     Reinstall(reinstall::Args),
+    Remote(remote::Args),
     #[clap(visible_alias = "rm")]
     Remove(remove::Args),
     #[clap(visible_alias = "r")]
@@ -384,6 +386,7 @@ pub async fn execute_command(
         Command::Lock(cmd) => lock::execute(cmd).await,
         Command::Exec(args) => exec::execute(args).await,
         Command::Build(args) => build::execute(args).await,
+        Command::Remote(cmd) => remote::execute(cmd).await,
         Command::Varlink(cmd) => varlink::execute(cmd).await,
         Command::External(args) => command_info::execute_external_command(args),
     }
