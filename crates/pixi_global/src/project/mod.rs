@@ -142,6 +142,9 @@ pub struct Project {
     command_dispatcher: OnceCell<CommandDispatcher>,
     /// Optional backend override for testing purposes
     backend_override: Option<BackendOverride>,
+    /// Optional custom reporter factory. When set, used instead of the default
+    /// `TopLevelProgress` terminal reporter.
+    reporter_factory: Option<Arc<dyn Fn() -> Box<dyn pixi_command_dispatcher::Reporter> + Send + Sync>>,
 }
 
 impl Debug for Project {
@@ -325,6 +328,7 @@ impl Project {
             concurrent_downloads_semaphore: OnceCell::new(),
             command_dispatcher: OnceCell::new(),
             backend_override: None,
+            reporter_factory: None,
         }
     }
 
@@ -500,6 +504,17 @@ impl Project {
     pub fn with_backend_override(mut self, backend_override: BackendOverride) -> Self {
         self.backend_override = Some(backend_override);
         // Clear the command dispatcher so it will be re-initialized with the new backend override
+        self.command_dispatcher = OnceCell::new();
+        self
+    }
+
+    /// Set a custom reporter factory. When set, this is used instead of the
+    /// default `TopLevelProgress` terminal reporter.
+    pub fn with_reporter_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Box<dyn pixi_command_dispatcher::Reporter> + Send + Sync + 'static,
+    {
+        self.reporter_factory = Some(Arc::new(factory));
         self.command_dispatcher = OnceCell::new();
         self
     }
@@ -1402,7 +1417,11 @@ impl Project {
                     RunPostLinkScripts::Insecure => true,
                     RunPostLinkScripts::False => false,
                 })
-                .with_reporter(TopLevelProgress::new(multi_progress, anchor_pb))
+                .with_reporter(if let Some(factory) = &self.reporter_factory {
+                    factory()
+                } else {
+                    Box::new(TopLevelProgress::new(multi_progress, anchor_pb))
+                })
                 .finish())
         })
     }

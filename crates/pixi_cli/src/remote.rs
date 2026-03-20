@@ -96,7 +96,10 @@ async fn execute_global_install(
         client_envs_dir: envs_dir.to_string_lossy().to_string(),
     };
 
-    let result = pixi_varlink::client::global_install(address, install_args).await?;
+    let result = pixi_varlink::client::global_install(address, install_args, &|msg| {
+        eprintln!("{msg}");
+    })
+    .await?;
     pixi_varlink::client::create_symlinks(&result)?;
 
     eprintln!(

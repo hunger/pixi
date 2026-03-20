@@ -6923,6 +6923,7 @@ dependencies = [
  "async-trait",
  "miette 7.6.0",
  "pixi_api",
+ "pixi_command_dispatcher",
  "pixi_config",
  "pixi_consts",
  "pixi_core",

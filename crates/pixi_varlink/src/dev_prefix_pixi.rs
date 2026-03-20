@@ -226,9 +226,14 @@ pub struct WorkspaceNotFound_Args {
 }
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct ConfirmGlobalInstall_Reply {
-    pub r#env_name: String,
-    pub r#env_path: String,
-    pub r#binaries: Vec<ExposedBinary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#env_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#env_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#binaries: Option<Vec<ExposedBinary>>,
 }
 impl varlink::VarlinkReply for ConfirmGlobalInstall_Reply {}
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -239,12 +244,14 @@ pub struct ConfirmGlobalInstall_Args {
 pub trait Call_ConfirmGlobalInstall: VarlinkCallError + Send {
     fn reply(
         &mut self,
-        r#env_name: String,
-        r#env_path: String,
-        r#binaries: Vec<ExposedBinary>,
+        r#message: Option<String>,
+        r#env_name: Option<String>,
+        r#env_path: Option<String>,
+        r#binaries: Option<Vec<ExposedBinary>>,
     ) -> varlink::Result<()> {
         self.reply_struct(
             ConfirmGlobalInstall_Reply {
+                r#message,
                 r#env_name,
                 r#env_path,
                 r#binaries,
@@ -566,6 +573,6 @@ impl varlink::AsyncInterface for VarlinkInterfaceHandler {
         "dev.prefix.pixi"
     }
     fn get_description(&self) -> &'static str {
-        "# Pixi workspace management over varlink IPC\ninterface dev.prefix.pixi\n\ntype EnvironmentInfo (\n    name: string,\n    features: []string,\n    solve_group: ?string,\n    platforms: []string,\n    dependencies: []string,\n    pypi_dependencies: []string,\n    tasks: []string,\n    prefix: string\n)\n\ntype WorkspaceInfo (\n    name: string,\n    manifest_path: string,\n    version: ?string,\n    pixi_version: string,\n    environments: []EnvironmentInfo\n)\n\n# An exposed binary from a global install.\ntype ExposedBinary (\n    # The name the binary is exposed as (e.g. \"rg\")\n    name: string,\n    # The absolute path to the trampoline on the server\n    path: string\n)\n\nmethod Info(manifest_path: ?string) -> (workspace: WorkspaceInfo)\n\n# Install packages globally. Returns a challenge UUID. The client must create\n# .pixi-server-auth-<challenge> in client_envs_dir, then call ConfirmGlobalInstall.\nmethod GlobalInstall(\n    packages: []string,\n    channels: []string,\n    platform: ?string,\n    environment: ?string,\n    expose: []string,\n    with: []string,\n    force_reinstall: bool,\n    no_shortcuts: bool,\n    client_envs_dir: string\n) -> (challenge: string)\n\n# Confirm that the auth file was created. The server checks for the file,\n# installs the environment, and returns the environment name, its path on\n# the server, and the list of exposed binaries.\nmethod ConfirmGlobalInstall(challenge: string) -> (\n    env_name: string,\n    env_path: string,\n    binaries: []ExposedBinary\n)\n\nerror WorkspaceNotFound(path: string)\nerror GlobalInstallFailed(message: string)\nerror AuthenticationFailed(challenge: string)\n"
+        "# Pixi workspace management over varlink IPC\ninterface dev.prefix.pixi\n\ntype EnvironmentInfo (\n    name: string,\n    features: []string,\n    solve_group: ?string,\n    platforms: []string,\n    dependencies: []string,\n    pypi_dependencies: []string,\n    tasks: []string,\n    prefix: string\n)\n\ntype WorkspaceInfo (\n    name: string,\n    manifest_path: string,\n    version: ?string,\n    pixi_version: string,\n    environments: []EnvironmentInfo\n)\n\n# An exposed binary from a global install.\ntype ExposedBinary (\n    # The name the binary is exposed as (e.g. \"rg\")\n    name: string,\n    # The absolute path to the trampoline on the server\n    path: string\n)\n\nmethod Info(manifest_path: ?string) -> (workspace: WorkspaceInfo)\n\n# Install packages globally. Returns a challenge UUID. The client must create\n# .pixi-server-auth-<challenge> in client_envs_dir, then call ConfirmGlobalInstall.\nmethod GlobalInstall(\n    packages: []string,\n    channels: []string,\n    platform: ?string,\n    environment: ?string,\n    expose: []string,\n    with: []string,\n    force_reinstall: bool,\n    no_shortcuts: bool,\n    client_envs_dir: string\n) -> (challenge: string)\n\n# Confirm that the auth file was created. The server checks for the file,\n# installs the environment, and returns the result.\n# With \"more\", the server streams progress as intermediate replies with only\n# the \"message\" field set, followed by a final reply with the full result.\nmethod ConfirmGlobalInstall(challenge: string) -> (\n    message: ?string,\n    env_name: ?string,\n    env_path: ?string,\n    binaries: ?[]ExposedBinary\n)\n\nerror WorkspaceNotFound(path: string)\nerror GlobalInstallFailed(message: string)\nerror AuthenticationFailed(challenge: string)\n"
     }
 }

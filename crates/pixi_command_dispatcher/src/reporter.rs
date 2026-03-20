@@ -339,6 +339,25 @@ pub trait Reporter: Send {
     }
 }
 
+impl Reporter for Box<dyn Reporter> {
+    fn on_start(&mut self) { (**self).on_start() }
+    fn on_clear(&mut self) { (**self).on_clear() }
+    fn on_finished(&mut self) { (**self).on_finished() }
+    fn as_git_reporter(&mut self) -> Option<&mut dyn GitCheckoutReporter> { (**self).as_git_reporter() }
+    fn as_url_reporter(&mut self) -> Option<&mut dyn UrlCheckoutReporter> { (**self).as_url_reporter() }
+    fn as_conda_solve_reporter(&mut self) -> Option<&mut dyn CondaSolveReporter> { (**self).as_conda_solve_reporter() }
+    fn as_pixi_solve_reporter(&mut self) -> Option<&mut dyn PixiSolveReporter> { (**self).as_pixi_solve_reporter() }
+    fn as_pixi_install_reporter(&mut self) -> Option<&mut dyn PixiInstallReporter> { (**self).as_pixi_install_reporter() }
+    fn as_instantiate_tool_environment_reporter(&mut self) -> Option<&mut dyn InstantiateToolEnvironmentReporter> { (**self).as_instantiate_tool_environment_reporter() }
+    fn as_build_backend_metadata_reporter(&mut self) -> Option<&mut dyn BuildBackendMetadataReporter> { (**self).as_build_backend_metadata_reporter() }
+    fn as_source_metadata_reporter(&mut self) -> Option<&mut dyn SourceMetadataReporter> { (**self).as_source_metadata_reporter() }
+    fn create_gateway_reporter(&mut self, reason: Option<ReporterContext>) -> Option<Box<dyn rattler_repodata_gateway::Reporter>> { (**self).create_gateway_reporter(reason) }
+    fn create_run_exports_reporter(&mut self, reason: Option<ReporterContext>) -> Option<Arc<dyn RunExportsReporter>> { (**self).create_run_exports_reporter(reason) }
+    fn create_install_reporter(&mut self, reason: Option<ReporterContext>) -> Option<Box<dyn rattler::install::Reporter>> { (**self).create_install_reporter(reason) }
+    fn as_source_build_reporter(&mut self) -> Option<&mut dyn SourceBuildReporter> { (**self).as_source_build_reporter() }
+    fn as_backend_source_build_reporter(&mut self) -> Option<&mut dyn BackendSourceBuildReporter> { (**self).as_backend_source_build_reporter() }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, derive_more::From)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReporterContext {

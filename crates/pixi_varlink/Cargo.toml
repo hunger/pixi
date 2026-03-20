@@ -9,6 +9,7 @@ license.workspace = true
 async-trait = { workspace = true }
 miette = { workspace = true }
 pixi_api = { workspace = true }
+pixi_command_dispatcher = { workspace = true }
 pixi_config = { workspace = true }
 pixi_consts = { workspace = true }
 pixi_core = { workspace = true }

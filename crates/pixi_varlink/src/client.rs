@@ -73,6 +73,7 @@ fn auth_file_path(client_envs_dir: &str, challenge: &str) -> PathBuf {
 pub async fn global_install(
     address: &str,
     args: GlobalInstallArgs,
+    on_progress: &dyn Fn(&str),
 ) -> miette::Result<GlobalInstallResult> {
     let client_envs_dir = args.client_envs_dir.clone();
     let client_env_name = args.environment.clone();
@@ -111,6 +112,7 @@ pub async fn global_install(
         &auth_file,
         &client_envs_dir,
         client_env_name.as_deref(),
+        on_progress,
     )
     .await
 }
@@ -121,12 +123,9 @@ async fn confirm_and_cleanup(
     auth_file: &Path,
     client_envs_dir: &str,
     client_env_name: Option<&str>,
+    on_progress: &dyn Fn(&str),
 ) -> miette::Result<GlobalInstallResult> {
-    let result = client
-        .confirm_global_install(challenge.to_string())
-        .call()
-        .await
-        .map_err(|e| miette::miette!("ConfirmGlobalInstall failed: {e}"));
+    let result = confirm_streaming(client, challenge, on_progress).await;
 
     // Always delete the auth file
     if let Err(e) = std::fs::remove_file(auth_file) {
@@ -139,30 +138,61 @@ async fn confirm_and_cleanup(
 
     let reply = result?;
 
+    let env_name = reply
+        .env_name
+        .ok_or_else(|| miette::miette!("server did not return env_name"))?;
+    let env_path = reply
+        .env_path
+        .ok_or_else(|| miette::miette!("server did not return env_path"))?;
+    let binaries_raw = reply.binaries.unwrap_or_default();
+
     let envs_dir = PathBuf::from(client_envs_dir);
-    // bin dir is a sibling of envs dir (e.g. ~/.pixi/bin next to ~/.pixi/envs)
     let pixi_bin_dir = envs_dir
         .parent()
         .expect("envs dir should have a parent")
         .join("bin");
 
-    // The local env symlink name is the client's requested name, or the
-    // server's SHA-based name if none was requested.
-    let local_env_name = client_env_name.unwrap_or(&reply.env_name);
+    let local_env_name = client_env_name.unwrap_or(&env_name);
     let local_env_symlink = envs_dir.join(local_env_name);
 
-    let binaries = reply
-        .binaries
+    let binaries = binaries_raw
         .into_iter()
         .map(|bin| to_installed_binary(bin, &pixi_bin_dir))
         .collect();
 
     Ok(GlobalInstallResult {
-        env_name: reply.env_name,
-        env_path: PathBuf::from(reply.env_path),
+        env_name,
+        env_path: PathBuf::from(env_path),
         local_env_symlink,
         binaries,
     })
+}
+
+async fn confirm_streaming(
+    client: &dev_prefix_pixi::VarlinkClient,
+    challenge: &str,
+    on_progress: &dyn Fn(&str),
+) -> miette::Result<dev_prefix_pixi::ConfirmGlobalInstall_Reply> {
+    let mut method_call = client.confirm_global_install(challenge.to_string());
+    let stream = method_call
+        .more()
+        .await
+        .map_err(|e| miette::miette!("ConfirmGlobalInstall failed: {e}"))?;
+
+    loop {
+        let reply = stream
+            .recv()
+            .await
+            .map_err(|e| miette::miette!("ConfirmGlobalInstall recv failed: {e}"))?;
+
+        if stream.continues() {
+            if let Some(msg) = &reply.message {
+                on_progress(msg);
+            }
+        } else {
+            return Ok(reply);
+        }
+    }
 }
 
 fn to_installed_binary(bin: ExposedBinary, pixi_bin_dir: &Path) -> InstalledBinary {

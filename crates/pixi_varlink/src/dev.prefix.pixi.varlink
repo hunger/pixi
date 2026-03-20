@@ -45,12 +45,14 @@ method GlobalInstall(
 ) -> (challenge: string)
 
 # Confirm that the auth file was created. The server checks for the file,
-# installs the environment, and returns the environment name, its path on
-# the server, and the list of exposed binaries.
+# installs the environment, and returns the result.
+# With "more", the server streams progress as intermediate replies with only
+# the "message" field set, followed by a final reply with the full result.
 method ConfirmGlobalInstall(challenge: string) -> (
-    env_name: string,
-    env_path: string,
-    binaries: []ExposedBinary
+    message: ?string,
+    env_name: ?string,
+    env_path: ?string,
+    binaries: ?[]ExposedBinary
 )
 
 error WorkspaceNotFound(path: string)

@@ -5,7 +5,9 @@ mod dev_prefix_pixi;
 // Will be used by methods that need a pixi_api::Interface (Install, Add, etc.)
 #[allow(dead_code)]
 mod non_interactive;
-mod server;
+mod reporter;
+pub(crate) mod server;
+mod streaming_handler;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,6 +15,7 @@ use std::sync::Arc;
 use varlink::{AsyncVarlinkService, ListenAsyncConfig, listen_async};
 
 use crate::server::PixiVarlinkService;
+use crate::streaming_handler::StreamingHandler;
 
 const FALLBACK_NONCE: &str = "pixi-varlink-default-nonce";
 
@@ -46,16 +49,15 @@ fn load_nonce() -> String {
 /// Address format: `unix:/path/to/socket`, `tcp:host:port`, or a bare path.
 pub async fn run_server(address: &str) -> miette::Result<()> {
     let nonce = load_nonce();
-    let handler = Arc::new(dev_prefix_pixi::new(Arc::new(
-        PixiVarlinkService::new(nonce),
-    )));
+    let pixi_service = Arc::new(PixiVarlinkService::new(nonce));
+    let streaming = Arc::new(StreamingHandler::new(pixi_service));
 
     let service = Arc::new(AsyncVarlinkService::new(
         "dev.prefix.pixi",
         "Pixi",
         pixi_consts::consts::PIXI_VERSION,
         "https://pixi.sh",
-        vec![handler],
+        vec![streaming],
     ));
 
     tracing::info!(address = %address, "listening");

@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::dev_prefix_pixi::{
     Call_ConfirmGlobalInstall, Call_GlobalInstall, Call_Info, EnvironmentInfo, ExposedBinary,
-    VarlinkInterface, WorkspaceInfo,
+    VarlinkCallError as _, VarlinkInterface, WorkspaceInfo,
 };
 
 #[allow(dead_code)]
@@ -89,6 +89,7 @@ async fn perform_global_install(
     env_name: &EnvironmentName,
     env_name_str: &str,
     pending: &PendingInstall,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> miette::Result<InstallResult> {
     let pixi_home = pixi_config::pixi_home()
         .ok_or_else(|| miette::miette!("could not determine PIXI_HOME"))?;
@@ -99,6 +100,12 @@ async fn perform_global_install(
     let mut project = Project::discover_or_create_with_bin_dir(bin_dir)
         .await?
         .with_cli_config(pixi_config::Config::load_global());
+
+    if let Some(tx) = progress_tx {
+        project = project.with_reporter_factory(move || {
+            Box::new(crate::reporter::VarlinkReporter::new(tx.clone()))
+        });
+    }
 
     let channels: Vec<NamedChannelOrUrl> = pending
         .channels
@@ -354,7 +361,7 @@ impl VarlinkInterface for PixiVarlinkService {
             "authentication succeeded, installing",
         );
 
-        match perform_global_install(&env_name, &env_name_str, &pending).await {
+        match perform_global_install(&env_name, &env_name_str, &pending, None).await {
             Ok(result) => {
                 tracing::info!(
                     env_name = %env_name,
@@ -366,9 +373,10 @@ impl VarlinkInterface for PixiVarlinkService {
                     tracing::debug!(name = %bin.name, path = %bin.path, "exposed binary");
                 }
                 call.reply(
-                    env_name_str.clone(),
-                    result.env_path.to_string_lossy().to_string(),
-                    result.binaries,
+                    None,
+                    Some(env_name_str.clone()),
+                    Some(result.env_path.to_string_lossy().to_string()),
+                    Some(result.binaries),
                 )
             }
             Err(err) => {
@@ -470,5 +478,89 @@ impl VarlinkInterface for PixiVarlinkService {
         };
 
         call.reply(info)
+    }
+}
+
+impl PixiVarlinkService {
+    /// Like `confirm_global_install` but sends progress through a channel
+    /// and returns the final replies for the streaming handler to send.
+    pub async fn confirm_global_install_streaming(
+        &self,
+        challenge: String,
+        progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> varlink::Result<Vec<varlink::Reply>> {
+        tracing::debug!(challenge = %challenge, "ConfirmGlobalInstall (streaming)");
+
+        let pending = self
+            .pending
+            .lock()
+            .expect("pending lock poisoned")
+            .remove(&challenge);
+
+        let Some(pending) = pending else {
+            tracing::warn!(challenge = %challenge, "unknown challenge");
+            let mut call = crate::dev_prefix_pixi::AsyncCall::new(false, false);
+            call.reply_authentication_failed(challenge)?;
+            return Ok(call.take_replies());
+        };
+
+        let auth_file = Self::auth_file_path(&pending.client_envs_dir, &challenge);
+
+        if !auth_file.exists() {
+            tracing::warn!(
+                challenge = %challenge,
+                expected = %auth_file.display(),
+                "auth file not found",
+            );
+            let mut call = crate::dev_prefix_pixi::AsyncCall::new(false, false);
+            call.reply_authentication_failed(challenge)?;
+            return Ok(call.take_replies());
+        }
+
+        let env_name_str =
+            self.compute_env_name(&pending.client_envs_dir, pending.environment.as_deref());
+        let env_name = EnvironmentName::from_str(&env_name_str).map_err(|e| {
+            varlink::error::Error(
+                varlink::ErrorKind::InvalidParameter(e.to_string()),
+                None,
+                None,
+            )
+        })?;
+
+        tracing::info!(
+            challenge = %challenge,
+            env_name = %env_name,
+            client_envs_dir = %pending.client_envs_dir,
+            "authentication succeeded, installing (streaming)",
+        );
+
+        let mut call = crate::dev_prefix_pixi::AsyncCall::new(false, false);
+
+        match perform_global_install(&env_name, &env_name_str, &pending, Some(progress_tx)).await {
+            Ok(result) => {
+                tracing::info!(
+                    env_name = %env_name,
+                    env_path = %result.env_path.display(),
+                    binaries = result.binaries.len(),
+                    "global install completed",
+                );
+                Call_ConfirmGlobalInstall::reply(
+                    &mut call,
+                    None,
+                    Some(env_name_str),
+                    Some(result.env_path.to_string_lossy().to_string()),
+                    Some(result.binaries),
+                )?;
+            }
+            Err(err) => {
+                tracing::error!(env_name = %env_name, error = %err, "global install failed");
+                crate::dev_prefix_pixi::VarlinkCallError::reply_global_install_failed(&mut call, err.to_string())?;
+            }
+        }
+
+        // Drop the progress sender implicitly (it's moved into the reporter
+        // factory and dropped when the install finishes)
+
+        Ok(call.take_replies())
     }
 }
