@@ -2,8 +2,9 @@
 Description=Pixi Varlink Socket
 
 [Socket]
-ListenStream=%t/pixi.sock
+ListenStream=/run/pixi/pixi.sock
 FileDescriptorName=varlink
+SocketMode=0666
 
 [Install]
 WantedBy=sockets.target

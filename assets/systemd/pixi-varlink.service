@@ -3,7 +3,21 @@ Description=Pixi Varlink Server
 
 [Service]
 Type=simple
-ExecStart=pixi varlink
+ExecStart=pixi varlink --cache-dir /var/cache/pixi --envs-dir /var/lib/pixi/envs
+
+# Run as a dedicated system user/group, created automatically by systemd.
+DynamicUser=yes
+User=pixi
+Group=pixi
+
+# Cache directory: private to the service.
+CacheDirectory=pixi
+CacheDirectoryMode=0750
+
+# State directory for environments: world-readable so other users can use
+# installed environments.
+StateDirectory=pixi/envs
+StateDirectoryMode=0755
 
 # Nonce credential passed to the server via $CREDENTIALS_DIRECTORY/nonce.
 # Generate an encrypted credential with:
@@ -11,6 +25,49 @@ ExecStart=pixi varlink
 # Then replace SetCredential= with SetCredentialEncrypted= and the ciphertext.
 SetCredential=nonce:pixi-varlink-default-nonce
 
+# --- Filesystem hardening ---
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/cache/pixi /var/lib/pixi
+
+# --- Network hardening ---
+# AF_UNIX for the varlink socket, AF_INET/AF_INET6 for package downloads.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# --- Privilege hardening ---
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Device and IPC isolation ---
+PrivateDevices=yes
+RemoveIPC=yes
+
+# --- Memory and execution hardening ---
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+
+# --- System call filter ---
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# --- Capabilities ---
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# --- Misc ---
+UMask=0022
+
+# --- Logging ---
 # Log level is controlled by RUST_LOG. Examples:
 #   error   - errors only (default)
 #   warn    - errors and warnings
@@ -18,13 +75,9 @@ SetCredential=nonce:pixi-varlink-default-nonce
 #   debug   - individual requests and responses
 #   trace   - full detail including pixi internals
 #
-# Override in a drop-in (systemctl --user edit pixi-varlink):
+# Override in a drop-in (systemctl edit pixi-varlink):
 #   [Service]
 #   Environment=RUST_LOG=info
 #
 # Or target specific crates:
 #   Environment=RUST_LOG=pixi_varlink=debug,pixi_core=warn
-
-# Defaults shown below; override in a drop-in or environment file.
-# Environment=PIXI_CACHE_DIR=%h/.cache/rattler
-# Environment=PIXI_ENVS_DIR=%h/.local/share/pixi
