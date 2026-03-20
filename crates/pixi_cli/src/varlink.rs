@@ -49,9 +49,11 @@ fn default_envs_dir() -> PathBuf {
 pub async fn execute(args: Args) -> miette::Result<()> {
     // SAFETY: called before spawning threads; the server is single-threaded at
     // this point. These env vars configure pixi internals (cache, environments).
+    // PIXI_HOME controls where pixi_global stores envs ($PIXI_HOME/envs),
+    // manifests ($PIXI_HOME/manifests), and bin ($PIXI_HOME/bin).
     unsafe {
         std::env::set_var("PIXI_CACHE_DIR", &args.cache_dir);
-        std::env::set_var("PIXI_ENVS_DIR", &args.envs_dir);
+        std::env::set_var("PIXI_HOME", &args.envs_dir);
     }
 
     let address = pixi_varlink::client::normalize_address(&args.address);

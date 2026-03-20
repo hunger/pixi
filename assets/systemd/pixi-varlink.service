@@ -3,7 +3,7 @@ Description=Pixi Varlink Server
 
 [Service]
 Type=simple
-ExecStart=pixi varlink --cache-dir /var/cache/pixi --envs-dir /var/lib/pixi/envs
+ExecStart=pixi varlink --cache-dir /var/cache/pixi --envs-dir /var/lib/pixi
 
 # Run as a dedicated system user/group, created automatically by systemd.
 DynamicUser=yes
@@ -14,9 +14,9 @@ Group=pixi
 CacheDirectory=pixi
 CacheDirectoryMode=0750
 
-# State directory for environments: world-readable so other users can use
-# installed environments.
-StateDirectory=pixi/envs
+# State directory for pixi home (envs, manifests, bin): world-readable so
+# other users can use installed environments.
+StateDirectory=pixi
 StateDirectoryMode=0755
 
 # Nonce credential passed to the server via $CREDENTIALS_DIRECTORY/nonce.

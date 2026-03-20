@@ -12,7 +12,9 @@ pixi_api = { workspace = true }
 pixi_config = { workspace = true }
 pixi_consts = { workspace = true }
 pixi_core = { workspace = true }
+pixi_global = { workspace = true }
 pixi_manifest = { workspace = true }
+rattler_conda_types = { workspace = true }
 serde = { workspace = true }
 serde_derive = "1"
 serde_json = { workspace = true }

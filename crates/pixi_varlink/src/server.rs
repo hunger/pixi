@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use pixi_consts::consts;
 use pixi_core::WorkspaceLocator;
+use pixi_global::{EnvironmentName, Mapping, Project};
 use pixi_manifest::{FeaturesExt, HasFeaturesIter};
+use rattler_conda_types::{MatchSpec, NamedChannelOrUrl, Platform};
 use sha2::{Digest, Sha256};
 
 use crate::dev_prefix_pixi::{
@@ -13,14 +16,22 @@ use crate::dev_prefix_pixi::{
     WorkspaceInfo,
 };
 
-struct PendingChallenge {
-    client_home: PathBuf,
+#[allow(dead_code)]
+struct PendingInstall {
+    client_home: String,
+    packages: Vec<String>,
+    channels: Vec<String>,
+    platform: Option<String>,
     environment: Option<String>,
+    expose: Vec<String>,
+    with: Vec<String>,
+    force_reinstall: bool,
+    no_shortcuts: bool,
 }
 
 pub struct PixiVarlinkService {
     nonce: String,
-    pending: Mutex<HashMap<String, PendingChallenge>>,
+    pending: Mutex<HashMap<String, PendingInstall>>,
 }
 
 impl PixiVarlinkService {
@@ -35,11 +46,6 @@ impl PixiVarlinkService {
         PathBuf::from(client_home).join(format!(".pixi-server-auth-{challenge}"))
     }
 
-    /// Compute a server-side environment name from the client's home directory
-    /// and the requested environment name, keyed by the server nonce.
-    ///
-    /// Format: `SHA256(nonce + client_home + nonce + environment + nonce)`
-    /// truncated to 16 hex characters.
     fn compute_env_name(&self, client_home: &str, environment: Option<&str>) -> String {
         let env = environment.unwrap_or("default");
         let mut hasher = Sha256::new();
@@ -53,6 +59,164 @@ impl PixiVarlinkService {
             .map(|pair| format!("{:02x}", pair[0] ^ pair[1]))
             .collect()
     }
+}
+
+async fn perform_global_install(
+    env_name: &EnvironmentName,
+    pending: &PendingInstall,
+) -> miette::Result<()> {
+    let mut project = Project::discover_or_create()
+        .await?
+        .with_cli_config(pixi_config::Config::load_global());
+
+    let channels: Vec<NamedChannelOrUrl> = pending
+        .channels
+        .iter()
+        .map(|c| c.parse())
+        .collect::<Result<_, _>>()
+        .map_err(|e| miette::miette!("invalid channel: {e}"))?;
+
+    let platform: Option<Platform> = pending
+        .platform
+        .as_ref()
+        .map(|p| Platform::from_str(p))
+        .transpose()
+        .map_err(|e| miette::miette!("invalid platform: {e}"))?;
+
+    let with_specs: Vec<MatchSpec> = pending
+        .with
+        .iter()
+        .map(|s| MatchSpec::from_str(s, rattler_conda_types::ParseStrictness::Lenient))
+        .collect::<Result<_, _>>()
+        .map_err(|e| miette::miette!("invalid --with spec: {e}"))?;
+
+    let expose_mappings: Vec<Mapping> = pending
+        .expose
+        .iter()
+        .map(|s| Mapping::from_str(s))
+        .collect::<Result<_, _>>()
+        .map_err(|e| miette::miette!("invalid --expose mapping: {e}"))?;
+
+    let channel_config = project.global_channel_config().clone();
+
+    // Parse packages into GlobalSpecs
+    let specs: Vec<pixi_global::project::GlobalSpec> = pending
+        .packages
+        .iter()
+        .map(|pkg| {
+            let match_spec =
+                MatchSpec::from_str(pkg, rattler_conda_types::ParseStrictness::Lenient)
+                    .map_err(|e| miette::miette!("invalid package spec '{pkg}': {e}"))?;
+            pixi_global::project::GlobalSpec::try_from_matchspec_with_name(
+                match_spec,
+                &channel_config,
+            )
+            .map_err(|e| miette::miette!("invalid package spec '{pkg}': {e}"))
+        })
+        .collect::<miette::Result<_>>()?;
+
+    // Force-reinstall: remove existing environment first
+    if pending.force_reinstall && project.environment(env_name).is_some() {
+        let _ = project.remove_environment(env_name).await?;
+    }
+
+    // Set up channels
+    let env_channels = if channels.is_empty() {
+        project.config().default_channels()
+    } else {
+        channels
+    };
+
+    // Create the environment if it doesn't exist
+    if !project.manifest.parsed.envs.contains_key(env_name) {
+        project
+            .manifest
+            .add_environment(env_name, Some(env_channels))?;
+    }
+
+    // Set platform
+    if let Some(platform) = platform {
+        project.manifest.set_platform(env_name, platform)?;
+    }
+
+    // Parse --with as GlobalSpecs for dependencies
+    let with_global_specs: Vec<pixi_global::project::GlobalSpec> = with_specs
+        .into_iter()
+        .map(|spec| {
+            pixi_global::project::GlobalSpec::try_from_matchspec_with_name(spec, &channel_config)
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|e| miette::miette!("invalid --with spec: {e}"))?;
+
+    // Add all dependencies
+    for spec in specs.iter().chain(with_global_specs.iter()) {
+        project.manifest.add_dependency(env_name, spec)?;
+    }
+
+    // Set expose mappings
+    if !expose_mappings.is_empty() {
+        project.manifest.remove_all_exposed_mappings(env_name)?;
+        for mapping in &expose_mappings {
+            project.manifest.add_exposed_mapping(env_name, mapping)?;
+        }
+    }
+
+    // Check if already in sync
+    if project
+        .environment_in_sync_internal(env_name, true)
+        .await?
+    {
+        tracing::info!(env_name = %env_name, "environment already in sync");
+        project.manifest.save().await?;
+        return Ok(());
+    }
+
+    // Install the environment
+    let environment_update = project
+        .install_environment_with_options(env_name, pending.force_reinstall)
+        .await?;
+
+    // Sync exposed names
+    let with_package_names: Vec<_> = with_global_specs
+        .iter()
+        .filter_map(|spec| {
+            let ms = MatchSpec::from_str(
+                spec.name().as_normalized(),
+                rattler_conda_types::ParseStrictness::Lenient,
+            )
+            .ok()?;
+            ms.name.as_exact().cloned()
+        })
+        .collect();
+
+    let expose_type = if !expose_mappings.is_empty() {
+        pixi_global::project::ExposedType::Mappings(expose_mappings)
+    } else if with_package_names.is_empty() {
+        pixi_global::project::ExposedType::All
+    } else {
+        pixi_global::project::ExposedType::Ignore(with_package_names)
+    };
+    project
+        .sync_exposed_names(env_name, expose_type)
+        .await?;
+
+    // Expose executables
+    let _ = project
+        .expose_executables_from_environment(env_name)
+        .await?;
+
+    // Sync completions
+    let _ = project.sync_completions(env_name).await?;
+
+    // Log installed packages
+    let requested_names: Vec<_> = specs.iter().map(|s| s.name().clone()).collect();
+    let changes = environment_update.user_requested_changes(&requested_names);
+    for (name, change) in &changes {
+        tracing::info!(package = %name.as_normalized(), change = ?change, "installed");
+    }
+
+    project.manifest.save().await?;
+    Ok(())
 }
 
 #[async_trait]
@@ -91,9 +255,16 @@ impl VarlinkInterface for PixiVarlinkService {
             .expect("pending lock poisoned")
             .insert(
                 challenge.clone(),
-                PendingChallenge {
-                    client_home: PathBuf::from(&client_home),
+                PendingInstall {
+                    client_home,
+                    packages,
+                    channels,
+                    platform,
                     environment,
+                    expose,
+                    with,
+                    force_reinstall,
+                    no_shortcuts,
                 },
             );
 
@@ -118,30 +289,43 @@ impl VarlinkInterface for PixiVarlinkService {
             return call.reply_authentication_failed(challenge);
         };
 
-        let auth_file = Self::auth_file_path(
-            pending.client_home.to_str().unwrap_or(""),
-            &challenge,
-        );
+        let auth_file = Self::auth_file_path(&pending.client_home, &challenge);
 
-        if auth_file.exists() {
-            let env_name = self.compute_env_name(
-                pending.client_home.to_str().unwrap_or(""),
-                pending.environment.as_deref(),
-            );
-            tracing::info!(
-                challenge = %challenge,
-                env_name = %env_name,
-                client_home = %pending.client_home.display(),
-                "authentication succeeded",
-            );
-            call.reply()
-        } else {
+        if !auth_file.exists() {
             tracing::warn!(
                 challenge = %challenge,
                 expected = %auth_file.display(),
                 "auth file not found",
             );
-            call.reply_authentication_failed(challenge)
+            return call.reply_authentication_failed(challenge);
+        }
+
+        let env_name_str =
+            self.compute_env_name(&pending.client_home, pending.environment.as_deref());
+        let env_name = EnvironmentName::from_str(&env_name_str).map_err(|e| {
+            varlink::error::Error(
+                varlink::ErrorKind::InvalidParameter(e.to_string()),
+                None,
+                None,
+            )
+        })?;
+
+        tracing::info!(
+            challenge = %challenge,
+            env_name = %env_name,
+            client_home = %pending.client_home,
+            "authentication succeeded, installing",
+        );
+
+        match perform_global_install(&env_name, &pending).await {
+            Ok(()) => {
+                tracing::info!(env_name = %env_name, "global install completed");
+                call.reply()
+            }
+            Err(err) => {
+                tracing::error!(env_name = %env_name, error = %err, "global install failed");
+                call.reply_global_install_failed(err.to_string())
+            }
         }
     }
 
