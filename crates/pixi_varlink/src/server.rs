@@ -6,19 +6,19 @@ use async_trait::async_trait;
 use pixi_consts::consts;
 use pixi_core::WorkspaceLocator;
 use pixi_manifest::{FeaturesExt, HasFeaturesIter};
+use sha2::{Digest, Sha256};
 
 use crate::dev_prefix_pixi::{
     Call_ConfirmGlobalInstall, Call_GlobalInstall, Call_Info, EnvironmentInfo, VarlinkInterface,
     WorkspaceInfo,
 };
 
-/// Pending challenge: maps UUID to the client_home where the auth file should appear.
 struct PendingChallenge {
     client_home: PathBuf,
+    environment: Option<String>,
 }
 
 pub struct PixiVarlinkService {
-    #[allow(dead_code)]
     nonce: String,
     pending: Mutex<HashMap<String, PendingChallenge>>,
 }
@@ -33,6 +33,25 @@ impl PixiVarlinkService {
 
     fn auth_file_path(client_home: &str, challenge: &str) -> PathBuf {
         PathBuf::from(client_home).join(format!(".pixi-server-auth-{challenge}"))
+    }
+
+    /// Compute a server-side environment name from the client's home directory
+    /// and the requested environment name, keyed by the server nonce.
+    ///
+    /// Format: `SHA256(nonce + client_home + nonce + environment + nonce)`
+    /// truncated to 16 hex characters.
+    fn compute_env_name(&self, client_home: &str, environment: Option<&str>) -> String {
+        let env = environment.unwrap_or("default");
+        let mut hasher = Sha256::new();
+        hasher.update(self.nonce.as_bytes());
+        hasher.update(client_home.as_bytes());
+        hasher.update(self.nonce.as_bytes());
+        hasher.update(env.as_bytes());
+        hasher.update(self.nonce.as_bytes());
+        let hash = hasher.finalize();
+        hash.chunks(2)
+            .map(|pair| format!("{:02x}", pair[0] ^ pair[1]))
+            .collect()
     }
 }
 
@@ -74,6 +93,7 @@ impl VarlinkInterface for PixiVarlinkService {
                 challenge.clone(),
                 PendingChallenge {
                     client_home: PathBuf::from(&client_home),
+                    environment,
                 },
             );
 
@@ -104,9 +124,14 @@ impl VarlinkInterface for PixiVarlinkService {
         );
 
         if auth_file.exists() {
+            let env_name = self.compute_env_name(
+                pending.client_home.to_str().unwrap_or(""),
+                pending.environment.as_deref(),
+            );
             tracing::info!(
                 challenge = %challenge,
-                path = %auth_file.display(),
+                env_name = %env_name,
+                client_home = %pending.client_home.display(),
                 "authentication succeeded",
             );
             call.reply()
