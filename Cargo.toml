@@ -128,6 +128,7 @@ pixi_url = { path = "crates/pixi_url" }
 pixi_utils = { path = "crates/pixi_utils", default-features = false }
 pixi_uv_context = { path = "crates/pixi_uv_context" }
 pixi_uv_conversions = { path = "crates/pixi_uv_conversions" }
+pixi_varlink = { path = "crates/pixi_varlink" }
 pixi_variant = { path = "crates/pixi_variant" }
 pypi_mapping = { path = "crates/pypi_mapping" }
 pypi_modifiers = { path = "crates/pypi_modifiers" }
@@ -212,6 +213,9 @@ uv-requirements-txt = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
 uv-resolver = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
 uv-types = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
 uv-workspace = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
+varlink = { git = "https://github.com/varlink/rust", default-features = false }
+varlink_generator = { git = "https://github.com/varlink/rust" }
+varlink_stdinterfaces = { git = "https://github.com/varlink/rust", default-features = false }
 which = "8.0.0"
 xxhash-rust = "0.8.15"
 zip = { version = "2.4.2", default-features = false }

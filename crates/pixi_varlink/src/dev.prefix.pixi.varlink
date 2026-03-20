@@ -1,0 +1,25 @@
+# Pixi workspace management over varlink IPC
+interface dev.prefix.pixi
+
+type EnvironmentInfo (
+    name: string,
+    features: []string,
+    solve_group: ?string,
+    platforms: []string,
+    dependencies: []string,
+    pypi_dependencies: []string,
+    tasks: []string,
+    prefix: string
+)
+
+type WorkspaceInfo (
+    name: string,
+    manifest_path: string,
+    version: ?string,
+    pixi_version: string,
+    environments: []EnvironmentInfo
+)
+
+method Info(manifest_path: ?string) -> (workspace: WorkspaceInfo)
+
+error WorkspaceNotFound(path: string)
