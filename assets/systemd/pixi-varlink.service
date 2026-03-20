@@ -4,6 +4,27 @@ Description=Pixi Varlink Server
 [Service]
 Type=simple
 ExecStart=pixi varlink
+
+# Nonce credential passed to the server via $CREDENTIALS_DIRECTORY/nonce.
+# Generate an encrypted credential with:
+#   systemd-creds encrypt --name=nonce - - <<< "$(openssl rand -hex 16)"
+# Then replace SetCredential= with SetCredentialEncrypted= and the ciphertext.
+SetCredential=nonce:pixi-varlink-default-nonce
+
+# Log level is controlled by RUST_LOG. Examples:
+#   error   - errors only (default)
+#   warn    - errors and warnings
+#   info    - startup, shutdown, config
+#   debug   - individual requests and responses
+#   trace   - full detail including pixi internals
+#
+# Override in a drop-in (systemctl --user edit pixi-varlink):
+#   [Service]
+#   Environment=RUST_LOG=info
+#
+# Or target specific crates:
+#   Environment=RUST_LOG=pixi_varlink=debug,pixi_core=warn
+
 # Defaults shown below; override in a drop-in or environment file.
 # Environment=PIXI_CACHE_DIR=%h/.cache/rattler
 # Environment=PIXI_ENVS_DIR=%h/.local/share/pixi

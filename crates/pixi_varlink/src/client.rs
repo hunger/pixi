@@ -1,8 +1,4 @@
-use miette::Context;
-
-use crate::dev_prefix_pixi::{self, VarlinkClientInterface as _};
-
-pub use crate::dev_prefix_pixi::{EnvironmentInfo, WorkspaceInfo};
+use varlink_stdinterfaces::org_varlink_service_async::VarlinkClientInterface as _;
 
 /// Normalize a varlink address: bare paths become `unix:` addresses.
 pub fn normalize_address(address: &str) -> String {
@@ -15,22 +11,18 @@ pub fn normalize_address(address: &str) -> String {
     }
 }
 
-/// Connect to a pixi varlink server and call `Info`.
-pub async fn info(
-    address: &str,
-    manifest_path: Option<String>,
-) -> miette::Result<WorkspaceInfo> {
+/// Connect to a pixi varlink server and return its version string.
+pub async fn version(address: &str) -> miette::Result<String> {
     let connection = varlink::AsyncConnection::with_address(address)
         .await
         .map_err(|e| miette::miette!("failed to connect to {address}: {e}"))?;
 
-    let client = dev_prefix_pixi::VarlinkClient::new(connection);
-    let reply = client
-        .info(manifest_path)
+    let client = varlink_stdinterfaces::org_varlink_service_async::VarlinkClient::new(connection);
+    let info = client
+        .get_info()
         .call()
         .await
-        .map_err(|e| miette::miette!("{e}"))
-        .wrap_err_with(|| format!("varlink call to {address} failed"))?;
+        .map_err(|e| miette::miette!("GetInfo call failed: {e}"))?;
 
-    Ok(reply.workspace)
+    Ok(info.version)
 }

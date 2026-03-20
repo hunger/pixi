@@ -5,7 +5,16 @@ use pixi_manifest::{FeaturesExt, HasFeaturesIter};
 
 use crate::dev_prefix_pixi::{Call_Info, EnvironmentInfo, VarlinkInterface, WorkspaceInfo};
 
-pub struct PixiVarlinkService;
+pub struct PixiVarlinkService {
+    #[allow(dead_code)]
+    nonce: String,
+}
+
+impl PixiVarlinkService {
+    pub fn new(nonce: String) -> Self {
+        Self { nonce }
+    }
+}
 
 #[async_trait]
 impl VarlinkInterface for PixiVarlinkService {
@@ -14,6 +23,8 @@ impl VarlinkInterface for PixiVarlinkService {
         call: &mut dyn Call_Info,
         manifest_path: Option<String>,
     ) -> varlink::Result<()> {
+        tracing::debug!(manifest_path = manifest_path.as_deref(), "Info request");
+
         let mut locator = WorkspaceLocator::for_cli();
         if let Some(path) = &manifest_path {
             locator = locator.with_search_start(
@@ -22,14 +33,22 @@ impl VarlinkInterface for PixiVarlinkService {
         }
 
         let workspace = match locator.locate() {
-            Ok(ws) => ws,
-            Err(_) => {
+            Ok(ws) => {
+                tracing::debug!(
+                    workspace = ws.display_name(),
+                    manifest = %ws.workspace.provenance.path.display(),
+                    "workspace found",
+                );
+                ws
+            }
+            Err(err) => {
                 let path = manifest_path.unwrap_or_else(|| ".".to_string());
+                tracing::warn!(path = %path, error = %err, "workspace not found");
                 return call.reply_workspace_not_found(path);
             }
         };
 
-        let environments = workspace
+        let environments: Vec<EnvironmentInfo> = workspace
             .environments()
             .iter()
             .map(|env| {
@@ -62,6 +81,12 @@ impl VarlinkInterface for PixiVarlinkService {
                 }
             })
             .collect();
+
+        tracing::debug!(
+            workspace = workspace.display_name(),
+            environments = environments.len(),
+            "Info reply",
+        );
 
         let version = workspace
             .workspace

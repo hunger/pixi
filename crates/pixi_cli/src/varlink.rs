@@ -55,8 +55,12 @@ pub async fn execute(args: Args) -> miette::Result<()> {
     }
 
     let address = pixi_varlink::client::normalize_address(&args.address);
-    eprintln!("Listening on {address}");
-    eprintln!("Cache dir: {}", args.cache_dir.display());
-    eprintln!("Envs dir: {}", args.envs_dir.display());
+    tracing::info!(
+        address = %address,
+        cache_dir = %args.cache_dir.display(),
+        envs_dir = %args.envs_dir.display(),
+        version = pixi_consts::consts::PIXI_VERSION,
+        "starting varlink server",
+    );
     pixi_varlink::run_server(&address).await
 }

@@ -38,9 +38,8 @@ pub async fn execute(args: Args) -> miette::Result<()> {
 }
 
 async fn print_remote_version(address: &str) -> miette::Result<()> {
-    let ws = pixi_varlink::client::info(address, None).await?;
+    let remote = pixi_varlink::client::version(address).await?;
     let local = pixi_consts::consts::PIXI_VERSION;
-    let remote = &ws.pixi_version;
 
     if local == remote {
         writeln!(std::io::stdout(), "{remote}").into_diagnostic()?;

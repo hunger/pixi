@@ -7,17 +7,48 @@ mod dev_prefix_pixi;
 mod non_interactive;
 mod server;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use varlink::{AsyncVarlinkService, ListenAsyncConfig, listen_async};
 
 use crate::server::PixiVarlinkService;
 
+const FALLBACK_NONCE: &str = "pixi-varlink-default-nonce";
+
+/// Read the nonce from `$CREDENTIALS_DIRECTORY/nonce`, falling back to a
+/// hardcoded default when not running under systemd socket activation.
+fn load_nonce() -> String {
+    if let Ok(creds_dir) = std::env::var("CREDENTIALS_DIRECTORY") {
+        let path = PathBuf::from(creds_dir).join("nonce");
+        match std::fs::read_to_string(&path) {
+            Ok(nonce) => {
+                let nonce = nonce.trim().to_string();
+                tracing::info!("loaded nonce from {}", path.display());
+                return nonce;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to read nonce, using fallback",
+                );
+            }
+        }
+    } else {
+        tracing::debug!("CREDENTIALS_DIRECTORY not set, using fallback nonce");
+    }
+    FALLBACK_NONCE.to_string()
+}
+
 /// Start a varlink server listening on the given address.
 ///
-/// Address format: `unix:/path/to/socket` or `tcp:host:port`.
+/// Address format: `unix:/path/to/socket`, `tcp:host:port`, or a bare path.
 pub async fn run_server(address: &str) -> miette::Result<()> {
-    let handler = Arc::new(dev_prefix_pixi::new(Arc::new(PixiVarlinkService)));
+    let nonce = load_nonce();
+    let handler = Arc::new(dev_prefix_pixi::new(Arc::new(
+        PixiVarlinkService::new(nonce),
+    )));
 
     let service = Arc::new(AsyncVarlinkService::new(
         "dev.prefix.pixi",
@@ -27,9 +58,14 @@ pub async fn run_server(address: &str) -> miette::Result<()> {
         vec![handler],
     ));
 
-    tracing::info!("varlink server listening on {address}");
+    tracing::info!(address = %address, "listening");
 
-    listen_async(service, address, &ListenAsyncConfig::default())
-        .await
-        .map_err(|e| miette::miette!("varlink server error: {e}"))
+    let result = listen_async(service, address, &ListenAsyncConfig::default()).await;
+
+    match &result {
+        Ok(()) => tracing::info!("server stopped"),
+        Err(e) => tracing::error!(error = %e, "server error"),
+    }
+
+    result.map_err(|e| miette::miette!("varlink server error: {e}"))
 }
