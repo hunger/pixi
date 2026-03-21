@@ -43,14 +43,24 @@ pub struct GlobalInstallArgs {
     pub client_envs_dir: String,
 }
 
+/// An installed package name and version.
+pub struct InstalledPackage {
+    pub name: String,
+    pub version: String,
+}
+
 /// Result of a remote global install.
 pub struct GlobalInstallResult {
     /// The server-side environment name (SHA-based).
     pub env_name: String,
+    /// The client-facing environment name.
+    pub display_env_name: String,
     /// The absolute path to the environment on the server.
     pub env_path: PathBuf,
     /// Where the client should symlink the environment.
     pub local_env_symlink: PathBuf,
+    /// Packages that were installed/changed.
+    pub packages: Vec<InstalledPackage>,
     /// The exposed binaries.
     pub binaries: Vec<InstalledBinary>,
 }
@@ -152,8 +162,18 @@ async fn confirm_and_cleanup(
         .expect("envs dir should have a parent")
         .join("bin");
 
-    let local_env_name = client_env_name.unwrap_or(&env_name);
-    let local_env_symlink = envs_dir.join(local_env_name);
+    let display_env_name = client_env_name.unwrap_or(&env_name).to_string();
+    let local_env_symlink = envs_dir.join(&display_env_name);
+
+    let packages = reply
+        .packages
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| InstalledPackage {
+            name: p.name,
+            version: p.version,
+        })
+        .collect();
 
     let binaries = binaries_raw
         .into_iter()
@@ -162,8 +182,10 @@ async fn confirm_and_cleanup(
 
     Ok(GlobalInstallResult {
         env_name,
+        display_env_name,
         env_path: PathBuf::from(env_path),
         local_env_symlink,
+        packages,
         binaries,
     })
 }

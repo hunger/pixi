@@ -28,6 +28,12 @@ type ExposedBinary (
     path: string
 )
 
+# A package that was installed.
+type InstalledPackage (
+    name: string,
+    version: string
+)
+
 method Info(manifest_path: ?string) -> (workspace: WorkspaceInfo)
 
 # Install packages globally. Returns a challenge UUID. The client must create
@@ -52,6 +58,7 @@ method ConfirmGlobalInstall(challenge: string) -> (
     message: ?string,
     env_name: ?string,
     env_path: ?string,
+    packages: ?[]InstalledPackage,
     binaries: ?[]ExposedBinary
 )
 

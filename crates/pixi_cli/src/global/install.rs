@@ -80,6 +80,18 @@ pub struct Args {
     pub backend_override: Option<pixi_build_frontend::BackendOverride>,
 }
 
+impl Args {
+    /// Returns the environment name if explicitly set, or the first package
+    /// name as a fallback. This mirrors the default behavior of `pixi global
+    /// install` which names environments after their packages.
+    pub fn environment_or_default(&self) -> Option<String> {
+        self.environment
+            .as_ref()
+            .map(|e| e.to_string())
+            .or_else(|| self.packages.specs.first().cloned())
+    }
+}
+
 pub async fn execute(args: Args) -> miette::Result<()> {
     let config = Config::with_cli_config(&args.config);
 

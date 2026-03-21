@@ -3,7 +3,7 @@ Description=Pixi Varlink Server
 
 [Service]
 Type=simple
-ExecStart=pixi varlink --cache-dir /var/cache/pixi --envs-dir /var/lib/pixi
+ExecStart=pixi remote --address /run/pixi/pixi.sock serve --cache-dir /var/cache/pixi --envs-dir /var/lib/pixi
 
 # Run as a dedicated system user/group, created automatically by systemd.
 DynamicUser=yes
@@ -27,7 +27,9 @@ SetCredential=nonce:pixi-varlink-default-nonce
 
 # --- Filesystem hardening ---
 ProtectSystem=strict
-ProtectHome=yes
+# read-only: the server needs to read auth challenge files that clients
+# create in their home directories.
+ProtectHome=read-only
 PrivateTmp=yes
 ReadWritePaths=/var/cache/pixi /var/lib/pixi
 

@@ -82,6 +82,7 @@ async fn list_binaries(bin_dir: &PathBuf) -> miette::Result<Vec<ExposedBinary>> 
 
 struct InstallResult {
     env_path: PathBuf,
+    packages: Vec<crate::dev_prefix_pixi::InstalledPackage>,
     binaries: Vec<ExposedBinary>,
 }
 
@@ -199,6 +200,7 @@ async fn perform_global_install(
         project.manifest.save().await?;
         return Ok(InstallResult {
             env_path,
+            packages: vec![],
             binaries: list_binaries(&env_bin_dir).await?,
         });
     }
@@ -238,14 +240,30 @@ async fn perform_global_install(
 
     let requested_names: Vec<_> = specs.iter().map(|s| s.name().clone()).collect();
     let changes = environment_update.user_requested_changes(&requested_names);
-    for (name, change) in &changes {
-        tracing::info!(package = %name.as_normalized(), change = ?change, "installed");
-    }
+
+    let packages: Vec<crate::dev_prefix_pixi::InstalledPackage> = changes
+        .iter()
+        .filter_map(|(name, change)| {
+            let version = match change {
+                pixi_global::common::InstallChange::Installed(v) => v.to_string(),
+                pixi_global::common::InstallChange::Upgraded(_, v) => v.to_string(),
+                pixi_global::common::InstallChange::Reinstalled(_, v) => v.to_string(),
+                pixi_global::common::InstallChange::TransitiveUpgraded(_, v) => v.to_string(),
+                pixi_global::common::InstallChange::Removed => return None,
+            };
+            tracing::info!(package = %name.as_normalized(), version = %version, "installed");
+            Some(crate::dev_prefix_pixi::InstalledPackage {
+                name: name.as_normalized().to_string(),
+                version,
+            })
+        })
+        .collect();
 
     project.manifest.save().await?;
 
     Ok(InstallResult {
         env_path,
+        packages,
         binaries: list_binaries(&env_bin_dir).await?,
     })
 }
@@ -376,6 +394,7 @@ impl VarlinkInterface for PixiVarlinkService {
                     None,
                     Some(env_name_str.clone()),
                     Some(result.env_path.to_string_lossy().to_string()),
+                    Some(result.packages),
                     Some(result.binaries),
                 )
             }
@@ -549,6 +568,7 @@ impl PixiVarlinkService {
                     None,
                     Some(env_name_str),
                     Some(result.env_path.to_string_lossy().to_string()),
+                    Some(result.packages),
                     Some(result.binaries),
                 )?;
             }

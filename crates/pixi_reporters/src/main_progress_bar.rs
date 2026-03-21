@@ -109,6 +109,7 @@ impl<T: Tracker> MainProgressBar<T> {
         let mut state = self.inner.write();
         state.clear();
     }
+
 }
 
 impl<T: Tracker> State<T> {

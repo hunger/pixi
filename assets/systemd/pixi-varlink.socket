@@ -5,6 +5,8 @@ Description=Pixi Varlink Socket
 ListenStream=/run/pixi/pixi.sock
 FileDescriptorName=varlink
 SocketMode=0666
+RuntimeDirectory=pixi
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=sockets.target

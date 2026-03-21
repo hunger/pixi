@@ -51,7 +51,6 @@ pub mod tree;
 pub mod update;
 pub mod upgrade;
 pub mod upload;
-pub mod varlink;
 pub mod workspace;
 
 #[derive(Parser, Debug)]
@@ -192,7 +191,6 @@ pub enum Command {
     Update(update::Args),
     Upgrade(upgrade::Args),
     Upload(upload::Args),
-    Varlink(varlink::Args),
     #[clap(alias = "project")]
     Workspace(workspace::Args),
     #[command(external_subcommand)]
@@ -387,7 +385,6 @@ pub async fn execute_command(
         Command::Exec(args) => exec::execute(args).await,
         Command::Build(args) => build::execute(args).await,
         Command::Remote(cmd) => remote::execute(cmd).await,
-        Command::Varlink(cmd) => varlink::execute(cmd).await,
         Command::External(args) => command_info::execute_external_command(args),
     }
 }

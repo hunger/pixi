@@ -1,6 +1,6 @@
 mod download_verify_reporter;
 mod git;
-mod main_progress_bar;
+pub mod main_progress_bar;
 mod release_notes;
 mod repodata_reporter;
 mod run_exports;
