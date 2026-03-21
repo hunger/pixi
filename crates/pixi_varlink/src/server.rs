@@ -4,16 +4,15 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use miette::IntoDiagnostic;
 use pixi_consts::consts;
 use pixi_core::WorkspaceLocator;
-use pixi_global::{BinDir, EnvironmentName, Mapping, Project};
+use pixi_global::{EnvironmentName, Mapping, Project};
 use pixi_manifest::{FeaturesExt, HasFeaturesIter};
 use rattler_conda_types::{MatchSpec, NamedChannelOrUrl, Platform};
 use sha2::{Digest, Sha256};
 
 use crate::dev_prefix_pixi::{
-    Call_ConfirmGlobalInstall, Call_GlobalInstall, Call_Info, EnvironmentInfo, ExposedBinary,
+    Call_ConfirmGlobalInstall, Call_GlobalInstall, Call_Info, EnvironmentInfo,
     VarlinkCallError as _, VarlinkInterface, WorkspaceInfo,
 };
 
@@ -32,13 +31,17 @@ struct PendingInstall {
 
 pub struct PixiVarlinkService {
     nonce: String,
+    base_dir: PathBuf,
     pending: Mutex<HashMap<String, PendingInstall>>,
 }
 
 impl PixiVarlinkService {
     pub fn new(nonce: String) -> Self {
+        let base_dir = pixi_config::pixi_home()
+            .expect("PIXI_HOME must be set before creating PixiVarlinkService");
         Self {
             nonce,
+            base_dir,
             pending: Mutex::new(HashMap::new()),
         }
     }
@@ -62,43 +65,28 @@ impl PixiVarlinkService {
     }
 }
 
-/// Collect all files in a directory as (file_name, full_path) pairs.
-async fn list_binaries(bin_dir: &PathBuf) -> miette::Result<Vec<ExposedBinary>> {
-    let mut binaries = Vec::new();
-    let mut entries = tokio::fs::read_dir(bin_dir).await.into_diagnostic()?;
-    while let Some(entry) = entries.next_entry().await.into_diagnostic()? {
-        let path = entry.path();
-        if path.is_file() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            binaries.push(ExposedBinary {
-                name,
-                path: path.to_string_lossy().to_string(),
-            });
-        }
-    }
-    binaries.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(binaries)
-}
 
 struct InstallResult {
-    env_path: PathBuf,
     packages: Vec<crate::dev_prefix_pixi::InstalledPackage>,
-    binaries: Vec<ExposedBinary>,
 }
 
 async fn perform_global_install(
+    base_dir: &PathBuf,
     env_name: &EnvironmentName,
-    env_name_str: &str,
+    sha: &str,
     pending: &PendingInstall,
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> miette::Result<InstallResult> {
-    let pixi_home = pixi_config::pixi_home()
-        .ok_or_else(|| miette::miette!("could not determine PIXI_HOME"))?;
-    let env_bin_dir = pixi_home.join(format!("{env_name_str}-bin"));
-    let env_path = pixi_home.join("envs").join(env_name_str);
-    let bin_dir = BinDir::from_path(env_bin_dir.clone()).await?;
+    let sha_home = base_dir.join(sha);
 
-    let mut project = Project::discover_or_create_with_bin_dir(bin_dir)
+    // Set PIXI_HOME to $base/$SHA so pixi_global puts everything inside:
+    // $base/$SHA/envs/0/, $base/$SHA/bin/, $base/$SHA/manifests/, etc.
+    // SAFETY: varlink requests are processed sequentially per connection.
+    unsafe {
+        std::env::set_var("PIXI_HOME", &sha_home);
+    }
+
+    let mut project = Project::discover_or_create()
         .await?
         .with_cli_config(pixi_config::Config::load_global());
 
@@ -198,10 +186,9 @@ async fn perform_global_install(
     {
         tracing::info!(env_name = %env_name, "environment already in sync");
         project.manifest.save().await?;
+
         return Ok(InstallResult {
-            env_path,
             packages: vec![],
-            binaries: list_binaries(&env_bin_dir).await?,
         });
     }
 
@@ -262,11 +249,10 @@ async fn perform_global_install(
     project.manifest.save().await?;
 
     Ok(InstallResult {
-        env_path,
         packages,
-        binaries: list_binaries(&env_bin_dir).await?,
     })
 }
+
 
 #[async_trait]
 impl VarlinkInterface for PixiVarlinkService {
@@ -362,9 +348,12 @@ impl VarlinkInterface for PixiVarlinkService {
             return call.reply_authentication_failed(challenge);
         }
 
-        let env_name_str =
+        let sha =
             self.compute_env_name(&pending.client_envs_dir, pending.environment.as_deref());
-        let env_name = EnvironmentName::from_str(&env_name_str).map_err(|e| {
+        let env_name = EnvironmentName::from_str(
+            pending.environment.as_deref().unwrap_or("default"),
+        )
+        .map_err(|e| {
             varlink::error::Error(
                 varlink::ErrorKind::InvalidParameter(e.to_string()),
                 None,
@@ -374,28 +363,24 @@ impl VarlinkInterface for PixiVarlinkService {
 
         tracing::info!(
             challenge = %challenge,
-            env_name = %env_name,
+            sha = %sha,
             client_envs_dir = %pending.client_envs_dir,
             "authentication succeeded, installing",
         );
 
-        match perform_global_install(&env_name, &env_name_str, &pending, None).await {
+        match perform_global_install(&self.base_dir, &env_name, &sha, &pending, None).await {
             Ok(result) => {
                 tracing::info!(
                     env_name = %env_name,
-                    env_path = %result.env_path.display(),
-                    binaries = result.binaries.len(),
+                    packages = result.packages.len(),
                     "global install completed",
                 );
-                for bin in &result.binaries {
-                    tracing::debug!(name = %bin.name, path = %bin.path, "exposed binary");
-                }
+                let sha_dir = self.base_dir.join(&sha);
                 call.reply(
                     None,
-                    Some(env_name_str.clone()),
-                    Some(result.env_path.to_string_lossy().to_string()),
+                    Some(sha.clone()),
+                    Some(sha_dir.to_string_lossy().to_string()),
                     Some(result.packages),
-                    Some(result.binaries),
                 )
             }
             Err(err) => {
@@ -536,9 +521,12 @@ impl PixiVarlinkService {
             return Ok(call.take_replies());
         }
 
-        let env_name_str =
+        let sha =
             self.compute_env_name(&pending.client_envs_dir, pending.environment.as_deref());
-        let env_name = EnvironmentName::from_str(&env_name_str).map_err(|e| {
+        let env_name = EnvironmentName::from_str(
+            pending.environment.as_deref().unwrap_or("default"),
+        )
+        .map_err(|e| {
             varlink::error::Error(
                 varlink::ErrorKind::InvalidParameter(e.to_string()),
                 None,
@@ -548,28 +536,27 @@ impl PixiVarlinkService {
 
         tracing::info!(
             challenge = %challenge,
-            env_name = %env_name,
+            sha = %sha,
             client_envs_dir = %pending.client_envs_dir,
             "authentication succeeded, installing (streaming)",
         );
 
         let mut call = crate::dev_prefix_pixi::AsyncCall::new(false, false);
 
-        match perform_global_install(&env_name, &env_name_str, &pending, Some(progress_tx)).await {
+        match perform_global_install(&self.base_dir, &env_name, &sha, &pending, Some(progress_tx)).await {
             Ok(result) => {
                 tracing::info!(
                     env_name = %env_name,
-                    env_path = %result.env_path.display(),
-                    binaries = result.binaries.len(),
+                    packages = result.packages.len(),
                     "global install completed",
                 );
+                let sha_dir = self.base_dir.join(&sha);
                 Call_ConfirmGlobalInstall::reply(
                     &mut call,
                     None,
-                    Some(env_name_str),
-                    Some(result.env_path.to_string_lossy().to_string()),
+                    Some(sha),
+                    Some(sha_dir.to_string_lossy().to_string()),
                     Some(result.packages),
-                    Some(result.binaries),
                 )?;
             }
             Err(err) => {

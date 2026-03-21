@@ -156,7 +156,7 @@ impl StreamingHandler {
                     match msg {
                         Some(message) => {
                             let reply = varlink::Reply {
-                                parameters: Some(json!({ "message": message, "env_name": null, "env_path": null, "packages": null, "binaries": null })),
+                                parameters: Some(json!({ "message": message, "sha": null, "sha_dir": null, "packages": null })),
                                 continues: Some(true),
                                 error: None,
                             };
@@ -183,7 +183,7 @@ impl StreamingHandler {
                     // Install finished before channel drained — drain remaining
                     while let Ok(message) = rx.try_recv() {
                         let reply = varlink::Reply {
-                            parameters: Some(json!({ "message": message, "env_name": null, "env_path": null, "packages": null, "binaries": null })),
+                            parameters: Some(json!({ "message": message, "sha": null, "sha_dir": null, "packages": null })),
                             continues: Some(true),
                             error: None,
                         };

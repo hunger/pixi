@@ -57,6 +57,18 @@ pub async fn execute(
 fn print_install_result(
     result: &pixi_varlink::client::GlobalInstallResult,
 ) -> miette::Result<()> {
+    // Discover exposed binaries by scanning the server's bin dir
+    let bin_dir = result.sha_dir.join("bin");
+    let mut exposed_names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_file() {
+                exposed_names.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+    exposed_names.sort();
+
     let mut message = String::new();
 
     message.push_str("└──");
@@ -92,17 +104,13 @@ fn print_install_result(
                 "packages",
                 deps,
                 true,
-                !result.binaries.is_empty(),
+                !exposed_names.is_empty(),
             ));
         }
     }
 
-    if !result.binaries.is_empty() {
-        let exposed = result
-            .binaries
-            .iter()
-            .map(|b| b.name.as_str())
-            .join(", ");
+    if !exposed_names.is_empty() {
+        let exposed = exposed_names.iter().join(", ");
         message.push_str(&format_asciiart_section("exposes", exposed, true, false));
     }
 

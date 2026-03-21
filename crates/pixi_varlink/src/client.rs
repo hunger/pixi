@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::dev_prefix_pixi::{self, ExposedBinary, VarlinkClientInterface as _};
+use crate::dev_prefix_pixi::{self, VarlinkClientInterface as _};
 use varlink_stdinterfaces::org_varlink_service_async::VarlinkClientInterface as _;
 
 /// Normalize a varlink address: bare paths become `unix:` addresses.
@@ -51,25 +51,16 @@ pub struct InstalledPackage {
 
 /// Result of a remote global install.
 pub struct GlobalInstallResult {
-    /// The server-side environment name (SHA-based).
-    pub env_name: String,
+    /// The SHA identifier for this install.
+    pub sha: String,
+    /// The absolute path to the SHA directory on the server.
+    pub sha_dir: PathBuf,
+    /// The client's pixi home (parent of envs dir, e.g. ~/.pixi).
+    pub pixi_home: PathBuf,
     /// The client-facing environment name.
     pub display_env_name: String,
-    /// The absolute path to the environment on the server.
-    pub env_path: PathBuf,
-    /// Where the client should symlink the environment.
-    pub local_env_symlink: PathBuf,
     /// Packages that were installed/changed.
     pub packages: Vec<InstalledPackage>,
-    /// The exposed binaries.
-    pub binaries: Vec<InstalledBinary>,
-}
-
-/// A binary exposed by the server, with symlink target for the client.
-pub struct InstalledBinary {
-    pub name: String,
-    pub server_path: PathBuf,
-    pub local_symlink: PathBuf,
 }
 
 fn auth_file_path(client_envs_dir: &str, challenge: &str) -> PathBuf {
@@ -148,22 +139,22 @@ async fn confirm_and_cleanup(
 
     let reply = result?;
 
-    let env_name = reply
-        .env_name
-        .ok_or_else(|| miette::miette!("server did not return env_name"))?;
-    let env_path = reply
-        .env_path
-        .ok_or_else(|| miette::miette!("server did not return env_path"))?;
-    let binaries_raw = reply.binaries.unwrap_or_default();
+    let sha = reply
+        .sha
+        .ok_or_else(|| miette::miette!("server did not return sha"))?;
+    let sha_dir = PathBuf::from(
+        reply
+            .sha_dir
+            .ok_or_else(|| miette::miette!("server did not return sha_dir"))?,
+    );
 
     let envs_dir = PathBuf::from(client_envs_dir);
-    let pixi_bin_dir = envs_dir
+    let pixi_home = envs_dir
         .parent()
         .expect("envs dir should have a parent")
-        .join("bin");
+        .to_path_buf();
 
-    let display_env_name = client_env_name.unwrap_or(&env_name).to_string();
-    let local_env_symlink = envs_dir.join(&display_env_name);
+    let display_env_name = client_env_name.unwrap_or(&sha).to_string();
 
     let packages = reply
         .packages
@@ -175,18 +166,12 @@ async fn confirm_and_cleanup(
         })
         .collect();
 
-    let binaries = binaries_raw
-        .into_iter()
-        .map(|bin| to_installed_binary(bin, &pixi_bin_dir))
-        .collect();
-
     Ok(GlobalInstallResult {
-        env_name,
+        sha,
+        sha_dir,
+        pixi_home,
         display_env_name,
-        env_path: PathBuf::from(env_path),
-        local_env_symlink,
         packages,
-        binaries,
     })
 }
 
@@ -217,14 +202,6 @@ async fn confirm_streaming(
     }
 }
 
-fn to_installed_binary(bin: ExposedBinary, pixi_bin_dir: &Path) -> InstalledBinary {
-    InstalledBinary {
-        local_symlink: pixi_bin_dir.join(&bin.name),
-        server_path: PathBuf::from(&bin.path),
-        name: bin.name,
-    }
-}
-
 #[cfg(unix)]
 fn force_symlink(target: &Path, link: &Path) -> miette::Result<()> {
     if link.exists() || link.is_symlink() {
@@ -240,37 +217,101 @@ fn force_symlink(target: &Path, link: &Path) -> miette::Result<()> {
     })
 }
 
-/// Create symlinks for the environment and its binaries in the client's
-/// `~/.pixi/envs` and `~/.pixi/bin`.
+/// Create symlinks in the client's `~/.pixi/` for the server's install.
+///
+/// Scans `$sha_dir` and for each top-level subdirectory, symlinks every
+/// entry inside it into the matching `$pixi_home/<subdir>/` directory.
+/// This merges `envs/*`, `bin/*`, `completions/*`, etc. into the client's
+/// pixi home.
+///
+/// If any symlink target already exists, all symlinks created in this run
+/// are removed before returning an error.
 pub fn create_symlinks(result: &GlobalInstallResult) -> miette::Result<()> {
-    // Symlink the environment: ~/.pixi/envs/<name> -> server env path
-    if let Some(parent) = result.local_env_symlink.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| miette::miette!("failed to create {}: {e}", parent.display()))?;
-    }
-    force_symlink(&result.env_path, &result.local_env_symlink)?;
-    tracing::debug!(
-        env_name = %result.env_name,
-        symlink = %result.local_env_symlink.display(),
-        target = %result.env_path.display(),
-        "created environment symlink",
-    );
+    let mut created: Vec<PathBuf> = Vec::new();
 
-    // Symlink binaries: ~/.pixi/bin/<name> -> server bin path
-    if let Some(first) = result.binaries.first() {
-        if let Some(bin_dir) = first.local_symlink.parent() {
-            std::fs::create_dir_all(bin_dir)
-                .map_err(|e| miette::miette!("failed to create {}: {e}", bin_dir.display()))?;
+    let outcome = do_create_symlinks(result, &mut created);
+
+    if let Err(err) = &outcome {
+        tracing::warn!(error = %err, "rolling back {} symlinks", created.len());
+        for link in created.iter().rev() {
+            if let Err(e) = std::fs::remove_file(link) {
+                tracing::warn!(path = %link.display(), error = %e, "rollback failed");
+            }
         }
     }
-    for bin in &result.binaries {
-        force_symlink(&bin.server_path, &bin.local_symlink)?;
-        tracing::debug!(
-            name = %bin.name,
-            symlink = %bin.local_symlink.display(),
-            target = %bin.server_path.display(),
-            "created binary symlink",
-        );
+
+    outcome
+}
+
+fn do_create_symlinks(
+    result: &GlobalInstallResult,
+    created: &mut Vec<PathBuf>,
+) -> miette::Result<()> {
+    let pixi_home = &result.pixi_home;
+    let sha_dir = &result.sha_dir;
+
+    let top_entries = std::fs::read_dir(sha_dir)
+        .map_err(|e| miette::miette!("failed to read {}: {e}", sha_dir.display()))?;
+
+    for top_entry in top_entries {
+        let top_entry = top_entry
+            .map_err(|e| miette::miette!("failed to read {}: {e}", sha_dir.display()))?;
+
+        if !top_entry.path().is_dir() {
+            continue;
+        }
+
+        let subdir_name = top_entry.file_name();
+        let subdir_str = subdir_name.to_string_lossy();
+
+        // Skip server-internal directories that shouldn't be merged
+        if subdir_str == "manifests" {
+            continue;
+        }
+        let server_subdir = top_entry.path();
+        let local_subdir = pixi_home.join(&subdir_name);
+
+        std::fs::create_dir_all(&local_subdir)
+            .map_err(|e| miette::miette!("failed to create {}: {e}", local_subdir.display()))?;
+
+        let entries = std::fs::read_dir(&server_subdir)
+            .map_err(|e| miette::miette!("failed to read {}: {e}", server_subdir.display()))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                miette::miette!("failed to read {}: {e}", server_subdir.display())
+            })?;
+
+            // Under envs/, entries are directories (each env) — symlink them.
+            // Under other dirs (bin/, etc.), skip subdirectories like
+            // trampoline_configuration which are internal pixi state.
+            let ft = entry.file_type().map_err(|e| {
+                miette::miette!("failed to stat {}: {e}", entry.path().display())
+            })?;
+            if ft.is_dir() && subdir_name != "envs" {
+                continue;
+            }
+
+            let file_name = entry.file_name();
+            let target = entry.path();
+            let link = local_subdir.join(&file_name);
+
+            if link.exists() || link.is_symlink() {
+                return Err(miette::miette!(
+                    "{}/{} already exists",
+                    subdir_name.to_string_lossy(),
+                    file_name.to_string_lossy(),
+                ));
+            }
+
+            force_symlink(&target, &link)?;
+            tracing::debug!(
+                symlink = %link.display(),
+                target = %target.display(),
+                "created symlink",
+            );
+            created.push(link);
+        }
     }
 
     Ok(())

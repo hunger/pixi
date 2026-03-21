@@ -20,14 +20,6 @@ type WorkspaceInfo (
     environments: []EnvironmentInfo
 )
 
-# An exposed binary from a global install.
-type ExposedBinary (
-    # The name the binary is exposed as (e.g. "rg")
-    name: string,
-    # The absolute path to the trampoline on the server
-    path: string
-)
-
 # A package that was installed.
 type InstalledPackage (
     name: string,
@@ -56,10 +48,9 @@ method GlobalInstall(
 # the "message" field set, followed by a final reply with the full result.
 method ConfirmGlobalInstall(challenge: string) -> (
     message: ?string,
-    env_name: ?string,
-    env_path: ?string,
-    packages: ?[]InstalledPackage,
-    binaries: ?[]ExposedBinary
+    sha: ?string,
+    sha_dir: ?string,
+    packages: ?[]InstalledPackage
 )
 
 error WorkspaceNotFound(path: string)
