@@ -343,6 +343,17 @@ impl Project {
         Ok(Self::from_manifest(manifest, env_root, bin_dir))
     }
 
+    /// Like [`discover_or_create`](Self::discover_or_create) but rooted at
+    /// an explicit directory instead of `$PIXI_HOME`. Everything (envs, bin,
+    /// manifests) is placed under `home`.
+    pub async fn discover_or_create_in(home: PathBuf) -> miette::Result<Self> {
+        let manifest_dir = home.join(MANIFESTS_DIR);
+        let manifest_path = manifest_dir.join(consts::GLOBAL_MANIFEST_DEFAULT_NAME);
+        let bin_dir = BinDir::from_path(home.join("bin")).await?;
+        let env_root = EnvRoot::from_path(home.join("envs")).await?;
+        Self::discover_or_create_impl(manifest_dir, manifest_path, bin_dir, env_root).await
+    }
+
     /// Discovers the project manifest file in path at
     /// `~/.pixi/manifests/pixi-global.toml`. If the manifest doesn't exist
     /// yet, and the function will try to create one from the existing
@@ -350,10 +361,17 @@ impl Project {
     pub async fn discover_or_create() -> miette::Result<Self> {
         let manifest_dir = Self::manifest_dir()?;
         let manifest_path = Self::default_manifest_path()?;
-
         let bin_dir = BinDir::from_env().await?;
         let env_root = EnvRoot::from_env().await?;
+        Self::discover_or_create_impl(manifest_dir, manifest_path, bin_dir, env_root).await
+    }
 
+    async fn discover_or_create_impl(
+        manifest_dir: PathBuf,
+        manifest_path: PathBuf,
+        bin_dir: BinDir,
+        env_root: EnvRoot,
+    ) -> miette::Result<Self> {
         if !manifest_path.exists() {
             tracing::debug!(
                 "Global manifest {} doesn't exist yet. Creating a new one.",

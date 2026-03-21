@@ -9,7 +9,7 @@ pub struct Args {
     #[arg(long, env = "PIXI_CACHE_DIR", default_value = "~/.cache/rattler")]
     pub cache_dir: PathBuf,
 
-    /// Directory for storing environments (becomes PIXI_HOME)
+    /// Base directory for storing environments
     #[arg(long, env = "PIXI_ENVS_DIR", default_value = "~/.local/share/pixi")]
     pub envs_dir: PathBuf,
 }
@@ -33,13 +33,10 @@ pub async fn execute(address: Option<String>, args: Args) -> miette::Result<()> 
     let cache_dir = expand_tilde(&args.cache_dir)?;
     let envs_dir = expand_tilde(&args.envs_dir)?;
 
-    // SAFETY: called before spawning threads; the server is single-threaded at
-    // this point. PIXI_CACHE_DIR configures the cache. PIXI_HOME is set
-    // per-install in perform_global_install to $envs_dir/$SHA, but we set
-    // it here as the base so pixi_home() returns a sensible default.
+    // SAFETY: called before spawning threads; only PIXI_CACHE_DIR is needed
+    // as a global env var (read by rattler). The envs_dir is passed explicitly.
     unsafe {
         std::env::set_var("PIXI_CACHE_DIR", &cache_dir);
-        std::env::set_var("PIXI_HOME", &envs_dir);
     }
 
     let raw_address = address.unwrap_or_else(|| {
@@ -57,5 +54,5 @@ pub async fn execute(address: Option<String>, args: Args) -> miette::Result<()> 
         version = pixi_consts::consts::PIXI_VERSION,
         "starting varlink server",
     );
-    pixi_varlink::run_server(&address).await
+    pixi_varlink::run_server(&address, envs_dir).await
 }

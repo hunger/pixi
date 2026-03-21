@@ -36,9 +36,7 @@ pub struct PixiVarlinkService {
 }
 
 impl PixiVarlinkService {
-    pub fn new(nonce: String) -> Self {
-        let base_dir = pixi_config::pixi_home()
-            .expect("PIXI_HOME must be set before creating PixiVarlinkService");
+    pub fn new(nonce: String, base_dir: PathBuf) -> Self {
         Self {
             nonce,
             base_dir,
@@ -79,14 +77,7 @@ async fn perform_global_install(
 ) -> miette::Result<InstallResult> {
     let sha_home = base_dir.join(sha);
 
-    // Set PIXI_HOME to $base/$SHA so pixi_global puts everything inside:
-    // $base/$SHA/envs/0/, $base/$SHA/bin/, $base/$SHA/manifests/, etc.
-    // SAFETY: varlink requests are processed sequentially per connection.
-    unsafe {
-        std::env::set_var("PIXI_HOME", &sha_home);
-    }
-
-    let mut project = Project::discover_or_create()
+    let mut project = Project::discover_or_create_in(sha_home.clone())
         .await?
         .with_cli_config(pixi_config::Config::load_global());
 

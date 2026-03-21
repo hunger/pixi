@@ -47,9 +47,9 @@ fn load_nonce() -> String {
 /// Start a varlink server listening on the given address.
 ///
 /// Address format: `unix:/path/to/socket`, `tcp:host:port`, or a bare path.
-pub async fn run_server(address: &str) -> miette::Result<()> {
+pub async fn run_server(address: &str, base_dir: PathBuf) -> miette::Result<()> {
     let nonce = load_nonce();
-    let pixi_service = Arc::new(PixiVarlinkService::new(nonce));
+    let pixi_service = Arc::new(PixiVarlinkService::new(nonce, base_dir));
     let streaming = Arc::new(StreamingHandler::new(pixi_service));
 
     let service = Arc::new(AsyncVarlinkService::new(

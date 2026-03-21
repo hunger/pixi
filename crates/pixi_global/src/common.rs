@@ -45,6 +45,13 @@ impl BinDir {
         Ok(Self(path))
     }
 
+    /// Create the binary executable directory at an explicit path.
+    pub async fn from_path(path: impl Into<PathBuf>) -> miette::Result<Self> {
+        let path = path.into();
+        tokio_fs::create_dir_all(&path).await.into_diagnostic()?;
+        Ok(Self(path))
+    }
+
     /// Create the binary executable directory from environment variables
     pub async fn from_env() -> miette::Result<Self> {
         let bin_dir = pixi_home()
@@ -111,6 +118,13 @@ impl EnvRoot {
     pub fn new(root: PathBuf) -> miette::Result<Self> {
         let path = root.join("envs");
         fs_err::create_dir_all(&path).into_diagnostic()?;
+        Ok(Self(path))
+    }
+
+    /// Create the environment root directory at an explicit path.
+    pub async fn from_path(path: impl Into<PathBuf>) -> miette::Result<Self> {
+        let path = path.into();
+        tokio_fs::create_dir_all(&path).await.into_diagnostic()?;
         Ok(Self(path))
     }
 
