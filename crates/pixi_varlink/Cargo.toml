@@ -16,6 +16,7 @@ pixi_core = { workspace = true }
 pixi_global = { workspace = true }
 pixi_manifest = { workspace = true }
 rattler_conda_types = { workspace = true }
+reflink-copy = { workspace = true }
 serde = { workspace = true }
 serde_derive = "1"
 serde_json = { workspace = true }

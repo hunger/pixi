@@ -6930,6 +6930,7 @@ dependencies = [
  "pixi_global",
  "pixi_manifest",
  "rattler_conda_types",
+ "reflink-copy",
  "serde",
  "serde_derive",
  "serde_json",

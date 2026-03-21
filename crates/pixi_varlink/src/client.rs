@@ -202,37 +202,52 @@ async fn confirm_streaming(
     }
 }
 
-#[cfg(unix)]
-fn force_symlink(target: &Path, link: &Path) -> miette::Result<()> {
-    if link.exists() || link.is_symlink() {
-        std::fs::remove_file(link)
-            .map_err(|e| miette::miette!("failed to remove {}: {e}", link.display()))?;
+/// Link a file or directory from `target` to `link`, trying:
+/// hardlink → reflink → symlink → copy → error.
+fn link_entry(target: &Path, link: &Path) -> miette::Result<&'static str> {
+    if target.is_file() {
+        if std::fs::hard_link(target, link).is_ok() {
+            return Ok("hardlink");
+        }
+        if reflink_copy::reflink(target, link).is_ok() {
+            return Ok("reflink");
+        }
     }
-    std::os::unix::fs::symlink(target, link).map_err(|e| {
-        miette::miette!(
-            "failed to symlink {} -> {}: {e}",
-            link.display(),
-            target.display()
-        )
-    })
+
+    #[cfg(unix)]
+    if std::os::unix::fs::symlink(target, link).is_ok() {
+        return Ok("symlink");
+    }
+
+    if target.is_file() {
+        std::fs::copy(target, link).map_err(|e| {
+            miette::miette!("failed to link {} -> {}: {e}", link.display(), target.display())
+        })?;
+        return Ok("copy");
+    }
+
+    Err(miette::miette!(
+        "failed to link {} -> {}",
+        link.display(),
+        target.display(),
+    ))
 }
 
-/// Create symlinks in the client's `~/.pixi/` for the server's install.
+/// Link the server's install into the client's `~/.pixi/`.
 ///
-/// Scans `$sha_dir` and for each top-level subdirectory, symlinks every
-/// entry inside it into the matching `$pixi_home/<subdir>/` directory.
-/// This merges `envs/*`, `bin/*`, `completions/*`, etc. into the client's
-/// pixi home.
+/// Scans `$sha_dir` and for each top-level subdirectory, links every
+/// entry inside it into the matching `$pixi_home/<subdir>/` directory
+/// using the best available method (reflink → hardlink → symlink → copy).
 ///
-/// If any symlink target already exists, all symlinks created in this run
+/// If any link target already exists, all links created in this run
 /// are removed before returning an error.
 pub fn create_symlinks(result: &GlobalInstallResult) -> miette::Result<()> {
     let mut created: Vec<PathBuf> = Vec::new();
 
-    let outcome = do_create_symlinks(result, &mut created);
+    let outcome = do_create_links(result, &mut created);
 
     if let Err(err) = &outcome {
-        tracing::warn!(error = %err, "rolling back {} symlinks", created.len());
+        tracing::warn!(error = %err, "rolling back {} links", created.len());
         for link in created.iter().rev() {
             if let Err(e) = std::fs::remove_file(link) {
                 tracing::warn!(path = %link.display(), error = %e, "rollback failed");
@@ -243,7 +258,7 @@ pub fn create_symlinks(result: &GlobalInstallResult) -> miette::Result<()> {
     outcome
 }
 
-fn do_create_symlinks(
+fn do_create_links(
     result: &GlobalInstallResult,
     created: &mut Vec<PathBuf>,
 ) -> miette::Result<()> {
@@ -304,11 +319,12 @@ fn do_create_symlinks(
                 ));
             }
 
-            force_symlink(&target, &link)?;
+            let method = link_entry(&target, &link)?;
             tracing::debug!(
-                symlink = %link.display(),
+                method,
+                link = %link.display(),
                 target = %target.display(),
-                "created symlink",
+                "linked",
             );
             created.push(link);
         }
