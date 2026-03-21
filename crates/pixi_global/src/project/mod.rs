@@ -145,6 +145,8 @@ pub struct Project {
     /// Optional custom reporter factory. When set, used instead of the default
     /// `TopLevelProgress` terminal reporter.
     reporter_factory: Option<Arc<dyn Fn() -> Box<dyn pixi_command_dispatcher::Reporter> + Send + Sync>>,
+    /// Cache directory for rattler/conda packages.
+    cache_dir: PathBuf,
 }
 
 impl Debug for Project {
@@ -303,32 +305,43 @@ async fn package_from_conda_meta(
 
 impl Project {
     /// Constructs a new instance from an internal manifest representation
+    #[cfg(test)]
     pub(crate) fn from_manifest(manifest: Manifest, env_root: EnvRoot, bin_dir: BinDir) -> Self {
+        let cache_dir = pixi_config::get_cache_dir()
+            .expect("could not determine cache directory");
+        Self::from_manifest_with_cache_dir(manifest, env_root, bin_dir, cache_dir)
+    }
+
+    /// Like [`from_manifest`](Self::from_manifest) but with an explicit cache
+    /// directory, bypassing `get_cache_dir()`.
+    pub(crate) fn from_manifest_with_cache_dir(
+        manifest: Manifest,
+        env_root: EnvRoot,
+        bin_dir: BinDir,
+        cache_dir: PathBuf,
+    ) -> Self {
         let root = manifest
             .path
             .parent()
             .expect("manifest path should always have a parent")
             .to_owned();
 
-        // Load the global config and ensure
-        // that the root_dir is relative to the manifest directory
         let mut config = Config::load_global();
         config.channel_config.root_dir = root.clone();
 
-        let client = OnceCell::new();
-        let repodata_gateway = OnceCell::new();
         Self {
             root,
             manifest,
             config,
             env_root,
             bin_dir,
-            client,
-            repodata_gateway,
+            client: OnceCell::new(),
+            repodata_gateway: OnceCell::new(),
             concurrent_downloads_semaphore: OnceCell::new(),
             command_dispatcher: OnceCell::new(),
             backend_override: None,
             reporter_factory: None,
+            cache_dir,
         }
     }
 
@@ -339,19 +352,52 @@ impl Project {
         env_root: EnvRoot,
         bin_dir: BinDir,
     ) -> miette::Result<Self> {
+        let cache_dir = pixi_config::get_cache_dir()?;
+        Self::from_str_with_cache_dir(manifest_path, content, env_root, bin_dir, cache_dir)
+    }
+
+    pub(crate) fn from_str_with_cache_dir(
+        manifest_path: &Path,
+        content: &str,
+        env_root: EnvRoot,
+        bin_dir: BinDir,
+        cache_dir: PathBuf,
+    ) -> miette::Result<Self> {
         let manifest = Manifest::from_str(manifest_path, content)?;
-        Ok(Self::from_manifest(manifest, env_root, bin_dir))
+        Ok(Self::from_manifest_with_cache_dir(
+            manifest, env_root, bin_dir, cache_dir,
+        ))
+    }
+
+    pub(crate) fn from_path_with_cache_dir(
+        manifest_path: &Path,
+        env_root: EnvRoot,
+        bin_dir: BinDir,
+        cache_dir: PathBuf,
+    ) -> miette::Result<Self> {
+        let manifest = Manifest::from_path(manifest_path)?;
+        Ok(Self::from_manifest_with_cache_dir(
+            manifest, env_root, bin_dir, cache_dir,
+        ))
     }
 
     /// Like [`discover_or_create`](Self::discover_or_create) but rooted at
     /// an explicit directory instead of `$PIXI_HOME`. Everything (envs, bin,
     /// manifests) is placed under `home`.
-    pub async fn discover_or_create_in(home: PathBuf) -> miette::Result<Self> {
+    /// Like [`discover_or_create`](Self::discover_or_create) but rooted at
+    /// an explicit directory instead of `$PIXI_HOME`, with an explicit cache
+    /// directory instead of `get_cache_dir()`.
+    pub async fn discover_or_create_in(
+        home: PathBuf,
+        cache_dir: PathBuf,
+    ) -> miette::Result<Self> {
         let manifest_dir = home.join(MANIFESTS_DIR);
         let manifest_path = manifest_dir.join(consts::GLOBAL_MANIFEST_DEFAULT_NAME);
         let bin_dir = BinDir::from_path(home.join("bin")).await?;
         let env_root = EnvRoot::from_path(home.join("envs")).await?;
-        Self::discover_or_create_impl(manifest_dir, manifest_path, bin_dir, env_root).await
+        Self::discover_or_create_impl(
+            manifest_dir, manifest_path, bin_dir, env_root, cache_dir,
+        ).await
     }
 
     /// Discovers the project manifest file in path at
@@ -363,7 +409,10 @@ impl Project {
         let manifest_path = Self::default_manifest_path()?;
         let bin_dir = BinDir::from_env().await?;
         let env_root = EnvRoot::from_env().await?;
-        Self::discover_or_create_impl(manifest_dir, manifest_path, bin_dir, env_root).await
+        let cache_dir = pixi_config::get_cache_dir()?;
+        Self::discover_or_create_impl(
+            manifest_dir, manifest_path, bin_dir, env_root, cache_dir,
+        ).await
     }
 
     async fn discover_or_create_impl(
@@ -371,6 +420,7 @@ impl Project {
         manifest_path: PathBuf,
         bin_dir: BinDir,
         env_root: EnvRoot,
+        cache_dir: PathBuf,
     ) -> miette::Result<Self> {
         if !manifest_path.exists() {
             tracing::debug!(
@@ -398,7 +448,7 @@ impl Project {
             }
         }
 
-        Self::from_path(&manifest_path, env_root, bin_dir)
+        Self::from_path_with_cache_dir(&manifest_path, env_root, bin_dir, cache_dir)
     }
 
     async fn try_from_existing_installation(
@@ -494,13 +544,14 @@ impl Project {
     }
 
     /// Loads a project from manifest file.
+    #[cfg(test)]
     pub(crate) fn from_path(
         manifest_path: &Path,
         env_root: EnvRoot,
         bin_dir: BinDir,
     ) -> miette::Result<Self> {
-        let manifest = Manifest::from_path(manifest_path)?;
-        Ok(Project::from_manifest(manifest, env_root, bin_dir))
+        let cache_dir = pixi_config::get_cache_dir()?;
+        Self::from_path_with_cache_dir(manifest_path, env_root, bin_dir, cache_dir)
     }
 
     /// Merge config with existing config project
@@ -1389,9 +1440,7 @@ impl Project {
         self.command_dispatcher.get_or_try_init(|| {
             let multi_progress = global_multi_progress();
             let anchor_pb = multi_progress.add(ProgressBar::hidden());
-            let cache_dir_path = pixi_config::get_cache_dir()
-                .map(|cache_dir| cache_dir.join(BUILD_DIR))
-                .map_err(|e| CommandDispatcherError::CacheDirectory(e.into()))?;
+            let cache_dir_path = self.cache_dir.join(BUILD_DIR);
             let cache_dir = AbsPathBuf::new(cache_dir_path)
                 .expect("cache dir is not absolute")
                 .into_assume_dir();
@@ -1527,6 +1576,9 @@ impl Repodata for Project {
                 .gateway()
                 .with_client(client)
                 .with_max_concurrent_requests(concurrent_downloads)
+                .with_cache_dir(
+                    self.cache_dir.join(pixi_consts::consts::CONDA_REPODATA_CACHE_DIR),
+                )
                 .finish())
         })
     }

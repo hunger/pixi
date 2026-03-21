@@ -33,12 +33,6 @@ pub async fn execute(address: Option<String>, args: Args) -> miette::Result<()> 
     let cache_dir = expand_tilde(&args.cache_dir)?;
     let envs_dir = expand_tilde(&args.envs_dir)?;
 
-    // SAFETY: called before spawning threads; only PIXI_CACHE_DIR is needed
-    // as a global env var (read by rattler). The envs_dir is passed explicitly.
-    unsafe {
-        std::env::set_var("PIXI_CACHE_DIR", &cache_dir);
-    }
-
     let raw_address = address.unwrap_or_else(|| {
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
             format!("{runtime_dir}/pixi.sock")
@@ -54,5 +48,5 @@ pub async fn execute(address: Option<String>, args: Args) -> miette::Result<()> 
         version = pixi_consts::consts::PIXI_VERSION,
         "starting varlink server",
     );
-    pixi_varlink::run_server(&address, envs_dir).await
+    pixi_varlink::run_server(&address, envs_dir, cache_dir).await
 }

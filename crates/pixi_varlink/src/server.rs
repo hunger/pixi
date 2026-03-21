@@ -32,14 +32,16 @@ struct PendingInstall {
 pub struct PixiVarlinkService {
     nonce: String,
     base_dir: PathBuf,
+    cache_dir: PathBuf,
     pending: Mutex<HashMap<String, PendingInstall>>,
 }
 
 impl PixiVarlinkService {
-    pub fn new(nonce: String, base_dir: PathBuf) -> Self {
+    pub fn new(nonce: String, base_dir: PathBuf, cache_dir: PathBuf) -> Self {
         Self {
             nonce,
             base_dir,
+            cache_dir,
             pending: Mutex::new(HashMap::new()),
         }
     }
@@ -70,6 +72,7 @@ struct InstallResult {
 
 async fn perform_global_install(
     base_dir: &PathBuf,
+    cache_dir: &PathBuf,
     env_name: &EnvironmentName,
     sha: &str,
     pending: &PendingInstall,
@@ -77,7 +80,7 @@ async fn perform_global_install(
 ) -> miette::Result<InstallResult> {
     let sha_home = base_dir.join(sha);
 
-    let mut project = Project::discover_or_create_in(sha_home.clone())
+    let mut project = Project::discover_or_create_in(sha_home.clone(), cache_dir.clone())
         .await?
         .with_cli_config(pixi_config::Config::load_global());
 
@@ -359,7 +362,7 @@ impl VarlinkInterface for PixiVarlinkService {
             "authentication succeeded, installing",
         );
 
-        match perform_global_install(&self.base_dir, &env_name, &sha, &pending, None).await {
+        match perform_global_install(&self.base_dir, &self.cache_dir, &env_name, &sha, &pending, None).await {
             Ok(result) => {
                 tracing::info!(
                     env_name = %env_name,
@@ -534,7 +537,7 @@ impl PixiVarlinkService {
 
         let mut call = crate::dev_prefix_pixi::AsyncCall::new(false, false);
 
-        match perform_global_install(&self.base_dir, &env_name, &sha, &pending, Some(progress_tx)).await {
+        match perform_global_install(&self.base_dir, &self.cache_dir, &env_name, &sha, &pending, Some(progress_tx)).await {
             Ok(result) => {
                 tracing::info!(
                     env_name = %env_name,
