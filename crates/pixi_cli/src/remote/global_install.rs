@@ -6,14 +6,8 @@ use pixi_global::list::format_asciiart_section;
 
 use super::progress::RemoteProgress;
 
-pub async fn execute(
-    address: &str,
-    args: crate::global::install::Args,
-) -> miette::Result<()> {
-    let envs_dir = pixi_global::EnvRoot::from_env()
-        .await?
-        .path()
-        .to_path_buf();
+pub async fn execute(address: &str, args: crate::global::install::Args) -> miette::Result<()> {
+    let envs_dir = pixi_global::EnvRoot::from_env().await?.path().to_path_buf();
     tokio::fs::create_dir_all(&envs_dir)
         .await
         .map_err(|e| miette::miette!("failed to create {}: {e}", envs_dir.display()))?;
@@ -44,7 +38,7 @@ pub async fn execute(
     let progress = std::cell::RefCell::new(RemoteProgress::new());
 
     let result = pixi_varlink::client::global_install(address, install_args, &|msg| {
-        progress.borrow_mut().on_message(msg);
+        progress.borrow_mut().on_progress(msg);
     })
     .await?;
 
@@ -54,12 +48,11 @@ pub async fn execute(
     print_install_result(&result)
 }
 
-fn print_install_result(
-    result: &pixi_varlink::client::GlobalInstallResult,
-) -> miette::Result<()> {
+fn print_install_result(result: &pixi_varlink::client::GlobalInstallResult) -> miette::Result<()> {
     // Discover exposed binaries by scanning the server's bin dir
     let bin_dir = result.sha_dir.join("bin");
     let mut exposed_names: Vec<String> = Vec::new();
+    #[allow(clippy::disallowed_methods)]
     if let Ok(entries) = std::fs::read_dir(&bin_dir) {
         for entry in entries.flatten() {
             if entry.path().is_file() {

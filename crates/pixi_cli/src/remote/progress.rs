@@ -33,7 +33,7 @@ impl RemoteProgress {
         }
     }
 
-    pub fn on_message(&mut self, progress: &Progress) {
+    pub fn on_progress(&mut self, progress: &Progress) {
         let msg = &progress.message;
         // The eprintln flushes stderr which triggers indicatif to redraw.
         eprintln!("[remote progress] {msg}");
