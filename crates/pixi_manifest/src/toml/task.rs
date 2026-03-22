@@ -379,7 +379,7 @@ mod test {
             cmd = "test"
             depends-on = [{ task = "foo", args = [{ "foo" = "bar", "baz" = "qux" }] }]
         "#
-        ), @r###"
+        ), @r#"
          × got at least 2 elements when exactly one was expected
           ╭─[pixi.toml:3:51]
         2 │             cmd = "test"
@@ -387,7 +387,7 @@ mod test {
           ·                                                   ────────────────────────────────
         4 │
           ╰────
-        "###);
+        "#);
         insta::assert_snapshot!(expect_parse_success(
             r#"
             cmd = "test"
@@ -437,14 +437,14 @@ mod test {
             cmd = "echo {{ target }}"
             args = [{ arg = "target", default = "invalid", choices = ["debug", "release"] }]
         "#
-        ), @r###"
-          × default value 'invalid' is not one of the allowed choices: debug, release
-           ╭─[pixi.toml:3:21]
-         2 │             cmd = "echo {{ target }}"
-         3 │             args = [{ arg = "target", default = "invalid", choices = ["debug", "release"] }]
-           ·                     ───────────────────────────────────────────────────────────────────────
-         4 │
-           ╰────
-        "###);
+        ), @r#"
+         × default value 'invalid' is not one of the allowed choices: debug, release
+          ╭─[pixi.toml:3:21]
+        2 │             cmd = "echo {{ target }}"
+        3 │             args = [{ arg = "target", default = "invalid", choices = ["debug", "release"] }]
+          ·                     ───────────────────────────────────────────────────────────────────────
+        4 │
+          ╰────
+        "#);
     }
 }

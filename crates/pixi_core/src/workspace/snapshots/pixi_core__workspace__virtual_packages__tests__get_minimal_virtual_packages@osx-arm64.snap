@@ -1,5 +1,5 @@
 ---
-source: src/workspace/virtual_packages.rs
+source: crates/pixi_core/src/workspace/virtual_packages.rs
 expression: packages
 ---
 [

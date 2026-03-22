@@ -1,32 +1,11 @@
 # Pixi workspace management over varlink IPC
 interface dev.prefix.pixi
 
-type EnvironmentInfo (
-    name: string,
-    features: []string,
-    solve_group: ?string,
-    platforms: []string,
-    dependencies: []string,
-    pypi_dependencies: []string,
-    tasks: []string,
-    prefix: string
-)
-
-type WorkspaceInfo (
-    name: string,
-    manifest_path: string,
-    version: ?string,
-    pixi_version: string,
-    environments: []EnvironmentInfo
-)
-
 # A package that was installed.
 type InstalledPackage (
     name: string,
     version: string
 )
-
-method Info(manifest_path: ?string) -> (workspace: WorkspaceInfo)
 
 # Install packages globally. Returns a challenge UUID. The client must create
 # .pixi-server-auth-<challenge> in client_envs_dir, then call ConfirmGlobalInstall.

@@ -1,7 +1,8 @@
 ---
-source: src/global/project/manifest.rs
+source: crates/pixi_global/src/project/manifest.rs
 expression: manifest.document.to_string()
 ---
+
 [envs.test-env]
 channels = ["test-channel"]
 dependencies = { "python" = "*"}

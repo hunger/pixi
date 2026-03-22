@@ -1,5 +1,5 @@
 ---
-source: src/global/project/parsed_manifest.rs
+source: crates/pixi_global/src/project/parsed_manifest.rs
 expression: manifest.unwrap_err()
 ---
 duplicate key: `PYTHON`

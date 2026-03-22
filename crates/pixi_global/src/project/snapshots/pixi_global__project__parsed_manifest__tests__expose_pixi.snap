@@ -1,5 +1,5 @@
 ---
-source: src/global/project/parsed_manifest.rs
-expression: manifest.unwrap_err()
+source: crates/pixi_global/src/project/parsed_manifest.rs
+expression: "manifest.unwrap_err().to_string().replace(pixi_utils::executable_name(),\n\"pixi\")"
 ---
 'pixi' is not allowed as exposed name in the map

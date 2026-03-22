@@ -361,7 +361,7 @@ mod test {
         "#;
         assert_snapshot!(
             format_parse_error(input, PypiOptions::from_toml_str(input).unwrap_err()),
-            @r###"
+            @r#"
          × Expected one of 'first-index', 'unsafe-first-match', 'unsafe-best-match'
           ╭─[pixi.toml:2:27]
         1 │
@@ -370,7 +370,7 @@ mod test {
         3 │
           ╰────
          help: Did you mean 'first-index'?
-        "###
+        "#
         )
     }
 
@@ -381,7 +381,7 @@ mod test {
         "#;
         assert_snapshot!(
             format_parse_error(input, PypiOptions::from_toml_str(input).unwrap_err()),
-            @r###"
+            @r#"
          × Expected one of 'first-index', 'unsafe-first-match', 'unsafe-best-match'
           ╭─[pixi.toml:2:27]
         1 │
@@ -390,7 +390,7 @@ mod test {
         3 │
           ╰────
          help: Did you mean 'unsafe-first-match'?
-        "###
+        "#
         )
     }
 
@@ -401,7 +401,7 @@ mod test {
         "#;
         assert_snapshot!(
             format_parse_error(input, PypiOptions::from_toml_str(input).unwrap_err()),
-            @r###"
+            @r#"
          × Expected one of 'first-index', 'unsafe-first-match', 'unsafe-best-match'
           ╭─[pixi.toml:2:27]
         1 │
@@ -409,7 +409,7 @@ mod test {
           ·                           ──────
         3 │
           ╰────
-        "###
+        "#
         )
     }
 
@@ -418,13 +418,13 @@ mod test {
         let input = "find-links = [{}]";
         assert_snapshot!(
             format_parse_error(input, PypiOptions::from_toml_str(input).unwrap_err()),
-            @r###"
+            @"
          × either 'url' or 'path' must be defined
           ╭─[pixi.toml:1:15]
         1 │ find-links = [{}]
           ·               ──
           ╰────
-        "###
+        "
         )
     }
 
@@ -433,13 +433,13 @@ mod test {
         let input = r#"find-links = [{url = "", path = ""}]"#;
         assert_snapshot!(
             format_parse_error(input, PypiOptions::from_toml_str(input).unwrap_err()),
-            @r###"
+            @r#"
          × cannot define both 'url' and 'path'
           ╭─[pixi.toml:1:15]
         1 │ find-links = [{url = "", path = ""}]
           ·               ─────────────────────
           ╰────
-        "###
+        "#
         )
     }
 
@@ -449,13 +449,13 @@ mod test {
         assert_snapshot!(format_parse_error(
             input,
             PypiOptions::from_toml_str(input).unwrap_err()
-        ), @r###"
+        ), @r#"
          × expected either "all", "none" or an array of packages e.g. ["foo", "bar"] , found integer
           ╭─[pixi.toml:1:12]
         1 │ no-build = 3
           ·            ─
           ╰────
-        "###)
+        "#)
     }
 
     #[test]
@@ -464,12 +464,12 @@ mod test {
         assert_snapshot!(format_parse_error(
             input,
             PypiOptions::from_toml_str(input).unwrap_err()
-        ), @r###"
+        ), @r#"
          × Not a valid package or extra name: "$$$". Names must start and end with a letter or digit and may only contain -, _, ., and alphanumeric characters.
           ╭─[pixi.toml:1:14]
         1 │ no-build = ['$$$']
           ·              ───
           ╰────
-        "###)
+        "#)
     }
 }

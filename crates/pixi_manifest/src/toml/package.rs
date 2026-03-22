@@ -553,7 +553,7 @@ mod test {
                 )
             })
             .unwrap_err();
-        assert_snapshot!(format_parse_error(input, parse_error),@r###"
+        assert_snapshot!(format_parse_error(input, parse_error),@r#"
          × 'LICENSE.txt' does not exist
           ╭─[pixi.toml:4:25]
         3 │         version = "1.0"
@@ -561,7 +561,7 @@ mod test {
           ·                         ───────────
         5 │
           ╰────
-        "###);
+        "#);
     }
 
     #[test]
@@ -585,7 +585,7 @@ mod test {
                 )
             })
             .unwrap_err();
-        assert_snapshot!(format_parse_error(input, parse_error), @r###"
+        assert_snapshot!(format_parse_error(input, parse_error), @r#"
          × 'README.md' does not exist
           ╭─[pixi.toml:4:19]
         3 │         version = "1.0"
@@ -593,7 +593,7 @@ mod test {
           ·                   ─────────
         5 │
           ╰────
-        "###);
+        "#);
     }
 
     #[test]

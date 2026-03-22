@@ -1,5 +1,5 @@
 ---
-source: src/global/project/parsed_manifest.rs
-expression: manifest.unwrap_err()
+source: crates/pixi_global/src/project/parsed_manifest.rs
+expression: remove_ansi_escape_sequences(&err)
 ---
 Duplicated exposed names found: python, python3

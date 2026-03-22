@@ -630,10 +630,10 @@ async fn add_unconstrained_dependency() {
         .to_toml_value()
         .to_string();
 
-    insta::assert_snapshot!(format!("foobar = {foo_spec}\nbar = {bar_spec}"), @r###"
+    insta::assert_snapshot!(format!("foobar = {foo_spec}\nbar = {bar_spec}"), @r#"
     foobar = ">=1,<2"
     bar = "*"
-    "###);
+    "#);
 }
 
 #[tokio::test]

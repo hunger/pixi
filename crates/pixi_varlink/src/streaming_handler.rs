@@ -5,7 +5,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::dev_prefix_pixi::{
-    AsyncCall, ConfirmGlobalInstall_Args, GlobalInstall_Args, Info_Args, VarlinkInterface,
+    AsyncCall, ConfirmGlobalInstall_Args, GlobalInstall_Args, VarlinkInterface,
 };
 use crate::server::PixiVarlinkService;
 
@@ -65,8 +65,7 @@ impl varlink::AsyncConnectionHandler for StreamingHandler {
                     let oneway = request.oneway.unwrap_or(false);
 
                     if request.method == "dev.prefix.pixi.ConfirmGlobalInstall" && more {
-                        let args: ConfirmGlobalInstall_Args =
-                            parse_args(request.parameters)?;
+                        let args: ConfirmGlobalInstall_Args = parse_args(request.parameters)?;
                         self.handle_confirm_streaming(server, args).await?;
                     } else {
                         let mut call = AsyncCall::new(more, oneway);
@@ -93,8 +92,7 @@ impl StreamingHandler {
     ) -> varlink::Result<()> {
         match request.method.as_ref() {
             "dev.prefix.pixi.ConfirmGlobalInstall" => {
-                let args: ConfirmGlobalInstall_Args =
-                    parse_args(request.parameters.clone())?;
+                let args: ConfirmGlobalInstall_Args = parse_args(request.parameters.clone())?;
                 self.inner
                     .confirm_global_install(call, args.challenge)
                     .await
@@ -115,10 +113,6 @@ impl StreamingHandler {
                         args.client_envs_dir,
                     )
                     .await
-            }
-            "dev.prefix.pixi.Info" => {
-                let args: Info_Args = parse_args(request.parameters.clone())?;
-                self.inner.info(call, args.manifest_path).await
             }
             method => {
                 use varlink::CallTrait;
@@ -141,9 +135,10 @@ impl StreamingHandler {
         let inner = self.inner.clone();
         let challenge = args.challenge;
 
-        let install_future = tokio::spawn(async move {
-            inner.confirm_global_install_streaming(challenge, tx).await
-        });
+        let install_future =
+            tokio::spawn(
+                async move { inner.confirm_global_install_streaming(challenge, tx).await },
+            );
 
         // Pin the future so we can poll it in select!
         tokio::pin!(install_future);

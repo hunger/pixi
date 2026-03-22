@@ -1,7 +1,6 @@
 ---
 source: crates/pixi_manifest/src/toml/manifest.rs
 expression: "expect_parse_warnings(r#\"\n        [workspace]\n        name = \"test\"\n        channels = []\n        platforms = ['osx-64']\n        preview = [\"pixi-build\"]\n\n        [package]\n\n        [package.build]\n        backend = { name = \"foobar\", version = \"*\" }\n\n        [target.osx-64.build-dependencies]\n        \"#,)"
-snapshot_kind: text
 ---
   × When `pixi-build` is enabled, build-dependencies can only be specified for a package.
     ╭─[pixi.toml:13:9]

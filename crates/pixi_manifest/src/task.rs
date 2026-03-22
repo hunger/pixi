@@ -1126,7 +1126,7 @@ mod tests {
         };
         let task = Task::Alias(alias);
         let toml = toml_edit::Item::from(task);
-        assert_snapshot!(toml.to_string(), @r###"[{ task = "depTask", args = ["foo", { bar = "baz" }] }]"###);
+        assert_snapshot!(toml.to_string(), @r#"[{ task = "depTask", args = ["foo", { bar = "baz" }] }]"#);
     }
 
     #[test]

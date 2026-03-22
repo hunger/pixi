@@ -89,7 +89,8 @@ async fn pypi_dependency_index_preserved_on_upgrade() {
         .replace(&Platform::current().to_string(), "[PLATFORM]")
         .replace(&channel.url().to_string(), "[CHANNEL_URL]")
         .replace(&pypi_index_url.to_string(), "[PYPI_INDEX_URL]");
-    assert_snapshot!(redacted_content, @r###"
+    assert_snapshot!(redacted_content, @r#"
+
     [workspace]
     channels = ["[CHANNEL_URL]"]
     platforms = ["[PLATFORM]"]
@@ -100,7 +101,7 @@ async fn pypi_dependency_index_preserved_on_upgrade() {
 
     [dependencies]
     python = ">=3.12.0,<3.13"
-    "###);
+    "#);
 }
 
 #[tokio::test]

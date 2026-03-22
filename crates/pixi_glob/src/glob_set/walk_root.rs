@@ -384,7 +384,7 @@ mod tests {
 
         assert_yaml_snapshot!(
             snapshot_walk_roots(&walk_roots, Path::new("workspace/baz")),
-            @r###"
+            @r#"
         root: workspace
         globs:
           - pattern: baz/src/**/*.rs
@@ -399,7 +399,7 @@ mod tests {
             negated: true
           - pattern: baz/**/*.cpp
             negated: false
-        "###
+        "#
         );
     }
 
@@ -412,14 +412,14 @@ mod tests {
 
         assert_yaml_snapshot!(
             snapshot_walk_roots(&walk_roots, Path::new("workspace/baz")),
-            @r###"
+            @r#"
         root: workspace/baz
         globs:
           - pattern: "*.rs"
             negated: false
           - pattern: "*.tmp"
             negated: true
-        "###
+        "#
         );
     }
 
@@ -430,7 +430,7 @@ mod tests {
         let walk_roots = WalkRoot::build(globs).expect("determine should succeed");
         assert_yaml_snapshot!(
             snapshot_walk_roots(&walk_roots, Path::new("workspace")),
-            @r###"
+            @"
         root: workspace
         globs:
           - pattern: src/**/*.rs
@@ -439,7 +439,7 @@ mod tests {
             negated: true
           - pattern: docs/**/*.md
             negated: false
-        "###
+        "
         );
     }
 
@@ -451,14 +451,14 @@ mod tests {
 
         assert_yaml_snapshot!(
             snapshot_walk_roots(&walk_roots, Path::new("workspace/baz")),
-            @r###"
+            @r#"
         root: workspace
         globs:
           - pattern: baz/.pixi/**
             negated: true
           - pattern: "*.{cc,cpp}"
             negated: false
-        "###
+        "#
         );
     }
 
@@ -470,14 +470,14 @@ mod tests {
 
         assert_yaml_snapshot!(
             snapshot_walk_roots(&walk_roots, Path::new("workspace/baz")),
-            @r###"
+            @r#"
         root: workspace
         globs:
           - pattern: baz/pixi.toml
             negated: false
           - pattern: "*.{cc,cpp}"
             negated: false
-        "###
+        "#
         );
     }
 
@@ -491,14 +491,14 @@ mod tests {
 
         assert_yaml_snapshot!(
             snapshot_walk_roots(&walk_roots, Path::new("workspace")),
-            @r###"
+            @r#"
         root: workspace
         globs:
           - pattern: recipe/**
             negated: false
           - pattern: "**"
             negated: false
-        "###
+        "#
         );
     }
 }

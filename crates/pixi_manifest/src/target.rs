@@ -716,11 +716,11 @@ mod tests {
                     format!("{} = {}", name.as_source(), spec.as_version_spec().unwrap())
                 })
             })
-            .join("\n"), @r###"
+            .join("\n"), @"
         run = ==2.0
         host = ==2.0
         build = ==1.0
-        "###);
+        ");
     }
 
     /// Test that Overwrite behavior replaces existing dependencies (regression test)
@@ -766,7 +766,8 @@ mod tests {
             .unwrap();
 
         // Verify the TOML output has only one foo dependency with version 2.0
-        assert_snapshot!(manifest_mut.document.to_string(), @r###"
+        assert_snapshot!(manifest_mut.document.to_string(), @r#"
+
         [project]
         name = "test"
         channels = []
@@ -774,7 +775,7 @@ mod tests {
 
         [dependencies]
         foo = "==2.0"
-        "###);
+        "#);
     }
 
     /// Test that adding multiple dependencies with Overwrite keeps only the last one
@@ -845,7 +846,8 @@ mod tests {
             .unwrap();
 
         // Verify only the last version (3.0) is in the TOML
-        assert_snapshot!(manifest_mut.document.to_string(), @r###"
+        assert_snapshot!(manifest_mut.document.to_string(), @r#"
+
         [project]
         name = "test"
         channels = []
@@ -853,7 +855,7 @@ mod tests {
 
         [dependencies]
         foo = "==3.0"
-        "###);
+        "#);
     }
 
     /// Test IgnoreDuplicate behavior doesn't add when dependency exists
@@ -898,12 +900,13 @@ mod tests {
         assert!(!result.unwrap());
 
         // Verify TOML still has original version
-        assert_snapshot!(manifest_mut.document.to_string(), @r###"
+        assert_snapshot!(manifest_mut.document.to_string(), @r#"
+
         [project]
         name = "test"
         channels = []
         platforms = []
-        "###);
+        "#);
     }
 
     /// Test that target-specific dependencies overwrite default feature dependencies

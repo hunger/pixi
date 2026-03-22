@@ -1,5 +1,5 @@
 ---
-source: src/workspace/mod.rs
+source: crates/pixi_core/src/workspace/mod.rs
 expression: "format_dependencies(workspace.default_environment().combined_dependencies(Some(Platform::Linux64)))"
 ---
 foo = "==1.0"

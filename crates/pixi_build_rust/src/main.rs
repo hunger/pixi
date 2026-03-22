@@ -585,11 +585,11 @@ mod tests {
                 .to_string()
         );
 
-        insta::assert_yaml_snapshot!(&generated_recipe.metadata_input_globs, @r###"
+        insta::assert_yaml_snapshot!(&generated_recipe.metadata_input_globs, @r#"
         - "../../Cargo.toml"
         - "../Cargo.toml"
         - Cargo.toml
-        "###);
+        "#);
     }
 
     #[tokio::test]

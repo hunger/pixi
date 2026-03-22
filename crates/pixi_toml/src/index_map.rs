@@ -105,13 +105,13 @@ mod test {
         let result = TomlIndexMap::<String, i32>::deserialize(&mut result)
             .unwrap()
             .into_inner();
-        assert_debug_snapshot!(result, @r###"
+        assert_debug_snapshot!(result, @r#"
         {
             "b": 1,
             "c": 2,
             "a": 3,
             "d": 4,
         }
-        "###);
+        "#);
     }
 }

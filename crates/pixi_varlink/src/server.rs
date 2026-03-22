@@ -4,17 +4,12 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use pixi_consts::consts;
-use pixi_core::WorkspaceLocator;
 use pixi_global::{EnvironmentName, Mapping, Project};
-use pixi_manifest::{FeaturesExt, HasFeaturesIter};
 use rattler_conda_types::{MatchSpec, NamedChannelOrUrl, Platform};
 use sha2::{Digest, Sha256};
 
-use crate::dev_prefix_pixi::{
-    Call_ConfirmGlobalInstall, Call_GlobalInstall, Call_Info, EnvironmentInfo,
-    VarlinkCallError as _, VarlinkInterface, WorkspaceInfo,
-};
+use crate::dev_prefix_pixi::Call_ConfirmGlobalInstall;
+use crate::dev_prefix_pixi::{Call_GlobalInstall, VarlinkCallError as _, VarlinkInterface};
 
 #[allow(dead_code)]
 struct PendingInstall {
@@ -64,7 +59,6 @@ impl PixiVarlinkService {
             .collect()
     }
 }
-
 
 struct InstallResult {
     packages: Vec<crate::dev_prefix_pixi::InstalledPackage>,
@@ -174,16 +168,11 @@ async fn perform_global_install(
         }
     }
 
-    if project
-        .environment_in_sync_internal(env_name, true)
-        .await?
-    {
+    if project.environment_in_sync_internal(env_name, true).await? {
         tracing::info!(env_name = %env_name, "environment already in sync");
         project.manifest.save().await?;
 
-        return Ok(InstallResult {
-            packages: vec![],
-        });
+        return Ok(InstallResult { packages: vec![] });
     }
 
     let environment_update = project
@@ -209,9 +198,7 @@ async fn perform_global_install(
     } else {
         pixi_global::project::ExposedType::Ignore(with_package_names)
     };
-    project
-        .sync_exposed_names(env_name, expose_type)
-        .await?;
+    project.sync_exposed_names(env_name, expose_type).await?;
 
     let _ = project
         .expose_executables_from_environment(env_name)
@@ -242,11 +229,8 @@ async fn perform_global_install(
 
     project.manifest.save().await?;
 
-    Ok(InstallResult {
-        packages,
-    })
+    Ok(InstallResult { packages })
 }
-
 
 #[async_trait]
 impl VarlinkInterface for PixiVarlinkService {
@@ -292,23 +276,20 @@ impl VarlinkInterface for PixiVarlinkService {
         let challenge = uuid::Uuid::new_v4().to_string();
         tracing::debug!(challenge = %challenge, client_envs_dir = %client_envs_dir, "issuing challenge");
 
-        self.pending
-            .lock()
-            .expect("pending lock poisoned")
-            .insert(
-                challenge.clone(),
-                PendingInstall {
-                    client_envs_dir,
-                    packages,
-                    channels,
-                    platform,
-                    environment,
-                    expose,
-                    with,
-                    force_reinstall,
-                    no_shortcuts,
-                },
-            );
+        self.pending.lock().expect("pending lock poisoned").insert(
+            challenge.clone(),
+            PendingInstall {
+                client_envs_dir,
+                packages,
+                channels,
+                platform,
+                environment,
+                expose,
+                with,
+                force_reinstall,
+                no_shortcuts,
+            },
+        );
 
         call.reply(challenge)
     }
@@ -342,18 +323,16 @@ impl VarlinkInterface for PixiVarlinkService {
             return call.reply_authentication_failed(challenge);
         }
 
-        let sha =
-            self.compute_env_name(&pending.client_envs_dir, pending.environment.as_deref());
-        let env_name = EnvironmentName::from_str(
-            pending.environment.as_deref().unwrap_or("default"),
-        )
-        .map_err(|e| {
-            varlink::error::Error(
-                varlink::ErrorKind::InvalidParameter(e.to_string()),
-                None,
-                None,
-            )
-        })?;
+        let sha = self.compute_env_name(&pending.client_envs_dir, pending.environment.as_deref());
+        let env_name =
+            EnvironmentName::from_str(pending.environment.as_deref().unwrap_or("default"))
+                .map_err(|e| {
+                    varlink::error::Error(
+                        varlink::ErrorKind::InvalidParameter(e.to_string()),
+                        None,
+                        None,
+                    )
+                })?;
 
         tracing::info!(
             challenge = %challenge,
@@ -362,7 +341,16 @@ impl VarlinkInterface for PixiVarlinkService {
             "authentication succeeded, installing",
         );
 
-        match perform_global_install(&self.base_dir, &self.cache_dir, &env_name, &sha, &pending, None).await {
+        match perform_global_install(
+            &self.base_dir,
+            &self.cache_dir,
+            &env_name,
+            &sha,
+            &pending,
+            None,
+        )
+        .await
+        {
             Ok(result) => {
                 tracing::info!(
                     env_name = %env_name,
@@ -382,100 +370,6 @@ impl VarlinkInterface for PixiVarlinkService {
                 call.reply_global_install_failed(err.to_string())
             }
         }
-    }
-
-    async fn info(
-        &self,
-        call: &mut dyn Call_Info,
-        manifest_path: Option<String>,
-    ) -> varlink::Result<()> {
-        tracing::debug!(manifest_path = manifest_path.as_deref(), "Info request");
-
-        let mut locator = WorkspaceLocator::for_cli();
-        if let Some(path) = &manifest_path {
-            locator = locator.with_search_start(
-                pixi_core::workspace::DiscoveryStart::ExplicitManifest(path.into()),
-            );
-        }
-
-        let workspace = match locator.locate() {
-            Ok(ws) => {
-                tracing::debug!(
-                    workspace = ws.display_name(),
-                    manifest = %ws.workspace.provenance.path.display(),
-                    "workspace found",
-                );
-                ws
-            }
-            Err(err) => {
-                let path = manifest_path.unwrap_or_else(|| ".".to_string());
-                tracing::warn!(path = %path, error = %err, "workspace not found");
-                return call.reply_workspace_not_found(path);
-            }
-        };
-
-        let environments: Vec<EnvironmentInfo> = workspace
-            .environments()
-            .iter()
-            .map(|env| {
-                let tasks = env
-                    .tasks(Some(env.best_platform()))
-                    .ok()
-                    .map(|t| t.into_keys().map(|n| n.as_str().to_string()).collect())
-                    .unwrap_or_default();
-
-                EnvironmentInfo {
-                    name: env.name().as_str().to_string(),
-                    features: env
-                        .features()
-                        .map(|f| f.name.as_str().to_string())
-                        .collect(),
-                    solve_group: env.solve_group().map(|sg| sg.name().to_string()),
-                    platforms: env.platforms().into_iter().map(|p| p.to_string()).collect(),
-                    dependencies: env
-                        .combined_dependencies(Some(env.best_platform()))
-                        .names()
-                        .map(|p| p.as_source().to_string())
-                        .collect(),
-                    pypi_dependencies: env
-                        .pypi_dependencies(Some(env.best_platform()))
-                        .into_iter()
-                        .map(|(name, _)| name.as_source().to_string())
-                        .collect(),
-                    tasks,
-                    prefix: env.dir().to_string_lossy().to_string(),
-                }
-            })
-            .collect();
-
-        tracing::debug!(
-            workspace = workspace.display_name(),
-            environments = environments.len(),
-            "Info reply",
-        );
-
-        let version = workspace
-            .workspace
-            .value
-            .workspace
-            .version
-            .as_ref()
-            .map(|v| v.to_string());
-
-        let info = WorkspaceInfo {
-            name: workspace.display_name().to_string(),
-            manifest_path: workspace
-                .workspace
-                .provenance
-                .path
-                .to_string_lossy()
-                .to_string(),
-            version,
-            pixi_version: consts::PIXI_VERSION.to_string(),
-            environments,
-        };
-
-        call.reply(info)
     }
 }
 
@@ -515,18 +409,16 @@ impl PixiVarlinkService {
             return Ok(call.take_replies());
         }
 
-        let sha =
-            self.compute_env_name(&pending.client_envs_dir, pending.environment.as_deref());
-        let env_name = EnvironmentName::from_str(
-            pending.environment.as_deref().unwrap_or("default"),
-        )
-        .map_err(|e| {
-            varlink::error::Error(
-                varlink::ErrorKind::InvalidParameter(e.to_string()),
-                None,
-                None,
-            )
-        })?;
+        let sha = self.compute_env_name(&pending.client_envs_dir, pending.environment.as_deref());
+        let env_name =
+            EnvironmentName::from_str(pending.environment.as_deref().unwrap_or("default"))
+                .map_err(|e| {
+                    varlink::error::Error(
+                        varlink::ErrorKind::InvalidParameter(e.to_string()),
+                        None,
+                        None,
+                    )
+                })?;
 
         tracing::info!(
             challenge = %challenge,
@@ -537,7 +429,16 @@ impl PixiVarlinkService {
 
         let mut call = crate::dev_prefix_pixi::AsyncCall::new(false, false);
 
-        match perform_global_install(&self.base_dir, &self.cache_dir, &env_name, &sha, &pending, Some(progress_tx)).await {
+        match perform_global_install(
+            &self.base_dir,
+            &self.cache_dir,
+            &env_name,
+            &sha,
+            &pending,
+            Some(progress_tx),
+        )
+        .await
+        {
             Ok(result) => {
                 tracing::info!(
                     env_name = %env_name,
@@ -555,7 +456,10 @@ impl PixiVarlinkService {
             }
             Err(err) => {
                 tracing::error!(env_name = %env_name, error = %err, "global install failed");
-                crate::dev_prefix_pixi::VarlinkCallError::reply_global_install_failed(&mut call, err.to_string())?;
+                crate::dev_prefix_pixi::VarlinkCallError::reply_global_install_failed(
+                    &mut call,
+                    err.to_string(),
+                )?;
             }
         }
 

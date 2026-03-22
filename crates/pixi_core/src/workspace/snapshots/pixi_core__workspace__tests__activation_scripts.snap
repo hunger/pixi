@@ -1,5 +1,5 @@
 ---
-source: src/workspace/mod.rs
+source: crates/pixi_core/src/workspace/mod.rs
 expression: "format!(\"= Linux64\\n{}\\n\\n= Win64\\n{}\\n\\n= OsxArm64\\n{}\",\nfmt_activation_scripts(workspace.default_environment().activation_scripts(Some(Platform::Linux64))),\nfmt_activation_scripts(workspace.default_environment().activation_scripts(Some(Platform::Win64))),\nfmt_activation_scripts(workspace.default_environment().activation_scripts(Some(Platform::OsxArm64))))"
 ---
 = Linux64

@@ -1,5 +1,5 @@
 ---
-source: src/cli/completion.rs
+source: crates/pixi_cli/src/completion.rs
 expression: result
 ---
 
@@ -44,5 +44,3 @@ _arguments "${_arguments_options[@]}" \
 _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
-
-

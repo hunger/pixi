@@ -1,5 +1,5 @@
 ---
 source: crates/pixi_build_discovery/tests/discovery.rs
-expression: error_to_snapshot(& err)
+expression: "pixi_test_utils :: format_diagnostic(& err)"
 ---
   × failed to discover a valid project manifest, the source path '/non-existing' could not be found

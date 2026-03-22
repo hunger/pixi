@@ -1,5 +1,5 @@
 ---
-source: src/workspace/mod.rs
+source: crates/pixi_core/src/workspace/mod.rs
 expression: "workspace.workspace.value.tasks(Some(Platform::Linux64),\n&FeatureName::DEFAULT).unwrap()"
 ---
 {

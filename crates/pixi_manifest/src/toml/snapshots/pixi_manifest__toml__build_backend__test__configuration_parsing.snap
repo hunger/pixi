@@ -1,7 +1,6 @@
 ---
 source: crates/pixi_manifest/src/toml/build_backend.rs
 expression: parsed
-snapshot_kind: text
 ---
 TomlPackageBuild {
     backend: PixiSpanned {

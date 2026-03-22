@@ -326,7 +326,7 @@ mod test {
         let parse_error = TomlWorkspace::from_toml_str(input)
             .and_then(|w| w.into_workspace(ExternalWorkspaceProperties::default(), Some(path)))
             .unwrap_err();
-        assert_snapshot!(format_parse_error(input, parse_error), @r###"
+        assert_snapshot!(format_parse_error(input, parse_error), @r#"
          × 'LICENSE.txt' does not exist
           ╭─[pixi.toml:4:25]
         3 │         platforms = []
@@ -334,7 +334,7 @@ mod test {
           ·                         ───────────
         5 │
           ╰────
-        "###);
+        "#);
     }
 
     #[test]
@@ -348,7 +348,7 @@ mod test {
         let parse_error = TomlWorkspace::from_toml_str(input)
             .and_then(|w| w.into_workspace(ExternalWorkspaceProperties::default(), Some(path)))
             .unwrap_err();
-        assert_snapshot!(format_parse_error(input, parse_error), @r###"
+        assert_snapshot!(format_parse_error(input, parse_error), @r#"
          × 'README.md' does not exist
           ╭─[pixi.toml:4:19]
         3 │         platforms = []
@@ -356,7 +356,7 @@ mod test {
           ·                   ─────────
         5 │
           ╰────
-        "###);
+        "#);
     }
 
     #[test]

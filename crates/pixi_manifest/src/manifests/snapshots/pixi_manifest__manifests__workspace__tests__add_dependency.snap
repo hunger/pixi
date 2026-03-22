@@ -1,7 +1,8 @@
 ---
 source: crates/pixi_manifest/src/manifests/workspace.rs
-expression: manifest.provenance.document.to_string()
+expression: manifest.document.to_string()
 ---
+
 [project]
 name = "foo"
 channels = []

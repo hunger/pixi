@@ -1,6 +1,6 @@
 ---
 source: crates/pixi_build_discovery/tests/discovery.rs
-expression: error_to_snapshot(& err)
+expression: "pixi_test_utils :: format_diagnostic(& err)"
 input_file: tests/data/discovery/not-a-package/TEST-CASE
 ---
   × the pixi.toml does not describe a package

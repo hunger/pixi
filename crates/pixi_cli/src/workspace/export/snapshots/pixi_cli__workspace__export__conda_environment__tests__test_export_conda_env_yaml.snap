@@ -1,6 +1,5 @@
 ---
 source: crates/pixi_cli/src/workspace/export/conda_environment.rs
-assertion_line: 273
 expression: env_yaml.unwrap().to_yaml_string()
 ---
 name: default

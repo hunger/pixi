@@ -1,7 +1,8 @@
 ---
-source: src/cli/completion.rs
+source: crates/pixi_cli/src/completion.rs
 expression: result
 ---
+
         pixi__project__help__help)
             opts=""
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

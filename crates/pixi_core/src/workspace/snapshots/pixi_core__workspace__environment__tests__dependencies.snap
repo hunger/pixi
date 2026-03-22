@@ -1,5 +1,5 @@
 ---
-source: src/workspace/environment.rs
+source: crates/pixi_core/src/workspace/environment.rs
 expression: format_dependencies(deps)
 ---
 foo = ">=1.0"

@@ -131,7 +131,7 @@ mod test {
         "#,
         )
         .unwrap();
-        assert_debug_snapshot!(channel, @r###"
+        assert_debug_snapshot!(channel, @r#"
         TopLevel {
             channel: Map(
                 PrioritizedChannel {
@@ -142,7 +142,7 @@ mod test {
                 },
             ),
         }
-        "###);
+        "#);
     }
 
     #[test]
@@ -153,7 +153,7 @@ mod test {
         "#,
         )
         .unwrap();
-        assert_debug_snapshot!(channel, @r###"
+        assert_debug_snapshot!(channel, @r#"
         TopLevel {
             channel: Map(
                 PrioritizedChannel {
@@ -166,7 +166,7 @@ mod test {
                 },
             ),
         }
-        "###);
+        "#);
     }
 
     #[test]
@@ -175,7 +175,7 @@ mod test {
         channel = { priority = 10 }
         "#;
         let error = TopLevel::from_toml_str(input).unwrap_err();
-        assert_snapshot!(format_parse_error(input, error), @r###"
+        assert_snapshot!(format_parse_error(input, error), @"
          × missing field 'channel' in table
           ╭─[pixi.toml:2:19]
         1 │
@@ -183,6 +183,6 @@ mod test {
           ·                   ─────────────────
         3 │
           ╰────
-        "###);
+        ");
     }
 }

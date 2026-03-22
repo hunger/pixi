@@ -109,10 +109,10 @@ mod tests {
         let entries = glob_set.collect_matching(root_path).unwrap();
 
         let paths = sorted_paths(entries, root_path);
-        assert_yaml_snapshot!(paths, @r###"
+        assert_yaml_snapshot!(paths, @"
         - include1.txt
         - subdir/include_subdir.txt
-        "###);
+        ");
     }
 
     // Check some general globbing support and make sure the correct things do not match
@@ -132,10 +132,10 @@ mod tests {
         let entries = glob_set.collect_matching(&search_root).unwrap();
 
         let paths = sorted_paths(entries, &search_root);
-        assert_yaml_snapshot!(paths, @r###"
+        assert_yaml_snapshot!(paths, @r#"
         - "../subdir/some_inner_source.cpp"
         - match.txt
-        "###);
+        "#);
     }
 
     // Check that single matching file glob works with rebasing
@@ -194,10 +194,10 @@ mod tests {
         let entries = glob_set.collect_matching(&root_path).unwrap();
 
         let paths = sorted_paths(entries, &root_path);
-        assert_yaml_snapshot!(paths, @r###"
+        assert_yaml_snapshot!(paths, @r#"
         - "../foo.txt"
         - pixi.toml
-        "###);
+        "#);
     }
 
     #[test]
@@ -281,9 +281,7 @@ mod tests {
         let entries = glob_set.collect_matching(&root_path).unwrap();
 
         let paths = sorted_paths(entries, &root_path);
-        assert_yaml_snapshot!(paths, @r#"
-        - ".pixi/subdir/foo_hidden.txt"
-        "#);
+        assert_yaml_snapshot!(paths, @r#"- ".pixi/subdir/foo_hidden.txt""#);
     }
 
     #[test]
@@ -305,9 +303,7 @@ mod tests {
         let entries = glob_set.collect_matching(&root_path).unwrap();
 
         let paths = sorted_paths(entries, &root_path);
-        assert_yaml_snapshot!(paths, @r#"
-        - some_text.txt
-        "#);
+        assert_yaml_snapshot!(paths, @"- some_text.txt");
     }
 
     /// Because we are using ignore which uses gitignore style parsing of globs we need to do some extra processing
@@ -353,9 +349,9 @@ mod tests {
         let entries = glob_set.collect_matching(&root_path).unwrap();
 
         let paths = sorted_paths(entries, &root_path);
-        assert_yaml_snapshot!(paths, @r#"
+        assert_yaml_snapshot!(paths, @"
         - link_dir/linked_file.txt
         - regular.txt
-        "#);
+        ");
     }
 }

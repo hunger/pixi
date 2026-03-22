@@ -1,7 +1,6 @@
 ---
 source: crates/pixi_manifest/src/system_requirements.rs
 expression: serialized
-snapshot_kind: text
 ---
 macos = "10.15"
 linux = "5.11"

@@ -183,13 +183,13 @@ mod tests {
 
         assert_snapshot!(
             format_parse_error(input, result.unwrap_err()),
-            @r###"
+            @r#"
          × expected bool or list of features e.g `true` or `["new-resolve"]`, found string
           ╭─[pixi.toml:1:12]
         1 │ preview = "not-a-bool"
           ·            ──────────
           ╰────
-        "###
+        "#
         );
     }
 
@@ -201,13 +201,13 @@ mod tests {
         assert!(result.is_err());
         assert_snapshot!(
             format_parse_error(input, result.unwrap_err()),
-            @r###"
+            @r#"
          × expected a feature name, found integer
           ╭─[pixi.toml:1:21]
         1 │ preview = ["build", 123]
           ·                     ───
           ╰────
-        "###
+        "#
         );
     }
 
@@ -219,13 +219,13 @@ mod tests {
         assert!(result.is_err());
         assert_snapshot!(
             format_parse_error(input, result.unwrap_err()),
-            @r###"
+            @r#"
          × expected bool or list of features e.g `true` or `["new-resolve"]`, found integer
           ╭─[pixi.toml:1:11]
         1 │ preview = 123
           ·           ───
           ╰────
-        "###
+        "#
         );
     }
 
@@ -252,7 +252,7 @@ mod tests {
         let top = TopLevel::from_toml_str(input).unwrap();
         let preview = top.preview.into_preview();
         assert_eq!(preview.warnings.len(), 1);
-        assert_snapshot!(format_parse_error(input, preview.warnings.into_iter().next().unwrap()), @r###"
+        assert_snapshot!(format_parse_error(input, preview.warnings.into_iter().next().unwrap()), @r#"
          ⚠ The preview features: foobar, new_parsing are defined in the manifest but un-used in pixi
           ╭─[pixi.toml:1:13]
         1 │ preview = ["foobar", "pixi-build", "new_parsing"]
@@ -260,6 +260,6 @@ mod tests {
           ·                │                         ╰── 'new_parsing' is unknown
           ·                ╰── 'foobar' is unknown
           ╰────
-        "###);
+        "#);
     }
 }

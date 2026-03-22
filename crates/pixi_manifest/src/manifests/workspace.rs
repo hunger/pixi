@@ -2959,11 +2959,11 @@ bar = "*"
         let report_handler = NarratableReportHandler::new().with_cause_chain();
         report_handler.render_report(&mut s, err.as_ref()).unwrap();
 
-        assert_snapshot!(s, @r###"
+        assert_snapshot!(s, @"
         the feature 'non-existing' is not defined in the project manifest
             Diagnostic severity: error
         diagnostic help: Did you mean 'existing'?
-        "###);
+        ");
     }
 
     #[test]
@@ -3243,7 +3243,8 @@ channels = ["nvidia", "pytorch"]
             .unwrap();
         assert!(cuda_channels.is_empty());
 
-        assert_snapshot!(manifest.document.to_string(), @r###"
+        assert_snapshot!(manifest.document.to_string(), @r#"
+
         [workspace]
         name = "foo"
         channels = ["bioconda", "conda-forge"]
@@ -3251,7 +3252,7 @@ channels = ["nvidia", "pytorch"]
 
         [feature.cuda]
         channels = []
-        "###);
+        "#);
     }
 
     #[test]
@@ -3268,7 +3269,7 @@ channels = ["nvidia", "pytorch"]
 
         let manifest = WorkspaceManifest::from_toml_str(toml);
         let err = manifest.unwrap_err();
-        insta::assert_snapshot!(format_parse_error(toml, err.error), @r###"
+        insta::assert_snapshot!(format_parse_error(toml, err.error), @r#"
          × conda source dependencies are not allowed without enabling the 'pixi-build' preview feature
           ╭─[pixi.toml:8:15]
         7 │         [dependencies]
@@ -3278,7 +3279,7 @@ channels = ["nvidia", "pytorch"]
         9 │
           ╰────
          help: Add `preview = ["pixi-build"]` to the `workspace` or `project` table of your manifest
-        "###);
+        "#);
     }
 
     #[test]
@@ -3297,12 +3298,13 @@ channels = ["nvidia", "pytorch"]
             .remove_platforms([Platform::Linux64], &FeatureName::DEFAULT)
             .unwrap();
 
-        assert_snapshot!(manifest.document.to_string(), @r###"
+        assert_snapshot!(manifest.document.to_string(), @r#"
+
         [workspace]
         name = "test"
         channels = ['conda-forge']
         platforms = [ 'win-64']
-        "###);
+        "#);
     }
 
     #[test]
