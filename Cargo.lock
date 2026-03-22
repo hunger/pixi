@@ -6936,6 +6936,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
  "uuid",
  "varlink",

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::dev_prefix_pixi::{self, VarlinkClientInterface as _};
+use toml_edit::DocumentMut;
 use varlink_stdinterfaces::org_varlink_service_async::VarlinkClientInterface as _;
 
 /// Normalize a varlink address: bare paths become `unix:` addresses.
@@ -235,16 +236,17 @@ fn link_entry(target: &Path, link: &Path) -> miette::Result<&'static str> {
 
 /// Link the server's install into the client's `~/.pixi/`.
 ///
-/// Scans `$sha_dir` and for each top-level subdirectory, links every
-/// entry inside it into the matching `$pixi_home/<subdir>/` directory
-/// using the best available method (reflink → hardlink → symlink → copy).
+/// - For `envs/`, `bin/`, etc.: links entries into `$pixi_home/<dir>/`.
+/// - For `manifests/`: merges the server's env sections into the client's
+///   `pixi-global.toml`.
 ///
-/// If any link target already exists, all links created in this run
-/// are removed before returning an error.
+/// On error, all created links are removed and the manifest is restored.
 pub fn create_symlinks(result: &GlobalInstallResult) -> miette::Result<()> {
     let mut created: Vec<PathBuf> = Vec::new();
+    let env_name = &result.display_env_name;
+    let manifest_path = result.pixi_home.join("manifests").join("pixi-global.toml");
 
-    let outcome = do_create_links(result, &mut created);
+    let outcome = do_create_links(result, &mut created, env_name, &manifest_path);
 
     if let Err(err) = &outcome {
         tracing::warn!(error = %err, "rolling back {} links", created.len());
@@ -253,7 +255,18 @@ pub fn create_symlinks(result: &GlobalInstallResult) -> miette::Result<()> {
                 tracing::warn!(path = %link.display(), error = %e, "rollback failed");
             }
         }
+        // Restore manifest backup if it exists
+        let backup = manifest_path.with_extension(format!("pre-{env_name}"));
+        if backup.exists() {
+            let _ = std::fs::rename(&backup, &manifest_path);
+        }
     }
+
+    // Clean up temp files on success
+    let backup = manifest_path.with_extension(format!("pre-{env_name}"));
+    let staged = manifest_path.with_extension(format!("toml-{env_name}"));
+    let _ = std::fs::remove_file(&backup);
+    let _ = std::fs::remove_file(&staged);
 
     outcome
 }
@@ -261,6 +274,8 @@ pub fn create_symlinks(result: &GlobalInstallResult) -> miette::Result<()> {
 fn do_create_links(
     result: &GlobalInstallResult,
     created: &mut Vec<PathBuf>,
+    env_name: &str,
+    manifest_path: &Path,
 ) -> miette::Result<()> {
     let pixi_home = &result.pixi_home;
     let sha_dir = &result.sha_dir;
@@ -279,10 +294,11 @@ fn do_create_links(
         let subdir_name = top_entry.file_name();
         let subdir_str = subdir_name.to_string_lossy();
 
-        // Skip server-internal directories that shouldn't be merged
         if subdir_str == "manifests" {
+            merge_manifest(sha_dir, env_name, manifest_path)?;
             continue;
         }
+
         let server_subdir = top_entry.path();
         let local_subdir = pixi_home.join(&subdir_name);
 
@@ -329,6 +345,92 @@ fn do_create_links(
             created.push(link);
         }
     }
+
+    // Atomically swap the staged manifest into place
+    let staged = manifest_path.with_extension(format!("toml-{env_name}"));
+    if staged.exists() {
+        std::fs::rename(&staged, manifest_path).map_err(|e| {
+            miette::miette!(
+                "failed to swap manifest {} -> {}: {e}",
+                staged.display(),
+                manifest_path.display(),
+            )
+        })?;
+        tracing::debug!(manifest = %manifest_path.display(), "manifest updated");
+    }
+
+    Ok(())
+}
+
+/// Merge the server's manifest env sections into the client's manifest.
+///
+/// 1. Copy current `pixi-global.toml` to `pixi-global.pre-<env_name>` (backup)
+/// 2. Read both manifests, merge `[envs.*]` from server into client
+/// 3. Write result to `pixi-global.toml-<env_name>` (staged)
+/// 4. The caller atomically renames the staged file into place on success
+fn merge_manifest(sha_dir: &Path, env_name: &str, manifest_path: &Path) -> miette::Result<()> {
+    let server_manifest = sha_dir.join("manifests").join("pixi-global.toml");
+    if !server_manifest.exists() {
+        return Ok(());
+    }
+
+    let manifest_dir = manifest_path
+        .parent()
+        .expect("manifest path should have a parent");
+    std::fs::create_dir_all(manifest_dir)
+        .map_err(|e| miette::miette!("failed to create {}: {e}", manifest_dir.display()))?;
+
+    // Read current client manifest (or empty)
+    let client_toml = if manifest_path.exists() {
+        std::fs::read_to_string(manifest_path)
+            .map_err(|e| miette::miette!("failed to read {}: {e}", manifest_path.display()))?
+    } else {
+        "version = 1\n".to_string()
+    };
+
+    // Backup
+    let backup = manifest_path.with_extension(format!("pre-{env_name}"));
+    if manifest_path.exists() {
+        std::fs::copy(manifest_path, &backup)
+            .map_err(|e| miette::miette!("failed to backup manifest: {e}"))?;
+    }
+
+    // Read server manifest
+    let server_toml = std::fs::read_to_string(&server_manifest)
+        .map_err(|e| miette::miette!("failed to read {}: {e}", server_manifest.display()))?;
+
+    let mut client_doc: DocumentMut = client_toml
+        .parse()
+        .map_err(|e| miette::miette!("failed to parse client manifest: {e}"))?;
+    let server_doc: DocumentMut = server_toml
+        .parse()
+        .map_err(|e| miette::miette!("failed to parse server manifest: {e}"))?;
+
+    // Ensure [envs] table exists in client
+    if !client_doc.contains_key("envs") {
+        client_doc["envs"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    let client_envs = client_doc["envs"]
+        .as_table_mut()
+        .ok_or_else(|| miette::miette!("client manifest [envs] is not a table"))?;
+
+    if let Some(server_envs) = server_doc.get("envs").and_then(|e| e.as_table()) {
+        for (name, value) in server_envs.iter() {
+            if client_envs.contains_key(name) {
+                return Err(miette::miette!(
+                    "environment '{name}' already exists in client manifest",
+                ));
+            }
+            client_envs.insert(name, value.clone());
+            tracing::debug!(env = name, "merged env into client manifest");
+        }
+    }
+
+    // Write staged file
+    let staged = manifest_path.with_extension(format!("toml-{env_name}"));
+    std::fs::write(&staged, client_doc.to_string())
+        .map_err(|e| miette::miette!("failed to write staged manifest: {e}"))?;
 
     Ok(())
 }
