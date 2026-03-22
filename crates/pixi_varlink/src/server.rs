@@ -8,7 +8,7 @@ use pixi_global::{EnvironmentName, Mapping, Project};
 use rattler_conda_types::{MatchSpec, NamedChannelOrUrl, Platform};
 use sha2::{Digest, Sha256};
 
-use crate::dev_prefix_pixi::Call_ConfirmGlobalInstall;
+use crate::dev_prefix_pixi::{Call_ConfirmGlobalInstall, ConfirmGlobalInstallResult};
 use crate::dev_prefix_pixi::{Call_GlobalInstall, VarlinkCallError as _, VarlinkInterface};
 
 #[allow(dead_code)]
@@ -247,6 +247,7 @@ impl VarlinkInterface for PixiVarlinkService {
         no_shortcuts: bool,
         client_envs_dir: String,
     ) -> varlink::Result<()> {
+        #[allow(clippy::disallowed_methods)]
         let client_envs_dir = std::fs::canonicalize(&client_envs_dir)
             .map_err(|e| {
                 varlink::error::Error(
@@ -360,9 +361,11 @@ impl VarlinkInterface for PixiVarlinkService {
                 let sha_dir = self.base_dir.join(&sha);
                 call.reply(
                     None,
-                    Some(sha.clone()),
-                    Some(sha_dir.to_string_lossy().to_string()),
-                    Some(result.packages),
+                    Some(ConfirmGlobalInstallResult {
+                        sha,
+                        sha_dir: sha_dir.to_string_lossy().to_string(),
+                        packages: result.packages,
+                    }),
                 )
             }
             Err(err) => {
@@ -449,9 +452,11 @@ impl PixiVarlinkService {
                 Call_ConfirmGlobalInstall::reply(
                     &mut call,
                     None,
-                    Some(sha),
-                    Some(sha_dir.to_string_lossy().to_string()),
-                    Some(result.packages),
+                    Some(crate::dev_prefix_pixi::ConfirmGlobalInstallResult {
+                        sha,
+                        sha_dir: sha_dir.to_string_lossy().to_string(),
+                        packages: result.packages,
+                    }),
                 )?;
             }
             Err(err) => {

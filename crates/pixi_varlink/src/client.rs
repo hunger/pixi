@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::dev_prefix_pixi::{self, VarlinkClientInterface as _};
+use crate::dev_prefix_pixi::{self, Progress, VarlinkClientInterface as _};
 use toml_edit::DocumentMut;
 use varlink_stdinterfaces::org_varlink_service_async::VarlinkClientInterface as _;
 
@@ -75,7 +75,7 @@ fn auth_file_path(client_envs_dir: &str, challenge: &str) -> PathBuf {
 pub async fn global_install(
     address: &str,
     args: GlobalInstallArgs,
-    on_progress: &dyn Fn(&str),
+    on_progress: &dyn Fn(&Progress),
 ) -> miette::Result<GlobalInstallResult> {
     let client_envs_dir = args.client_envs_dir.clone();
     let client_env_name = args.environment.clone();
@@ -125,7 +125,7 @@ async fn confirm_and_cleanup(
     auth_file: &Path,
     client_envs_dir: &str,
     client_env_name: Option<&str>,
-    on_progress: &dyn Fn(&str),
+    on_progress: &dyn Fn(&Progress),
 ) -> miette::Result<GlobalInstallResult> {
     let result = confirm_streaming(client, challenge, on_progress).await;
 
@@ -140,14 +140,12 @@ async fn confirm_and_cleanup(
 
     let reply = result?;
 
-    let sha = reply
-        .sha
-        .ok_or_else(|| miette::miette!("server did not return sha"))?;
-    let sha_dir = PathBuf::from(
-        reply
-            .sha_dir
-            .ok_or_else(|| miette::miette!("server did not return sha_dir"))?,
-    );
+    let Some(reply) = reply.result else {
+        return Err(miette::miette!("Server did not send a result"));
+    };
+
+    let sha = reply.sha;
+    let sha_dir = PathBuf::from(reply.sha_dir);
 
     let envs_dir = PathBuf::from(client_envs_dir);
     let pixi_home = envs_dir
@@ -159,7 +157,6 @@ async fn confirm_and_cleanup(
 
     let packages = reply
         .packages
-        .unwrap_or_default()
         .into_iter()
         .map(|p| InstalledPackage {
             name: p.name,
@@ -179,7 +176,7 @@ async fn confirm_and_cleanup(
 async fn confirm_streaming(
     client: &dev_prefix_pixi::VarlinkClient,
     challenge: &str,
-    on_progress: &dyn Fn(&str),
+    on_progress: &dyn Fn(&Progress),
 ) -> miette::Result<dev_prefix_pixi::ConfirmGlobalInstall_Reply> {
     let mut method_call = client.confirm_global_install(challenge.to_string());
     let stream = method_call
@@ -194,7 +191,7 @@ async fn confirm_streaming(
             .map_err(|e| miette::miette!("ConfirmGlobalInstall recv failed: {e}"))?;
 
         if stream.continues() {
-            if let Some(msg) = &reply.message {
+            if let Some(msg) = &reply.progress {
                 on_progress(msg);
             }
         } else {
@@ -222,7 +219,11 @@ fn link_entry(target: &Path, link: &Path) -> miette::Result<&'static str> {
 
     if target.is_file() {
         std::fs::copy(target, link).map_err(|e| {
-            miette::miette!("failed to link {} -> {}: {e}", link.display(), target.display())
+            miette::miette!(
+                "failed to link {} -> {}: {e}",
+                link.display(),
+                target.display()
+            )
         })?;
         return Ok("copy");
     }
@@ -284,8 +285,8 @@ fn do_create_links(
         .map_err(|e| miette::miette!("failed to read {}: {e}", sha_dir.display()))?;
 
     for top_entry in top_entries {
-        let top_entry = top_entry
-            .map_err(|e| miette::miette!("failed to read {}: {e}", sha_dir.display()))?;
+        let top_entry =
+            top_entry.map_err(|e| miette::miette!("failed to read {}: {e}", sha_dir.display()))?;
 
         if !top_entry.path().is_dir() {
             continue;
@@ -309,16 +310,15 @@ fn do_create_links(
             .map_err(|e| miette::miette!("failed to read {}: {e}", server_subdir.display()))?;
 
         for entry in entries {
-            let entry = entry.map_err(|e| {
-                miette::miette!("failed to read {}: {e}", server_subdir.display())
-            })?;
+            let entry = entry
+                .map_err(|e| miette::miette!("failed to read {}: {e}", server_subdir.display()))?;
 
             // Under envs/, entries are directories (each env) — symlink them.
             // Under other dirs (bin/, etc.), skip subdirectories like
             // trampoline_configuration which are internal pixi state.
-            let ft = entry.file_type().map_err(|e| {
-                miette::miette!("failed to stat {}: {e}", entry.path().display())
-            })?;
+            let ft = entry
+                .file_type()
+                .map_err(|e| miette::miette!("failed to stat {}: {e}", entry.path().display()))?;
             if ft.is_dir() && subdir_name != "envs" {
                 continue;
             }

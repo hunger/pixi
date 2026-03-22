@@ -19,6 +19,8 @@ use crate::streaming_handler::StreamingHandler;
 
 const FALLBACK_NONCE: &str = "pixi-varlink-default-nonce";
 
+pub use dev_prefix_pixi::Progress;
+
 /// Read the nonce from `$CREDENTIALS_DIRECTORY/nonce`, falling back to a
 /// hardcoded default when not running under systemd socket activation.
 fn load_nonce() -> String {
@@ -47,7 +49,11 @@ fn load_nonce() -> String {
 /// Start a varlink server listening on the given address.
 ///
 /// Address format: `unix:/path/to/socket`, `tcp:host:port`, or a bare path.
-pub async fn run_server(address: &str, base_dir: PathBuf, cache_dir: PathBuf) -> miette::Result<()> {
+pub async fn run_server(
+    address: &str,
+    base_dir: PathBuf,
+    cache_dir: PathBuf,
+) -> miette::Result<()> {
     let nonce = load_nonce();
     let pixi_service = Arc::new(PixiVarlinkService::new(nonce, base_dir, cache_dir));
     let streaming = Arc::new(StreamingHandler::new(pixi_service));

@@ -14,7 +14,6 @@ pub enum ErrorKind {
     VarlinkReply_Error,
     AuthenticationFailed(Option<AuthenticationFailed_Args>),
     GlobalInstallFailed(Option<GlobalInstallFailed_Args>),
-    WorkspaceNotFound(Option<WorkspaceNotFound_Args>),
 }
 impl ::std::fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
@@ -26,9 +25,6 @@ impl ::std::fmt::Display for ErrorKind {
             }
             ErrorKind::GlobalInstallFailed(v) => {
                 write!(f, "dev.prefix.pixi.GlobalInstallFailed: {:#?}", v)
-            }
-            ErrorKind::WorkspaceNotFound(v) => {
-                write!(f, "dev.prefix.pixi.WorkspaceNotFound: {:#?}", v)
             }
         }
     }
@@ -141,18 +137,6 @@ impl From<&varlink::Reply> for ErrorKind {
                     _ => ErrorKind::GlobalInstallFailed(None),
                 }
             }
-            varlink::Reply { error: Some(t), .. } if t == "dev.prefix.pixi.WorkspaceNotFound" => {
-                match e {
-                    varlink::Reply {
-                        parameters: Some(p),
-                        ..
-                    } => match serde_json::from_value(p.clone()) {
-                        Ok(v) => ErrorKind::WorkspaceNotFound(v),
-                        Err(_) => ErrorKind::WorkspaceNotFound(None),
-                    },
-                    _ => ErrorKind::WorkspaceNotFound(None),
-                }
-            }
             _ => ErrorKind::VarlinkReply_Error,
         }
     }
@@ -177,21 +161,22 @@ pub trait VarlinkCallError: varlink::CallTrait {
             ),
         ))
     }
-    fn reply_workspace_not_found(&mut self, r#path: String) -> varlink::Result<()> {
-        self.reply_struct(varlink::Reply::error(
-            "dev.prefix.pixi.WorkspaceNotFound",
-            Some(
-                serde_json::to_value(WorkspaceNotFound_Args { r#path })
-                    .map_err(varlink::map_context!())?,
-            ),
-        ))
-    }
 }
 impl VarlinkCallError for varlink::Call<'_> {}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct r#ConfirmGlobalInstallResult {
+    pub r#sha: String,
+    pub r#sha_dir: String,
+    pub r#packages: Vec<InstalledPackage>,
+}
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct r#InstalledPackage {
     pub r#name: String,
     pub r#version: String,
+}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct r#Progress {
+    pub r#message: String,
 }
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct AuthenticationFailed_Args {
@@ -202,19 +187,11 @@ pub struct GlobalInstallFailed_Args {
     pub r#message: String,
 }
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-pub struct WorkspaceNotFound_Args {
-    pub r#path: String,
-}
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct ConfirmGlobalInstall_Reply {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub r#message: Option<String>,
+    pub r#progress: Option<Progress>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub r#sha: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub r#sha_dir: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub r#packages: Option<Vec<InstalledPackage>>,
+    pub r#result: Option<ConfirmGlobalInstallResult>,
 }
 impl varlink::VarlinkReply for ConfirmGlobalInstall_Reply {}
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -225,17 +202,13 @@ pub struct ConfirmGlobalInstall_Args {
 pub trait Call_ConfirmGlobalInstall: VarlinkCallError + Send {
     fn reply(
         &mut self,
-        r#message: Option<String>,
-        r#sha: Option<String>,
-        r#sha_dir: Option<String>,
-        r#packages: Option<Vec<InstalledPackage>>,
+        r#progress: Option<Progress>,
+        r#result: Option<ConfirmGlobalInstallResult>,
     ) -> varlink::Result<()> {
         self.reply_struct(
             ConfirmGlobalInstall_Reply {
-                r#message,
-                r#sha,
-                r#sha_dir,
-                r#packages,
+                r#progress,
+                r#result,
             }
             .into(),
         )
@@ -501,6 +474,6 @@ impl varlink::AsyncInterface for VarlinkInterfaceHandler {
         "dev.prefix.pixi"
     }
     fn get_description(&self) -> &'static str {
-        "# Pixi workspace management over varlink IPC\ninterface dev.prefix.pixi\n\n# A package that was installed.\ntype InstalledPackage (\n    name: string,\n    version: string\n)\n\n# Install packages globally. Returns a challenge UUID. The client must create\n# .pixi-server-auth-<challenge> in client_envs_dir, then call ConfirmGlobalInstall.\nmethod GlobalInstall(\n    packages: []string,\n    channels: []string,\n    platform: ?string,\n    environment: ?string,\n    expose: []string,\n    with: []string,\n    force_reinstall: bool,\n    no_shortcuts: bool,\n    client_envs_dir: string\n) -> (challenge: string)\n\n# Confirm that the auth file was created. The server checks for the file,\n# installs the environment, and returns the result.\n# With \"more\", the server streams progress as intermediate replies with only\n# the \"message\" field set, followed by a final reply with the full result.\nmethod ConfirmGlobalInstall(challenge: string) -> (\n    message: ?string,\n    sha: ?string,\n    sha_dir: ?string,\n    packages: ?[]InstalledPackage\n)\n\nerror WorkspaceNotFound(path: string)\nerror GlobalInstallFailed(message: string)\nerror AuthenticationFailed(challenge: string)\n"
+        "# Pixi workspace management over varlink IPC\ninterface dev.prefix.pixi\n\n# A package that was installed.\ntype InstalledPackage (\n    name: string,\n    version: string\n)\n\n# A progress message\ntype Progress (\n    message: string\n)\n\n# The response to ConfirmGlobalInstall\ntype ConfirmGlobalInstallResult (\n    sha: string,\n    sha_dir: string,\n    packages: []InstalledPackage\n)\n\n# Install packages globally. Returns a challenge UUID. The client must create\n# .pixi-server-auth-<challenge> in client_envs_dir, then call ConfirmGlobalInstall.\nmethod GlobalInstall(\n    packages: []string,\n    channels: []string,\n    platform: ?string,\n    environment: ?string,\n    expose: []string,\n    with: []string,\n    force_reinstall: bool,\n    no_shortcuts: bool,\n    client_envs_dir: string\n) -> (challenge: string)\n\n# Confirm that the auth file was created. The server checks for the file,\n# installs the environment, and returns the result.\n# With \"more\", the server streams progress as intermediate replies with only\n# the \"message\" field set, followed by a final reply with the full result.\nmethod ConfirmGlobalInstall(challenge: string) -> (\n    progress: ?Progress,\n    result: ?ConfirmGlobalInstallResult\n)\n\nerror GlobalInstallFailed(message: string)\nerror AuthenticationFailed(challenge: string)\n"
     }
 }

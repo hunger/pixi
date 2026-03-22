@@ -1,5 +1,6 @@
 use indicatif::ProgressBar;
 use pixi_reporters::main_progress_bar::MainProgressBar;
+use pixi_varlink::Progress;
 
 /// Drives progress bars from server-streamed messages, using the same
 /// [`MainProgressBar`] that `pixi global install` uses for solving.
@@ -32,10 +33,11 @@ impl RemoteProgress {
         }
     }
 
-    pub fn on_message(&mut self, msg: &str) {
+    pub fn on_message(&mut self, progress: &Progress) {
+        let msg = &progress.message;
         // The eprintln flushes stderr which triggers indicatif to redraw.
         eprintln!("[remote progress] {msg}");
-        match msg {
+        match msg.as_str() {
             "pixi solve: queued" => {
                 let id = self.solve_bar.queued("remote".to_owned());
                 self.solve_id = Some(id);

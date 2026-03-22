@@ -7,6 +7,18 @@ type InstalledPackage (
     version: string
 )
 
+# A progress message
+type Progress (
+    message: string
+)
+
+# The response to ConfirmGlobalInstall
+type ConfirmGlobalInstallResult (
+    sha: string,
+    sha_dir: string,
+    packages: []InstalledPackage
+)
+
 # Install packages globally. Returns a challenge UUID. The client must create
 # .pixi-server-auth-<challenge> in client_envs_dir, then call ConfirmGlobalInstall.
 method GlobalInstall(
@@ -26,12 +38,9 @@ method GlobalInstall(
 # With "more", the server streams progress as intermediate replies with only
 # the "message" field set, followed by a final reply with the full result.
 method ConfirmGlobalInstall(challenge: string) -> (
-    message: ?string,
-    sha: ?string,
-    sha_dir: ?string,
-    packages: ?[]InstalledPackage
+    progress: ?Progress,
+    result: ?ConfirmGlobalInstallResult
 )
 
-error WorkspaceNotFound(path: string)
 error GlobalInstallFailed(message: string)
 error AuthenticationFailed(challenge: string)
