@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -14,7 +14,7 @@ pub struct Args {
     pub envs_dir: PathBuf,
 }
 
-fn expand_tilde(path: &PathBuf) -> miette::Result<PathBuf> {
+fn expand_tilde(path: &Path) -> miette::Result<PathBuf> {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix("~/") {
         let home = std::env::var("HOME")
@@ -25,7 +25,7 @@ fn expand_tilde(path: &PathBuf) -> miette::Result<PathBuf> {
             .map_err(|_| miette::miette!("HOME not set, cannot expand ~ in {s}"))?;
         Ok(PathBuf::from(home))
     } else {
-        Ok(path.clone())
+        Ok(path.to_path_buf())
     }
 }
 
@@ -40,7 +40,7 @@ pub async fn execute(address: Option<String>, args: Args) -> miette::Result<()> 
             format!("/tmp/pixi-{}.sock", std::process::id())
         }
     });
-    let address = pixi_varlink::client::normalize_address(&raw_address);
+    let address = pixi_varlink::normalize_address(&raw_address);
     tracing::info!(
         address = %address,
         cache_dir = %cache_dir.display(),

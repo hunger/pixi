@@ -48,7 +48,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
             let address = args
                 .address
                 .ok_or_else(|| miette::miette!("--address is required for this command"))?;
-            let address = pixi_varlink::client::normalize_address(&address);
+            let address = pixi_varlink::normalize_address(&address);
             match cmd {
                 RemoteCommand::Info(info_args) => crate::info::execute(info_args).await,
                 RemoteCommand::Global(global) => match global.command {

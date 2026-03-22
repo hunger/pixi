@@ -21,11 +21,23 @@ const FALLBACK_NONCE: &str = "pixi-varlink-default-nonce";
 
 pub use dev_prefix_pixi::Progress;
 
+/// Normalize a varlink address: bare paths become `unix:` addresses.
+pub fn normalize_address(address: &str) -> String {
+    if address.starts_with("unix:") || address.starts_with("tcp:") {
+        address.to_string()
+    } else if address.starts_with('/') || address.starts_with('.') {
+        format!("unix:{address}")
+    } else {
+        address.to_string()
+    }
+}
+
 /// Read the nonce from `$CREDENTIALS_DIRECTORY/nonce`, falling back to a
 /// hardcoded default when not running under systemd socket activation.
 fn load_nonce() -> String {
     if let Ok(creds_dir) = std::env::var("CREDENTIALS_DIRECTORY") {
         let path = PathBuf::from(creds_dir).join("nonce");
+        #[allow(clippy::disallowed_methods)]
         match std::fs::read_to_string(&path) {
             Ok(nonce) => {
                 let nonce = nonce.trim().to_string();
