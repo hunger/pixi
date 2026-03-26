@@ -17,15 +17,21 @@ use fs_err::tokio as tokio_fs;
 pub struct CompletionsDir(PathBuf);
 
 impl CompletionsDir {
-    /// Create the global complations directory from environment variables
+    /// Create the global completions directory from an explicit path.
+    pub async fn from_path(path: impl Into<PathBuf>) -> miette::Result<Self> {
+        let path = path.into();
+        tokio_fs::create_dir_all(&path).await.into_diagnostic()?;
+        Ok(Self(path))
+    }
+
+    /// Create the global completions directory from environment variables
     pub async fn from_env() -> miette::Result<Self> {
-        let bin_dir = pixi_home()
+        let path = pixi_home()
             .map(|path| path.join("completions"))
             .ok_or(miette::miette!(
                 "Couldn't determine global completions directory"
             ))?;
-        tokio_fs::create_dir_all(&bin_dir).await.into_diagnostic()?;
-        Ok(Self(bin_dir))
+        Self::from_path(path).await
     }
 
     /// Returns the path to the binary directory

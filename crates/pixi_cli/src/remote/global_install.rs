@@ -4,8 +4,6 @@ use itertools::Itertools;
 use miette::IntoDiagnostic;
 use pixi_global::list::format_asciiart_section;
 
-use super::progress::RemoteProgress;
-
 pub async fn execute(address: &str, args: crate::global::install::Args) -> miette::Result<()> {
     let envs_dir = pixi_global::EnvRoot::from_env().await?.path().to_path_buf();
     tokio::fs::create_dir_all(&envs_dir)
@@ -35,14 +33,10 @@ pub async fn execute(address: &str, args: crate::global::install::Args) -> miett
         client_envs_dir: envs_dir.to_string_lossy().to_string(),
     };
 
-    let progress = std::cell::RefCell::new(RemoteProgress::new());
-
-    let result = pixi_varlink::client::global_install(address, install_args, &|msg| {
-        progress.borrow_mut().on_progress(msg);
+    let result = pixi_varlink::client::global_install(address, install_args, &|progress| {
+        eprintln!("{progress:?}")
     })
     .await?;
-
-    progress.borrow_mut().finish();
 
     pixi_varlink::client::create_symlinks(&result)?;
     print_install_result(&result)

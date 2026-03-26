@@ -5,8 +5,10 @@ Description=Pixi Varlink Server
 Type=simple
 ExecStart=pixi remote --address /run/pixi/pixi.sock serve --cache-dir /var/cache/pixi --envs-dir /var/lib/pixi
 
-# Run as a dedicated system user/group, created automatically by systemd.
-DynamicUser=yes
+# Run as a dedicated static system user/group.
+# Not DynamicUser=yes because clients need to traverse /var/lib/pixi directly
+# (DynamicUser redirects StateDirectory into /var/lib/private/ which is 0700).
+# Create the user with: systemd-sysusers pixi-varlink.conf
 User=pixi
 Group=pixi
 

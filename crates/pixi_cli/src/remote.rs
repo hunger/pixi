@@ -1,5 +1,4 @@
 mod global_install;
-mod progress;
 pub mod serve;
 mod version;
 

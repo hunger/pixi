@@ -7,9 +7,27 @@ type InstalledPackage (
     version: string
 )
 
+# Progress bar
+type ProgressBar (
+    Global,
+    CondaSolve,
+    PixiSolve,
+    PixiInstall,
+    FixPermissions
+)
+
+# Progress State
+type ProgressState (
+    Queued,
+    Started,
+    Finished
+)
+
 # A progress message
 type Progress (
-    message: string
+    progress_bar: ProgressBar,
+    progress_state: ProgressState,
+    id: int
 )
 
 # The response to ConfirmGlobalInstall

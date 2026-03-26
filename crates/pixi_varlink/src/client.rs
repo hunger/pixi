@@ -140,10 +140,6 @@ async fn confirm_and_cleanup(
 
     let reply = result?;
 
-    let Some(reply) = reply.result else {
-        return Err(miette::miette!("Server did not send a result"));
-    };
-
     let sha = reply.sha;
     let sha_dir = PathBuf::from(reply.sha_dir);
 
@@ -177,7 +173,7 @@ async fn confirm_streaming(
     client: &dev_prefix_pixi::VarlinkClient,
     challenge: &str,
     on_progress: &dyn Fn(&Progress),
-) -> miette::Result<dev_prefix_pixi::ConfirmGlobalInstall_Reply> {
+) -> miette::Result<dev_prefix_pixi::ConfirmGlobalInstallResult> {
     let mut method_call = client.confirm_global_install(challenge.to_string());
     let stream = method_call
         .more()
@@ -191,11 +187,9 @@ async fn confirm_streaming(
             .map_err(|e| miette::miette!("ConfirmGlobalInstall recv failed: {e}"))?;
 
         if stream.continues() {
-            if let Some(msg) = &reply.progress {
-                on_progress(msg);
-            }
+            on_progress(&reply.progress.expect("A streamed item must be progress"));
         } else {
-            return Ok(reply);
+            return Ok(reply.result.expect("The reply must have result"));
         }
     }
 }

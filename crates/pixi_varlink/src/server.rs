@@ -8,7 +8,7 @@ use pixi_global::{EnvironmentName, Mapping, Project};
 use rattler_conda_types::{MatchSpec, NamedChannelOrUrl, Platform};
 use sha2::{Digest, Sha256};
 
-use crate::dev_prefix_pixi::{Call_ConfirmGlobalInstall, ConfirmGlobalInstallResult};
+use crate::dev_prefix_pixi::{self, Call_ConfirmGlobalInstall, ConfirmGlobalInstallResult};
 use crate::dev_prefix_pixi::{Call_GlobalInstall, VarlinkCallError as _, VarlinkInterface};
 
 #[allow(dead_code)]
@@ -70,7 +70,7 @@ async fn perform_global_install(
     env_name: &EnvironmentName,
     sha: &str,
     pending: &PendingInstall,
-    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<dev_prefix_pixi::Progress>>,
 ) -> miette::Result<InstallResult> {
     let sha_home = base_dir.join(sha);
 
@@ -78,9 +78,12 @@ async fn perform_global_install(
         .await?
         .with_cli_config(pixi_config::Config::load_global());
 
-    if let Some(tx) = progress_tx {
+    let id_counter = crate::reporter::ProgressIdCounter::new(std::sync::atomic::AtomicUsize::new(0));
+    if let Some(ref tx) = progress_tx {
+        let tx = tx.clone();
+        let id_counter = id_counter.clone();
         project = project.with_reporter_factory(move || {
-            Box::new(crate::reporter::VarlinkReporter::new(tx.clone()))
+            Box::new(crate::reporter::VarlinkReporter::new(tx.clone(), id_counter.clone()))
         });
     }
 
@@ -229,7 +232,71 @@ async fn perform_global_install(
 
     project.manifest.save().await?;
 
+    let fix_id = id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i64;
+    if let Some(ref tx) = progress_tx {
+        let _ = tx.send(dev_prefix_pixi::Progress {
+            progress_bar: dev_prefix_pixi::ProgressBar::FixPermissions,
+            progress_state: dev_prefix_pixi::ProgressState::Started,
+            id: fix_id,
+        });
+    }
+
+    fix_permissions(&sha_home)?;
+
+    if let Some(ref tx) = progress_tx {
+        let _ = tx.send(dev_prefix_pixi::Progress {
+            progress_bar: dev_prefix_pixi::ProgressBar::FixPermissions,
+            progress_state: dev_prefix_pixi::ProgressState::Finished,
+            id: fix_id,
+        });
+    }
+
     Ok(InstallResult { packages })
+}
+
+/// Make all files and directories under `root` world-readable.
+///
+/// Conda creates files with mode 0600, but clients need to read from the
+/// server's state directory. This walks the tree and adds read permission
+/// for group and others on every entry.
+fn fix_permissions(root: &std::path::Path) -> miette::Result<()> {
+    fix_permissions_entry(root)?;
+
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| miette::miette!("failed to read {}: {e}", root.display()))?;
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| miette::miette!("failed to read {}: {e}", root.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            fix_permissions(&path)?;
+        } else {
+            fix_permissions_entry(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn fix_permissions_entry(path: &std::path::Path) -> miette::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| miette::miette!("failed to stat {}: {e}", path.display()))?;
+    let mut perms = metadata.permissions();
+    let mode = perms.mode();
+    // Add read for group+other; add execute on directories so they're traversable
+    let new_mode = if metadata.is_dir() {
+        mode | 0o055
+    } else {
+        mode | 0o044
+    };
+    if new_mode != mode {
+        perms.set_mode(new_mode);
+        std::fs::set_permissions(path, perms)
+            .map_err(|e| miette::miette!("chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -382,7 +449,7 @@ impl PixiVarlinkService {
     pub async fn confirm_global_install_streaming(
         &self,
         challenge: String,
-        progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        progress_tx: tokio::sync::mpsc::UnboundedSender<dev_prefix_pixi::Progress>,
     ) -> varlink::Result<Vec<varlink::Reply>> {
         tracing::debug!(challenge = %challenge, "ConfirmGlobalInstall (streaming)");
 

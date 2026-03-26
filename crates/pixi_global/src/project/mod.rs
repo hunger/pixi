@@ -554,6 +554,16 @@ impl Project {
         Self::from_path_with_cache_dir(manifest_path, env_root, bin_dir, cache_dir)
     }
 
+    /// The pixi home directory for this project (parent of the manifest dir).
+    ///
+    /// In normal use this is `$PIXI_HOME` (e.g. `~/.pixi`).
+    /// On the varlink server it is the per-environment SHA directory.
+    fn home_dir(&self) -> miette::Result<&Path> {
+        self.root
+            .parent()
+            .ok_or_else(|| miette::miette!("project root {:?} has no parent", self.root))
+    }
+
     /// Merge config with existing config project
     pub fn with_cli_config<C>(mut self, config: C) -> Self
     where
@@ -790,7 +800,9 @@ impl Project {
         #[cfg(unix)] // Completions are only supported on unix-like systems
         {
             // Prune old completions
-            let completions_dir = super::completions::CompletionsDir::from_env().await?;
+            let completions_dir = super::completions::CompletionsDir::from_path(
+                self.home_dir()?.join("completions"),
+            ).await?;
             completions_dir.prune_old_completions()?;
         }
 
@@ -1387,7 +1399,9 @@ impl Project {
             .map(|exec| exec.name)
             .collect();
 
-        let completions_dir = crate::completions::CompletionsDir::from_env().await?;
+        let completions_dir = crate::completions::CompletionsDir::from_path(
+            self.home_dir()?.join("completions"),
+        ).await?;
         let (completions_to_remove, completions_to_add) =
             super::completions::completions_sync_status(
                 environment.exposed.clone(),

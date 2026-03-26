@@ -1,0 +1,3 @@
+# Create the pixi system user/group for pixi-varlink.service.
+# Install to /usr/lib/sysusers.d/ and run: systemd-sysusers pixi-varlink.conf
+u pixi - "Pixi Varlink Server" /var/lib/pixi /usr/sbin/nologin

@@ -5,7 +5,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::dev_prefix_pixi::{
-    AsyncCall, ConfirmGlobalInstall_Args, GlobalInstall_Args, VarlinkInterface,
+    self, AsyncCall, ConfirmGlobalInstall_Args, GlobalInstall_Args, VarlinkInterface,
 };
 use crate::server::PixiVarlinkService;
 
@@ -127,7 +127,7 @@ impl StreamingHandler {
         server: &mut varlink::sansio::Server,
         args: ConfirmGlobalInstall_Args,
     ) -> varlink::Result<()> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<dev_prefix_pixi::Progress>();
 
         // Run the install (which uses the reporter that sends to tx)
         // on a blocking-friendly spawned task, while we drain progress
@@ -151,7 +151,7 @@ impl StreamingHandler {
                     match msg {
                         Some(message) => {
                             let reply = varlink::Reply {
-                                parameters: Some(json!({ "message": message, "sha": null, "sha_dir": null, "packages": null })),
+                                parameters: Some(json!({ "progress": message, "result": null })),
                                 continues: Some(true),
                                 error: None,
                             };
@@ -178,7 +178,7 @@ impl StreamingHandler {
                     // Install finished before channel drained — drain remaining
                     while let Ok(message) = rx.try_recv() {
                         let reply = varlink::Reply {
-                            parameters: Some(json!({ "message": message, "sha": null, "sha_dir": null, "packages": null })),
+                            parameters: Some(json!({ "progress": message, "result": null })),
                             continues: Some(true),
                             error: None,
                         };

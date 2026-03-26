@@ -176,7 +176,23 @@ pub struct r#InstalledPackage {
 }
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct r#Progress {
-    pub r#message: String,
+    pub r#progress_bar: ProgressBar,
+    pub r#progress_state: ProgressState,
+    pub r#id: i64,
+}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub enum r#ProgressBar {
+    r#Global,
+    r#CondaSolve,
+    r#PixiSolve,
+    r#PixiInstall,
+    r#FixPermissions,
+}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub enum r#ProgressState {
+    r#Queued,
+    r#Started,
+    r#Finished,
 }
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct AuthenticationFailed_Args {
@@ -474,6 +490,6 @@ impl varlink::AsyncInterface for VarlinkInterfaceHandler {
         "dev.prefix.pixi"
     }
     fn get_description(&self) -> &'static str {
-        "# Pixi workspace management over varlink IPC\ninterface dev.prefix.pixi\n\n# A package that was installed.\ntype InstalledPackage (\n    name: string,\n    version: string\n)\n\n# A progress message\ntype Progress (\n    message: string\n)\n\n# The response to ConfirmGlobalInstall\ntype ConfirmGlobalInstallResult (\n    sha: string,\n    sha_dir: string,\n    packages: []InstalledPackage\n)\n\n# Install packages globally. Returns a challenge UUID. The client must create\n# .pixi-server-auth-<challenge> in client_envs_dir, then call ConfirmGlobalInstall.\nmethod GlobalInstall(\n    packages: []string,\n    channels: []string,\n    platform: ?string,\n    environment: ?string,\n    expose: []string,\n    with: []string,\n    force_reinstall: bool,\n    no_shortcuts: bool,\n    client_envs_dir: string\n) -> (challenge: string)\n\n# Confirm that the auth file was created. The server checks for the file,\n# installs the environment, and returns the result.\n# With \"more\", the server streams progress as intermediate replies with only\n# the \"message\" field set, followed by a final reply with the full result.\nmethod ConfirmGlobalInstall(challenge: string) -> (\n    progress: ?Progress,\n    result: ?ConfirmGlobalInstallResult\n)\n\nerror GlobalInstallFailed(message: string)\nerror AuthenticationFailed(challenge: string)\n"
+        "# Pixi workspace management over varlink IPC\ninterface dev.prefix.pixi\n\n# A package that was installed.\ntype InstalledPackage (\n    name: string,\n    version: string\n)\n\n# Progress bar\ntype ProgressBar (\n    Global,\n    CondaSolve,\n    PixiSolve,\n    PixiInstall,\n    FixPermissions\n)\n\n# Progress State\ntype ProgressState (\n    Queued,\n    Started,\n    Finished\n)\n\n# A progress message\ntype Progress (\n    progress_bar: ProgressBar,\n    progress_state: ProgressState,\n    id: int\n)\n\n# The response to ConfirmGlobalInstall\ntype ConfirmGlobalInstallResult (\n    sha: string,\n    sha_dir: string,\n    packages: []InstalledPackage\n)\n\n# Install packages globally. Returns a challenge UUID. The client must create\n# .pixi-server-auth-<challenge> in client_envs_dir, then call ConfirmGlobalInstall.\nmethod GlobalInstall(\n    packages: []string,\n    channels: []string,\n    platform: ?string,\n    environment: ?string,\n    expose: []string,\n    with: []string,\n    force_reinstall: bool,\n    no_shortcuts: bool,\n    client_envs_dir: string\n) -> (challenge: string)\n\n# Confirm that the auth file was created. The server checks for the file,\n# installs the environment, and returns the result.\n# With \"more\", the server streams progress as intermediate replies with only\n# the \"message\" field set, followed by a final reply with the full result.\nmethod ConfirmGlobalInstall(challenge: string) -> (\n    progress: ?Progress,\n    result: ?ConfirmGlobalInstallResult\n)\n\nerror GlobalInstallFailed(message: string)\nerror AuthenticationFailed(challenge: string)\n"
     }
 }
