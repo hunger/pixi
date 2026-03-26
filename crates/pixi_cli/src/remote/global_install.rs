@@ -1,8 +1,13 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Write;
 
+use indicatif::ProgressBar;
 use itertools::Itertools;
 use miette::IntoDiagnostic;
 use pixi_global::list::format_asciiart_section;
+use pixi_reporters::main_progress_bar::MainProgressBar;
+use pixi_varlink::{ProgressBarKind, ProgressState};
 
 pub async fn execute(address: &str, args: crate::global::install::Args) -> miette::Result<()> {
     let envs_dir = pixi_global::EnvRoot::from_env().await?.path().to_path_buf();
@@ -33,13 +38,86 @@ pub async fn execute(address: &str, args: crate::global::install::Args) -> miett
         client_envs_dir: envs_dir.to_string_lossy().to_string(),
     };
 
+    let mp = pixi_progress::global_multi_progress();
+    let anchor = mp.add(ProgressBar::hidden());
+    let placement = pixi_progress::ProgressBarPlacement::Before(anchor.clone());
+
+    let solve_bar = MainProgressBar::<String>::new(mp.clone(), placement.clone(), "solving".to_owned());
+    let install_bar = MainProgressBar::<String>::new(mp.clone(), placement.clone(), "installing".to_owned());
+    let permissions_bar = MainProgressBar::<String>::new(mp.clone(), placement.clone(), "fixing permissions".to_owned());
+
+    // Map server-side progress IDs to local MainProgressBar IDs.
+    // RefCell because on_progress is &dyn Fn (not FnMut).
+    let solve_ids: RefCell<HashMap<i64, usize>> = RefCell::new(HashMap::new());
+    let install_ids: RefCell<HashMap<i64, usize>> = RefCell::new(HashMap::new());
+    let permissions_ids: RefCell<HashMap<i64, usize>> = RefCell::new(HashMap::new());
+
     let result = pixi_varlink::client::global_install(address, install_args, &|progress| {
-        eprintln!("{progress:?}")
+        match progress.progress_bar {
+            ProgressBarKind::Global => {}
+            ProgressBarKind::CondaSolve | ProgressBarKind::PixiSolve => {
+                handle_progress(
+                    &solve_bar,
+                    &solve_ids,
+                    progress,
+                    || format!("{:?}", progress.progress_bar),
+                );
+            }
+            ProgressBarKind::PixiInstall => {
+                handle_progress(
+                    &install_bar,
+                    &install_ids,
+                    progress,
+                    || "install".to_owned(),
+                );
+            }
+            ProgressBarKind::FixPermissions => {
+                handle_progress(
+                    &permissions_bar,
+                    &permissions_ids,
+                    progress,
+                    || "permissions".to_owned(),
+                );
+            }
+        }
     })
-    .await?;
+    .await;
+
+    solve_bar.clear();
+    install_bar.clear();
+    permissions_bar.clear();
+    anchor.finish_and_clear();
+
+    let result = result?;
 
     pixi_varlink::client::create_symlinks(&result)?;
     print_install_result(&result)
+}
+
+fn handle_progress(
+    bar: &MainProgressBar<String>,
+    ids: &RefCell<HashMap<i64, usize>>,
+    progress: &pixi_varlink::Progress,
+    label: impl FnOnce() -> String,
+) {
+    match progress.progress_state {
+        ProgressState::Queued => {
+            let local_id = bar.queued(label());
+            ids.borrow_mut().insert(progress.id, local_id);
+        }
+        ProgressState::Started => {
+            let local_id = *ids
+                .borrow_mut()
+                .entry(progress.id)
+                .or_insert_with(|| bar.queued(label()));
+            bar.start(local_id);
+        }
+        ProgressState::Finished => {
+            if let Some(&local_id) = ids.borrow().get(&progress.id) {
+                bar.finish(local_id);
+            }
+        }
+    }
 }
 
 fn print_install_result(result: &pixi_varlink::client::GlobalInstallResult) -> miette::Result<()> {

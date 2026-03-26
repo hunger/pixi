@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+fs-err = { workspace = true }
 miette = { workspace = true }
 pixi_api = { workspace = true }
 pixi_command_dispatcher = { workspace = true }

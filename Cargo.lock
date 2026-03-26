@@ -6921,6 +6921,7 @@ name = "pixi_varlink"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "fs-err",
  "miette 7.6.0",
  "pixi_api",
  "pixi_command_dispatcher",

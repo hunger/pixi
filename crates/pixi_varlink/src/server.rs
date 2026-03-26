@@ -262,7 +262,7 @@ async fn perform_global_install(
 fn fix_permissions(root: &std::path::Path) -> miette::Result<()> {
     fix_permissions_entry(root)?;
 
-    let entries = std::fs::read_dir(root)
+    let entries = fs_err::read_dir(root)
         .map_err(|e| miette::miette!("failed to read {}: {e}", root.display()))?;
 
     for entry in entries {
@@ -281,7 +281,7 @@ fn fix_permissions(root: &std::path::Path) -> miette::Result<()> {
 fn fix_permissions_entry(path: &std::path::Path) -> miette::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let metadata = std::fs::metadata(path)
+    let metadata = fs_err::metadata(path)
         .map_err(|e| miette::miette!("failed to stat {}: {e}", path.display()))?;
     let mut perms = metadata.permissions();
     let mode = perms.mode();
@@ -293,7 +293,7 @@ fn fix_permissions_entry(path: &std::path::Path) -> miette::Result<()> {
     };
     if new_mode != mode {
         perms.set_mode(new_mode);
-        std::fs::set_permissions(path, perms)
+        fs_err::set_permissions(path, perms)
             .map_err(|e| miette::miette!("chmod {}: {e}", path.display()))?;
     }
     Ok(())

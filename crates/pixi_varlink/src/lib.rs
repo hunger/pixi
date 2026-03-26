@@ -19,7 +19,7 @@ use crate::streaming_handler::StreamingHandler;
 
 const FALLBACK_NONCE: &str = "pixi-varlink-default-nonce";
 
-pub use dev_prefix_pixi::Progress;
+pub use dev_prefix_pixi::{Progress, ProgressBar as ProgressBarKind, ProgressState};
 
 /// Normalize a varlink address: bare paths become `unix:` addresses.
 pub fn normalize_address(address: &str) -> String {
