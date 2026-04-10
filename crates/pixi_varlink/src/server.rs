@@ -78,12 +78,16 @@ async fn perform_global_install(
         .await?
         .with_cli_config(pixi_config::Config::load_global());
 
-    let id_counter = crate::reporter::ProgressIdCounter::new(std::sync::atomic::AtomicUsize::new(0));
+    let id_counter =
+        crate::reporter::ProgressIdCounter::new(std::sync::atomic::AtomicUsize::new(0));
     if let Some(ref tx) = progress_tx {
         let tx = tx.clone();
         let id_counter = id_counter.clone();
         project = project.with_reporter_factory(move || {
-            Box::new(crate::reporter::VarlinkReporter::new(tx.clone(), id_counter.clone()))
+            Box::new(crate::reporter::VarlinkReporter::new(
+                tx.clone(),
+                id_counter.clone(),
+            ))
         });
     }
 
@@ -266,8 +270,7 @@ fn fix_permissions(root: &std::path::Path) -> miette::Result<()> {
         .map_err(|e| miette::miette!("failed to read {}: {e}", root.display()))?;
 
     for entry in entries {
-        let entry =
-            entry.map_err(|e| miette::miette!("failed to read {}: {e}", root.display()))?;
+        let entry = entry.map_err(|e| miette::miette!("failed to read {}: {e}", root.display()))?;
         let path = entry.path();
         if path.is_dir() {
             fix_permissions(&path)?;

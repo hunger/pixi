@@ -42,9 +42,15 @@ pub async fn execute(address: &str, args: crate::global::install::Args) -> miett
     let anchor = mp.add(ProgressBar::hidden());
     let placement = pixi_progress::ProgressBarPlacement::Before(anchor.clone());
 
-    let solve_bar = MainProgressBar::<String>::new(mp.clone(), placement.clone(), "solving".to_owned());
-    let install_bar = MainProgressBar::<String>::new(mp.clone(), placement.clone(), "installing".to_owned());
-    let permissions_bar = MainProgressBar::<String>::new(mp.clone(), placement.clone(), "fixing permissions".to_owned());
+    let solve_bar =
+        MainProgressBar::<String>::new(mp.clone(), placement.clone(), "solving".to_owned());
+    let install_bar =
+        MainProgressBar::<String>::new(mp.clone(), placement.clone(), "installing".to_owned());
+    let permissions_bar = MainProgressBar::<String>::new(
+        mp.clone(),
+        placement.clone(),
+        "fixing permissions".to_owned(),
+    );
 
     // Map server-side progress IDs to local MainProgressBar IDs.
     // RefCell because on_progress is &dyn Fn (not FnMut).
@@ -52,36 +58,28 @@ pub async fn execute(address: &str, args: crate::global::install::Args) -> miett
     let install_ids: RefCell<HashMap<i64, usize>> = RefCell::new(HashMap::new());
     let permissions_ids: RefCell<HashMap<i64, usize>> = RefCell::new(HashMap::new());
 
-    let result = pixi_varlink::client::global_install(address, install_args, &|progress| {
-        match progress.progress_bar {
+    let result =
+        pixi_varlink::client::global_install(address, install_args, &|progress| match progress
+            .progress_bar
+        {
             ProgressBarKind::Global => {}
             ProgressBarKind::CondaSolve | ProgressBarKind::PixiSolve => {
-                handle_progress(
-                    &solve_bar,
-                    &solve_ids,
-                    progress,
-                    || format!("{:?}", progress.progress_bar),
-                );
+                handle_progress(&solve_bar, &solve_ids, progress, || {
+                    format!("{:?}", progress.progress_bar)
+                });
             }
             ProgressBarKind::PixiInstall => {
-                handle_progress(
-                    &install_bar,
-                    &install_ids,
-                    progress,
-                    || "install".to_owned(),
-                );
+                handle_progress(&install_bar, &install_ids, progress, || {
+                    "install".to_owned()
+                });
             }
             ProgressBarKind::FixPermissions => {
-                handle_progress(
-                    &permissions_bar,
-                    &permissions_ids,
-                    progress,
-                    || "permissions".to_owned(),
-                );
+                handle_progress(&permissions_bar, &permissions_ids, progress, || {
+                    "permissions".to_owned()
+                });
             }
-        }
-    })
-    .await;
+        })
+        .await;
 
     solve_bar.clear();
     install_bar.clear();

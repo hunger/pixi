@@ -144,7 +144,8 @@ pub struct Project {
     backend_override: Option<BackendOverride>,
     /// Optional custom reporter factory. When set, used instead of the default
     /// `TopLevelProgress` terminal reporter.
-    reporter_factory: Option<Arc<dyn Fn() -> Box<dyn pixi_command_dispatcher::Reporter> + Send + Sync>>,
+    reporter_factory:
+        Option<Arc<dyn Fn() -> Box<dyn pixi_command_dispatcher::Reporter> + Send + Sync>>,
     /// Cache directory for rattler/conda packages.
     cache_dir: PathBuf,
 }
@@ -307,8 +308,7 @@ impl Project {
     /// Constructs a new instance from an internal manifest representation
     #[cfg(test)]
     pub(crate) fn from_manifest(manifest: Manifest, env_root: EnvRoot, bin_dir: BinDir) -> Self {
-        let cache_dir = pixi_config::get_cache_dir()
-            .expect("could not determine cache directory");
+        let cache_dir = pixi_config::get_cache_dir().expect("could not determine cache directory");
         Self::from_manifest_with_cache_dir(manifest, env_root, bin_dir, cache_dir)
     }
 
@@ -387,17 +387,13 @@ impl Project {
     /// Like [`discover_or_create`](Self::discover_or_create) but rooted at
     /// an explicit directory instead of `$PIXI_HOME`, with an explicit cache
     /// directory instead of `get_cache_dir()`.
-    pub async fn discover_or_create_in(
-        home: PathBuf,
-        cache_dir: PathBuf,
-    ) -> miette::Result<Self> {
+    pub async fn discover_or_create_in(home: PathBuf, cache_dir: PathBuf) -> miette::Result<Self> {
         let manifest_dir = home.join(MANIFESTS_DIR);
         let manifest_path = manifest_dir.join(consts::GLOBAL_MANIFEST_DEFAULT_NAME);
         let bin_dir = BinDir::from_path(home.join("bin")).await?;
         let env_root = EnvRoot::from_path(home.join("envs")).await?;
-        Self::discover_or_create_impl(
-            manifest_dir, manifest_path, bin_dir, env_root, cache_dir,
-        ).await
+        Self::discover_or_create_impl(manifest_dir, manifest_path, bin_dir, env_root, cache_dir)
+            .await
     }
 
     /// Discovers the project manifest file in path at
@@ -410,9 +406,8 @@ impl Project {
         let bin_dir = BinDir::from_env().await?;
         let env_root = EnvRoot::from_env().await?;
         let cache_dir = pixi_config::get_cache_dir()?;
-        Self::discover_or_create_impl(
-            manifest_dir, manifest_path, bin_dir, env_root, cache_dir,
-        ).await
+        Self::discover_or_create_impl(manifest_dir, manifest_path, bin_dir, env_root, cache_dir)
+            .await
     }
 
     async fn discover_or_create_impl(
@@ -800,9 +795,9 @@ impl Project {
         #[cfg(unix)] // Completions are only supported on unix-like systems
         {
             // Prune old completions
-            let completions_dir = super::completions::CompletionsDir::from_path(
-                self.home_dir()?.join("completions"),
-            ).await?;
+            let completions_dir =
+                super::completions::CompletionsDir::from_path(self.home_dir()?.join("completions"))
+                    .await?;
             completions_dir.prune_old_completions()?;
         }
 
@@ -1399,9 +1394,9 @@ impl Project {
             .map(|exec| exec.name)
             .collect();
 
-        let completions_dir = crate::completions::CompletionsDir::from_path(
-            self.home_dir()?.join("completions"),
-        ).await?;
+        let completions_dir =
+            crate::completions::CompletionsDir::from_path(self.home_dir()?.join("completions"))
+                .await?;
         let (completions_to_remove, completions_to_add) =
             super::completions::completions_sync_status(
                 environment.exposed.clone(),
@@ -1591,7 +1586,8 @@ impl Repodata for Project {
                 .with_client(client)
                 .with_max_concurrent_requests(concurrent_downloads)
                 .with_cache_dir(
-                    self.cache_dir.join(pixi_consts::consts::CONDA_REPODATA_CACHE_DIR),
+                    self.cache_dir
+                        .join(pixi_consts::consts::CONDA_REPODATA_CACHE_DIR),
                 )
                 .finish())
         })

@@ -25,7 +25,10 @@ pub struct VarlinkReporter {
 }
 
 impl VarlinkReporter {
-    pub fn new(tx: mpsc::UnboundedSender<dev_prefix_pixi::Progress>, id_counter: ProgressIdCounter) -> Self {
+    pub fn new(
+        tx: mpsc::UnboundedSender<dev_prefix_pixi::Progress>,
+        id_counter: ProgressIdCounter,
+    ) -> Self {
         Self { tx, id_counter }
     }
 
