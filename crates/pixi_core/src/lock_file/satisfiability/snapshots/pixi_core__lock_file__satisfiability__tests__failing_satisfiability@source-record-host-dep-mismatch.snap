@@ -1,0 +1,8 @@
+---
+source: crates/pixi_core/src/lock_file/satisfiability/mod.rs
+assertion_line: 3626
+expression: s
+---
+environment 'default' does not satisfy the requirements of the project for platform 'linux-64'
+    Diagnostic severity: error
+    Caused by: source package 'my-package' requires rebuild or re-evaluation; forcing a full re-lock

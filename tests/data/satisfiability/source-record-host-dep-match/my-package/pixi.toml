@@ -1,0 +1,9 @@
+[package]
+name = "my-package"
+version = "1.0.0"
+
+[package.build]
+backend = { name = "in-memory", version = "*" }
+
+[package.host-dependencies]
+required-host-dep = "*"

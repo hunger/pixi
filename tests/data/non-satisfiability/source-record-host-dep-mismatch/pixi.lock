@@ -1,0 +1,24 @@
+#
+# This lock-file should not satisfy the accompanying pixi.toml file.
+#
+# my-package's source manifest declares a host-dependency on
+# `required-host-dep`, but the lock-file's `host_packages` list is
+# empty. Under lock-file v7 the build/host package sets are
+# authoritative, so the satisfiability check rejects this and emits
+# `SourceRecordRequiresRebuild`.
+
+version: 7
+platforms:
+  - name: linux-64
+environments:
+  default:
+    channels:
+      - url: https://conda.anaconda.org/conda-forge/
+    packages:
+      linux-64:
+        - conda_source: my-package[deadbeef] @ ./my-package
+packages:
+  - conda_source: my-package[deadbeef] @ ./my-package
+    variants:
+      target_platform: linux-64
+    depends: []
