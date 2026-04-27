@@ -1081,7 +1081,6 @@ my-package = {{ path = "./my-package" }}
 /// - purls, python_site_packages_path
 /// - run_exports
 #[tokio::test]
-#[ignore = "expected to fail: source packages always re-lock under the SourceRecordRequiresRebuild stopgap; tracked as follow-up work"]
 async fn test_source_package_lock_file_up_to_date() {
     use pixi_test_utils::create_conda_package;
     use rattler_conda_types::{NoArchType, package::RunExportsJson};
@@ -1222,7 +1221,6 @@ test-source-pkg = {{ path = "./source-package" }}
 /// The test uses ObservableBackend to verify that the backend is called again
 /// when the configuration changes.
 #[tokio::test]
-#[ignore = "expected to fail: source packages always re-lock under the SourceRecordRequiresRebuild stopgap; tracked as follow-up work"]
 async fn test_build_config_change_invalidates_cache() {
     setup_tracing();
 
@@ -1566,7 +1564,6 @@ renamed-package = {{ path = "./my-package" }}
 /// re-evaluates it, and the lock-file is written again. The source package
 /// should be present and equivalent in both lock-files.
 #[tokio::test]
-#[ignore = "expected to fail: source packages always re-lock under the SourceRecordRequiresRebuild stopgap; tracked as follow-up work"]
 async fn test_source_record_roundtrips_through_lock_file() {
     setup_tracing();
 

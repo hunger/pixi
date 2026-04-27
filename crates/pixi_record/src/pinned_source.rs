@@ -749,9 +749,14 @@ pub enum SourceMismatchError {
         requested: String,
     },
 
-    #[error("the locked source type does not match the requested type")]
+    #[error("locked as {locked}, but requested as {requested}")]
     /// The locked source type does not match the requested type.
-    SourceTypeMismatch,
+    SourceTypeMismatch {
+        /// The kind of the locked source ("path" | "url" | "git" | "none").
+        locked: &'static str,
+        /// The kind of the requested source ("path" | "url" | "git" | "none").
+        requested: &'static str,
+    },
 }
 
 impl PinnedPathSpec {
@@ -873,7 +878,18 @@ impl PinnedSourceSpec {
             (PinnedSourceSpec::Git(locked), SourceLocationSpec::Git(spec)) => {
                 locked.satisfies(spec)
             }
-            (_, _) => Err(SourceMismatchError::SourceTypeMismatch),
+            (locked, requested) => Err(SourceMismatchError::SourceTypeMismatch {
+                locked: match locked {
+                    PinnedSourceSpec::Path(_) => "path",
+                    PinnedSourceSpec::Url(_) => "url",
+                    PinnedSourceSpec::Git(_) => "git",
+                },
+                requested: match requested {
+                    SourceLocationSpec::Path(_) => "path",
+                    SourceLocationSpec::Url(_) => "url",
+                    SourceLocationSpec::Git(_) => "git",
+                },
+            }),
         }
     }
 }

@@ -17,11 +17,14 @@ use itertools::{Either, Itertools};
 use miette::Diagnostic;
 use once_cell::sync::OnceCell;
 use pep440_rs::VersionSpecifiers;
+use pixi_build_types as pbt;
 use pixi_command_dispatcher::{
-    BuildBackendMetadataSpec, BuildEnvironment, CommandDispatcher, CommandDispatcherError,
-    CommandDispatcherErrorResultExt, ComputeResultExt, DevSourceMetadataError,
-    DevSourceMetadataSpec, EnvironmentRef, EnvironmentSpec, SourceCheckoutError, SourceRecordError,
-    WorkspaceEnvRef, executor::CancellationAwareFutures, source_checkout::SourceCheckoutExt,
+    BuildBackendMetadataKey, BuildBackendMetadataSpec, BuildEnvironment, CommandDispatcher,
+    CommandDispatcherError, CommandDispatcherErrorResultExt, ComputeResultExt,
+    DevSourceMetadataError, DevSourceMetadataSpec, EnvironmentRef, EnvironmentSpec,
+    SourceCheckoutError, SourceRecordError, WorkspaceEnvRef,
+    build::conversion::from_binary_spec_v1, executor::CancellationAwareFutures,
+    source_checkout::SourceCheckoutExt,
 };
 use pixi_config::Config;
 use pixi_git::url::RepositoryUrl;
@@ -32,8 +35,9 @@ use pixi_manifest::{
 };
 use pixi_pypi_spec::PixiPypiSource;
 use pixi_record::{
-    DevSourceRecord, LockFileResolver, LockedGitUrl, ParseLockFileError, PinnedBuildSourceSpec,
-    PinnedSourceSpec, PixiRecord, SourceMismatchError, SourceRecordData, UnresolvedPixiRecord,
+    DevSourceRecord, FullSourceRecordData, LockFileResolver, LockedGitUrl, ParseLockFileError,
+    PartialSourceRecordData, PinnedBuildSourceSpec, PinnedSourceSpec, PixiRecord,
+    SourceMismatchError, SourceRecord, SourceRecordData, UnresolvedPixiRecord,
 };
 use pixi_spec::{
     PixiSpec, SourceAnchor, SourceLocationSpec, SourceSpec, SpecConversionError, Subdirectory,
@@ -47,7 +51,7 @@ use rattler_conda_types::{
     ChannelUrl, GenericVirtualPackage, MatchSpec, Matches, NamedChannelOrUrl, PackageName,
     ParseChannelError, ParseMatchSpecError, ParseStrictness::Lenient, Platform,
 };
-use rattler_lock::{LockedPackage, PackageHashes, PypiIndexes, UrlOrPath};
+use rattler_lock::{FileFormatVersion, LockedPackage, PackageHashes, PypiIndexes, UrlOrPath};
 use thiserror::Error;
 use typed_path::Utf8TypedPathBuf;
 use url::Url;
@@ -354,10 +358,12 @@ pub enum PlatformUnsat {
     #[error("required source package '{0}' is locked as binary (required by '{1}')")]
     RequiredSourceIsBinary(String, String),
 
-    #[error("package '{0}' is locked as source, but is only required as binary")]
+    #[error(
+        "package '{0}' is locked as a source package, but the manifest requires it as a binary package"
+    )]
     RequiredBinaryIsSource(String),
 
-    #[error("the locked source package '{0}' does not match the requested source package, {1}")]
+    #[error("source for '{0}': {1}")]
     SourcePackageMismatch(String, SourceMismatchError),
 
     #[error("failed to convert the requirement for '{0}'")]
@@ -1151,16 +1157,6 @@ pub async fn verify_platform_satisfiability(
         }
     }
 
-    // TODO: Temporary pessimistic behavior: any source record that is mutable
-    // (local path, unlocked git, etc.) or only partially resolved in the lock
-    // file is treated as unsatisfied, forcing a full re-lock. The correct fix
-    // is to verify that the backend's declared host/build specs are still
-    // satisfied by the locked host/build package sets (which the lock file now
-    // stores), without reconstructing those environments. That check must be
-    // implemented before this pessimistic path is removed, so that mutable
-    // source packages do not always trigger a re-lock when the build inputs
-    // have not actually changed. Track this as a follow-up before any release
-    // that ships source-package locking.
     let mut resolved_records = Vec::new();
     for record in unresolved_records {
         match record {
@@ -1168,25 +1164,107 @@ pub async fn verify_platform_satisfiability(
                 resolved_records.push(PixiRecord::Binary(record))
             }
             UnresolvedPixiRecord::Source(record) => {
-                if record.has_mutable_source() || record.data.is_partial() {
-                    // Mutable or partial source records cannot be verified
-                    // without re-running the build backend. Emit unsatisfied so
-                    // the caller triggers a fresh re-lock.
-                    return Err(CommandDispatcherError::Failed(Box::new(
-                        PlatformUnsat::SourceRecordRequiresRebuild {
-                            package: record.name().as_source().to_string(),
-                        },
-                    )));
+                // Three cases for a source record:
+                //   - immutable + Full data: trust the lock as-is.
+                //   - mutable + Full data: source could have changed
+                //     since lock-write; verify against the backend.
+                //   - Partial data (with or without mutable source): the
+                //     lock intentionally omits the package record; we
+                //     must fetch it from the backend and synthesize a
+                //     `FullSourceRecordData` to push downstream.
+                let needs_backend_lookup = record.data.is_partial() || record.has_mutable_source();
+
+                let synthesized_data = if needs_backend_lookup {
+                    let backend_spec = BuildBackendMetadataSpec {
+                        manifest_source: record.manifest_source.clone(),
+                        preferred_build_source: record
+                            .build_source
+                            .clone()
+                            .map(PinnedSourceSpec::from),
+                        env_ref: EnvironmentRef::Workspace(
+                            platform_setup.workspace_env_ref.clone(),
+                        ),
+                    };
+                    let metadata = ctx
+                        .command_dispatcher
+                        .engine()
+                        .with_ctx(async |cctx| {
+                            cctx.compute(&BuildBackendMetadataKey::new(backend_spec))
+                                .await
+                        })
+                        .await
+                        .map_err_into_dispatcher(|e| {
+                            Box::new(PlatformUnsat::SourceRecord(
+                                SourceRecordError::BuildBackendMetadata(e),
+                            ))
+                        })?;
+
+                    let output = metadata.metadata.outputs.iter().find(|o| {
+                        o.metadata.name == *record.name()
+                            && variants_match(&o.metadata.variant, &record.variants)
+                    });
+                    let Some(output) = output else {
+                        return Err(CommandDispatcherError::Failed(Box::new(
+                            PlatformUnsat::SourceRecordRequiresRebuild {
+                                package: record.name().as_source().to_string(),
+                            },
+                        )));
+                    };
+
+                    let lock_format_version = locked_environment.lock_file().version();
+                    if !specs_satisfied(
+                        output.host_dependencies.as_ref(),
+                        &record.host_packages,
+                        &platform_setup.channel_config,
+                        lock_format_version,
+                    ) || !specs_satisfied(
+                        output.build_dependencies.as_ref(),
+                        &record.build_packages,
+                        &platform_setup.channel_config,
+                        lock_format_version,
+                    ) {
+                        return Err(CommandDispatcherError::Failed(Box::new(
+                            PlatformUnsat::SourceRecordRequiresRebuild {
+                                package: record.name().as_source().to_string(),
+                            },
+                        )));
+                    }
+
+                    // For partial records we synthesize the full data
+                    // from the backend output. For mutable+Full, the
+                    // existing Full data already passed verification —
+                    // keep it.
+                    match &record.data {
+                        SourceRecordData::Partial(partial) => {
+                            Some(synthesize_full_source_data(partial, output))
+                        }
+                        SourceRecordData::Full(_) => None,
+                    }
                 } else {
-                    // Immutable and already full: downcast in place.
-                    let full_record = Arc::unwrap_or_clone(record).map_data(|data| match data {
+                    None
+                };
+
+                let full_record = match synthesized_data {
+                    Some(data) => {
+                        let unwrapped = Arc::unwrap_or_clone(record);
+                        SourceRecord {
+                            data,
+                            manifest_source: unwrapped.manifest_source,
+                            build_source: unwrapped.build_source,
+                            variants: unwrapped.variants,
+                            identifier_hash: unwrapped.identifier_hash,
+                            build_packages: unwrapped.build_packages,
+                            host_packages: unwrapped.host_packages,
+                        }
+                    }
+                    None => Arc::unwrap_or_clone(record).map_data(|data| match data {
                         SourceRecordData::Full(data) => data,
                         SourceRecordData::Partial(_) => {
-                            unreachable!("guarded by is_partial() check above")
+                            unreachable!("partials are synthesized above")
                         }
-                    });
-                    resolved_records.push(PixiRecord::Source(Arc::new(full_record)))
-                }
+                    }),
+                };
+                resolved_records.push(PixiRecord::Source(Arc::new(full_record)))
             }
         }
     }
@@ -2882,6 +2960,158 @@ async fn read_local_package_metadata(
     })
 }
 
+/// Build a [`FullSourceRecordData`] for a partial locked source
+/// record by filling in the package-record fields from the backend's
+/// matched [`CondaOutput`]. The partial's own `depends` and `sources`
+/// are preserved verbatim so the verification step's contract is
+/// stable: we already checked `host_dependencies` / `build_dependencies`
+/// against the locked sets, and the partial's run dependency list is
+/// the lock's authoritative view of what was solved.
+///
+/// Run-exports and constraints are intentionally not synthesized here.
+/// The lock-file v7 partial form discards them, and reconstructing them
+/// would require nested build/host env solves (cf.
+/// `assemble_source_record` in pixi_command_dispatcher). Downstream
+/// consumers in the satisfiability path don't need them; if a
+/// downstream consumer ever does, that's a signal to either widen the
+/// partial format or do a full re-resolve via the dispatcher.
+fn synthesize_full_source_data(
+    partial: &PartialSourceRecordData,
+    output: &pbt::procedures::conda_outputs::CondaOutput,
+) -> FullSourceRecordData {
+    let package_record = rattler_conda_types::PackageRecord {
+        name: output.metadata.name.clone(),
+        version: output.metadata.version.clone(),
+        build: output.metadata.build.clone(),
+        build_number: output.metadata.build_number,
+        subdir: output.metadata.subdir.to_string(),
+        platform: output
+            .metadata
+            .subdir
+            .only_platform()
+            .map(ToString::to_string),
+        arch: output
+            .metadata
+            .subdir
+            .arch()
+            .as_ref()
+            .map(ToString::to_string),
+        license: output.metadata.license.clone(),
+        license_family: output.metadata.license_family.clone(),
+        noarch: output.metadata.noarch,
+        purls: output
+            .metadata
+            .purls
+            .as_ref()
+            .map(|p| p.iter().cloned().collect()),
+        python_site_packages_path: output.metadata.python_site_packages_path.clone(),
+        depends: partial.depends.clone(),
+        constrains: vec![],
+        run_exports: None,
+        size: None,
+        sha256: None,
+        md5: None,
+        timestamp: None,
+        features: None,
+        track_features: vec![],
+        legacy_bz2_md5: None,
+        legacy_bz2_size: None,
+        experimental_extra_depends: Default::default(),
+    };
+    FullSourceRecordData {
+        package_record,
+        sources: partial.sources.clone(),
+    }
+}
+
+/// Returns true when the backend's variant map for an output is
+/// element-wise equal to the locked record's variant map. Backend and
+/// record use distinct `VariantValue` types from different crates,
+/// with identical shape, so compare arm-by-arm.
+fn variants_match(
+    backend_variants: &std::collections::BTreeMap<String, pbt::VariantValue>,
+    record_variants: &std::collections::BTreeMap<String, pixi_record::VariantValue>,
+) -> bool {
+    if backend_variants.len() != record_variants.len() {
+        return false;
+    }
+    backend_variants.iter().all(|(k, bv)| {
+        record_variants.get(k).is_some_and(|rv| match (rv, bv) {
+            (pixi_record::VariantValue::String(a), pbt::VariantValue::String(b)) => a == b,
+            (pixi_record::VariantValue::Int(a), pbt::VariantValue::Int(b)) => a == b,
+            (pixi_record::VariantValue::Bool(a), pbt::VariantValue::Bool(b)) => a == b,
+            _ => false,
+        })
+    })
+}
+
+/// For each backend-declared dependency, check there is a locked entry
+/// satisfying it. Binary specs are matched as `MatchSpec`s against the
+/// locked record's `PackageRecord`. Source specs are matched by name
+/// only (the backend reports them separately and the lock file already
+/// records exact pinned sources elsewhere). Pin-compatible specs are
+/// skipped: their resolution happens at solve time and is not
+/// represented as a standalone entry in the locked set.
+///
+/// Constraints declared by the backend are intentionally ignored: they
+/// restrict other packages, not this record's own dependencies, and
+/// the regular dependency check in `verify_platform_satisfiability`
+/// already covers them.
+fn specs_satisfied(
+    declared: Option<&pbt::procedures::conda_outputs::CondaOutputDependencies>,
+    locked: &[UnresolvedPixiRecord],
+    channel_config: &rattler_conda_types::ChannelConfig,
+    lock_format_version: FileFormatVersion,
+) -> bool {
+    let Some(declared) = declared else {
+        return true;
+    };
+    // The build/host package handles per source record only exist in
+    // lock-file v7+. For older formats the data simply cannot be
+    // present, so an empty `locked` set is "unknown, not authoritative"
+    // — treat it as satisfied and trust the lock. From v7 onwards an
+    // empty set is authoritative ("the source has no host/build deps")
+    // and we must verify against it as normal.
+    if locked.is_empty() && lock_format_version < FileFormatVersion::V7 {
+        return true;
+    }
+    for named in &declared.depends {
+        let Ok(name) = PackageName::from_str(named.name.as_str()) else {
+            return false;
+        };
+        match &named.spec {
+            pbt::PackageSpec::Binary(binary) => {
+                let binary_spec = from_binary_spec_v1(binary.clone());
+                let Ok(nameless) = binary_spec.try_into_nameless_match_spec(channel_config) else {
+                    return false;
+                };
+                let match_spec = MatchSpec::from_nameless(nameless, name.clone().into());
+                if !locked.iter().any(|entry| {
+                    entry.name() == &name
+                        && entry
+                            .package_record()
+                            .is_some_and(|pr| match_spec.matches(pr))
+                }) {
+                    return false;
+                }
+            }
+            pbt::PackageSpec::Source(_) => {
+                if !locked.iter().any(|entry| {
+                    matches!(entry, UnresolvedPixiRecord::Source(_)) && entry.name() == &name
+                }) {
+                    return false;
+                }
+            }
+            pbt::PackageSpec::PinCompatible(_) => {
+                // Pin-compatible specs are auto-resolved at build time
+                // and are not represented as standalone entries in the
+                // locked set.
+            }
+        }
+    }
+    true
+}
+
 fn find_matching_package(
     locked_pixi_records: &PixiRecordsByName,
     virtual_packages: &HashMap<PackageName, GenericVirtualPackage>,
@@ -3072,10 +3302,26 @@ fn verify_build_source_matches_manifest(
 
     let lockfile_source_location = src_record.build_source.clone();
 
+    let manifest_kind = match &manifest_source_location {
+        None => "none",
+        Some(SourceLocationSpec::Path(_)) => "path",
+        Some(SourceLocationSpec::Url(_)) => "url",
+        Some(SourceLocationSpec::Git(_)) => "git",
+    };
+    let lockfile_kind = match lockfile_source_location.as_ref().map(|s| s.pinned()) {
+        None => "none",
+        Some(PinnedSourceSpec::Path(_)) => "path",
+        Some(PinnedSourceSpec::Url(_)) => "url",
+        Some(PinnedSourceSpec::Git(_)) => "git",
+    };
+
     let ok = Ok(());
     let error = Err(Box::new(PlatformUnsat::PackageBuildSourceMismatch(
         src_record.name().as_source().to_string(),
-        SourceMismatchError::SourceTypeMismatch,
+        SourceMismatchError::SourceTypeMismatch {
+            locked: lockfile_kind,
+            requested: manifest_kind,
+        },
     )));
     let sat_err = |e| {
         Box::new(PlatformUnsat::PackageBuildSourceMismatch(
