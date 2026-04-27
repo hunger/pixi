@@ -406,7 +406,6 @@ async fn assemble_source_record_inner(
 /// from the outer solve) so pins for source deps reachable from the
 /// nested build/host env are honoured.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn nested_solve(
     ctx: &mut ComputeCtx,
     pkg_name: &PackageName,
