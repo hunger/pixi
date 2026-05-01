@@ -43,6 +43,8 @@ pub mod remove;
 pub mod run;
 pub mod search;
 pub mod self_update;
+#[cfg(unix)]
+pub mod serve;
 mod shared;
 pub mod shell;
 pub mod shell_hook;
@@ -182,6 +184,8 @@ pub enum Command {
     #[cfg_attr(not(feature = "self_update"), clap(hide = true))]
     #[cfg_attr(feature = "self_update", clap(hide = false))]
     SelfUpdate(self_update::Args),
+    #[cfg(unix)]
+    Serve(serve::Args),
     #[clap(visible_alias = "s")]
     Shell(shell::Args),
     ShellHook(shell_hook::Args),
@@ -378,6 +382,8 @@ pub async fn execute_command(
         Command::SelfUpdate(cmd) => self_update::execute(cmd, global_options).await,
         #[cfg(not(feature = "self_update"))]
         Command::SelfUpdate(cmd) => self_update::execute_stub(cmd, global_options).await,
+        #[cfg(unix)]
+        Command::Serve(cmd) => serve::execute(cmd).await,
         Command::List(cmd) => list::execute(cmd).await,
         Command::Tree(cmd) => tree::execute(cmd).await,
         Command::Update(cmd) => update::execute(cmd).await,

@@ -1269,6 +1269,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "ShellConfig::is_default")]
     pub shell: ShellConfig,
 
+    /// Configuration for `pixi serve`.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "ServeConfig::is_default")]
+    pub serve: ServeConfig,
+
     /// Experimental features that can be enabled.
     #[serde(default)]
     #[serde(skip_serializing_if = "ExperimentalConfig::is_default")]
@@ -1356,6 +1361,7 @@ impl Default for Config {
             detached_environments: None,
             pinning_strategy: None,
             shell: ShellConfig::default(),
+            serve: ServeConfig::default(),
             experimental: ExperimentalConfig::default(),
             concurrency: ConcurrencyConfig::default(),
             run_post_link_scripts: None,
@@ -1483,6 +1489,29 @@ impl ShellConfig {
 
     pub fn source_completion_scripts(&self) -> bool {
         self.source_completion_scripts.unwrap_or(true)
+    }
+}
+
+/// Configuration for the `pixi serve` command.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ServeConfig {
+    /// Path of the Unix domain socket to bind. When unset, `pixi serve` falls
+    /// back to the systemd socket-activation protocol.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket: Option<PathBuf>,
+}
+
+impl ServeConfig {
+    pub fn is_default(&self) -> bool {
+        self.socket.is_none()
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            socket: other.socket.or(self.socket),
+        }
     }
 }
 
@@ -1944,6 +1973,8 @@ impl Config {
             "s3-options.<bucket>.endpoint-url",
             "s3-options.<bucket>.force-path-style",
             "s3-options.<bucket>.region",
+            "serve",
+            "serve.socket",
             "shell",
             "shell.change-ps1",
             "shell.force-activate",
@@ -1991,6 +2022,7 @@ impl Config {
             detached_environments: other.detached_environments.or(self.detached_environments),
             pinning_strategy: other.pinning_strategy.or(self.pinning_strategy),
             shell: self.shell.merge(other.shell),
+            serve: self.serve.merge(other.serve),
             experimental: self.experimental.merge(other.experimental),
             // Make other take precedence over self to allow for setting the value through the CLI
             concurrency: self.concurrency.merge(other.concurrency),
@@ -2410,6 +2442,25 @@ impl Config {
                     "change-ps1" => {
                         self.shell.change_ps1 =
                             value.map(|v| v.parse()).transpose().into_diagnostic()?;
+                    }
+                    _ => return Err(err),
+                }
+            }
+            key if key.starts_with("serve") => {
+                if key == "serve" {
+                    if let Some(value) = value {
+                        self.serve = serde_json::de::from_str(&value).into_diagnostic()?;
+                    } else {
+                        self.serve = ServeConfig::default();
+                    }
+                    return Ok(());
+                } else if !key.starts_with("serve.") {
+                    return Err(err);
+                }
+                let subkey = key.strip_prefix("serve.").unwrap();
+                match subkey {
+                    "socket" => {
+                        self.serve.socket = value.map(PathBuf::from);
                     }
                     _ => return Err(err),
                 }
@@ -2934,6 +2985,9 @@ UNUSED = "unused"
                 pypi_mapping: Some(PathBuf::from("/local/mapping")),
                 netfs_redirect: NetfsRedirect::Always,
                 ..CacheConfig::default()
+            },
+            serve: ServeConfig {
+                socket: Some(PathBuf::from("/run/pixi/pixi.sock")),
             },
             // Deprecated keys
             change_ps1: None,

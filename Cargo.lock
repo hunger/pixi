@@ -6204,6 +6204,7 @@ dependencies = [
  "pixi_task",
  "pixi_utils",
  "pixi_uv_conversions",
+ "pixi_varlink",
  "rattler",
  "rattler_conda_types",
  "rattler_index",

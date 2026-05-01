@@ -110,6 +110,7 @@ insta = { workspace = true, features = ["filters"] }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true, default-features = false }
 pixi_pty = { path = "../pixi_pty" }
+pixi_varlink = { workspace = true }
 
 [features]
 default = []

@@ -1,6 +1,6 @@
 ---
 source: crates/pixi_config/src/lib.rs
-assertion_line: 2831
+assertion_line: 3044
 expression: debug
 ---
 Config {
@@ -124,6 +124,9 @@ Config {
         change_ps1: Some(
             true,
         ),
+    },
+    serve: ServeConfig {
+        socket: None,
     },
     experimental: ExperimentalConfig {
         use_environment_activation_cache: None,
