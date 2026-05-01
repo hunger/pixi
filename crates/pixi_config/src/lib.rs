@@ -1269,10 +1269,10 @@ pub struct Config {
     #[serde(skip_serializing_if = "ShellConfig::is_default")]
     pub shell: ShellConfig,
 
-    /// Configuration for `pixi serve`.
+    /// Configuration for `pixi serve` and other remote-control endpoints.
     #[serde(default)]
-    #[serde(skip_serializing_if = "ServeConfig::is_default")]
-    pub serve: ServeConfig,
+    #[serde(skip_serializing_if = "RemoteConfig::is_default")]
+    pub remote: RemoteConfig,
 
     /// Experimental features that can be enabled.
     #[serde(default)]
@@ -1361,7 +1361,7 @@ impl Default for Config {
             detached_environments: None,
             pinning_strategy: None,
             shell: ShellConfig::default(),
-            serve: ServeConfig::default(),
+            remote: RemoteConfig::default(),
             experimental: ExperimentalConfig::default(),
             concurrency: ConcurrencyConfig::default(),
             run_post_link_scripts: None,
@@ -1492,25 +1492,33 @@ impl ShellConfig {
     }
 }
 
-/// Configuration for the `pixi serve` command.
+/// Configuration for `pixi serve` and other remote-control endpoints.
 #[derive(Clone, Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct ServeConfig {
-    /// Path of the Unix domain socket to bind. When unset, `pixi serve` falls
-    /// back to the systemd socket-activation protocol.
+pub struct RemoteConfig {
+    /// Path of the Unix domain socket to bind. Mutually exclusive with
+    /// `socket-activation`.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket: Option<PathBuf>,
+
+    /// When `true`, `pixi serve` adopts the listening socket passed by
+    /// systemd (or another supervisor) via the `LISTEN_PID` / `LISTEN_FDS`
+    /// protocol, instead of binding `socket` itself.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_activation: Option<bool>,
 }
 
-impl ServeConfig {
+impl RemoteConfig {
     pub fn is_default(&self) -> bool {
-        self.socket.is_none()
+        self.socket.is_none() && self.socket_activation.is_none()
     }
 
     pub fn merge(self, other: Self) -> Self {
         Self {
             socket: other.socket.or(self.socket),
+            socket_activation: other.socket_activation.or(self.socket_activation),
         }
     }
 }
@@ -1960,6 +1968,9 @@ impl Config {
             "pypi-config.extra-index-urls",
             "pypi-config.index-url",
             "pypi-config.keyring-provider",
+            "remote",
+            "remote.socket",
+            "remote.socket-activation",
             "repodata-config",
             "repodata-config.disable-bzip2",
             "repodata-config.disable-sharded",
@@ -1973,8 +1984,6 @@ impl Config {
             "s3-options.<bucket>.endpoint-url",
             "s3-options.<bucket>.force-path-style",
             "s3-options.<bucket>.region",
-            "serve",
-            "serve.socket",
             "shell",
             "shell.change-ps1",
             "shell.force-activate",
@@ -2022,7 +2031,7 @@ impl Config {
             detached_environments: other.detached_environments.or(self.detached_environments),
             pinning_strategy: other.pinning_strategy.or(self.pinning_strategy),
             shell: self.shell.merge(other.shell),
-            serve: self.serve.merge(other.serve),
+            remote: self.remote.merge(other.remote),
             experimental: self.experimental.merge(other.experimental),
             // Make other take precedence over self to allow for setting the value through the CLI
             concurrency: self.concurrency.merge(other.concurrency),
@@ -2446,21 +2455,25 @@ impl Config {
                     _ => return Err(err),
                 }
             }
-            key if key.starts_with("serve") => {
-                if key == "serve" {
+            key if key.starts_with("remote") => {
+                if key == "remote" {
                     if let Some(value) = value {
-                        self.serve = serde_json::de::from_str(&value).into_diagnostic()?;
+                        self.remote = serde_json::de::from_str(&value).into_diagnostic()?;
                     } else {
-                        self.serve = ServeConfig::default();
+                        self.remote = RemoteConfig::default();
                     }
                     return Ok(());
-                } else if !key.starts_with("serve.") {
+                } else if !key.starts_with("remote.") {
                     return Err(err);
                 }
-                let subkey = key.strip_prefix("serve.").unwrap();
+                let subkey = key.strip_prefix("remote.").unwrap();
                 match subkey {
                     "socket" => {
-                        self.serve.socket = value.map(PathBuf::from);
+                        self.remote.socket = value.map(PathBuf::from);
+                    }
+                    "socket-activation" => {
+                        self.remote.socket_activation =
+                            value.map(|v| v.parse()).transpose().into_diagnostic()?;
                     }
                     _ => return Err(err),
                 }
@@ -2986,8 +2999,9 @@ UNUSED = "unused"
                 netfs_redirect: NetfsRedirect::Always,
                 ..CacheConfig::default()
             },
-            serve: ServeConfig {
+            remote: RemoteConfig {
                 socket: Some(PathBuf::from("/run/pixi/pixi.sock")),
+                socket_activation: Some(true),
             },
             // Deprecated keys
             change_ps1: None,
