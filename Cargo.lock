@@ -7086,6 +7086,7 @@ dependencies = [
 name = "pixi_varlink"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "serde",
  "tempfile",
  "thiserror 2.0.18",

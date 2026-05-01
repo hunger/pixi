@@ -28,6 +28,68 @@ pub struct PingReply {
     pub message: String,
 }
 
+/// One progress notification, emitted on a streaming RPC reply alongside the
+/// final result.
+///
+/// `task_id` is opaque and is only required to be unique within a single
+/// streaming call. `parent` lets a server build a tree of sub-tasks (e.g. a
+/// solve nested inside an install).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgressEvent {
+    /// Stream-local identifier for the task this event belongs to.
+    pub task_id: u64,
+    /// Optional parent task, for nested progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u64>,
+    /// What happened.
+    pub kind: ProgressKind,
+}
+
+/// The kind of [`ProgressEvent`] being reported.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProgressKind {
+    /// A new task has begun.
+    Started {
+        /// Human-readable label.
+        label: String,
+        /// Total work units, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
+    },
+    /// The task has advanced; `current` is cumulative work units done.
+    Advance {
+        /// Cumulative work units completed so far.
+        current: u64,
+    },
+    /// A free-form status update.
+    Message {
+        /// Status text.
+        text: String,
+    },
+    /// The task is finished.
+    Finished,
+}
+
+/// One element of [`EchoProxy::long_ping`]'s reply stream.
+///
+/// Intermediate replies carry [`Progress`](Self::Progress) events; the final
+/// reply carries [`Result`](Self::Result) and ends the stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LongPingReply {
+    /// A progress notification.
+    Progress {
+        /// The notification.
+        event: ProgressEvent,
+    },
+    /// The terminating reply, carrying the same payload as [`PingReply`].
+    Result {
+        /// The echoed message.
+        reply: PingReply,
+    },
+}
+
 /// Errors that the echo service can return to a peer.
 #[derive(Debug, Clone, PartialEq, ReplyError, introspect::ReplyError)]
 #[zlink(interface = "dev.prefix.pixi.Echo")]
@@ -42,6 +104,16 @@ pub enum EchoError {
 pub trait EchoProxy {
     /// Echoes `message` back to the caller.
     async fn ping(&mut self, message: &str) -> zlink::Result<Result<PingReply, EchoError>>;
+
+    /// Like [`ping`](Self::ping), but streams a [`ProgressEvent`] for each
+    /// character of the message before delivering the terminating
+    /// [`LongPingReply::Result`]. Demonstrates how a long-running RPC carries
+    /// its own progress notifications.
+    #[zlink(more)]
+    async fn long_ping(
+        &mut self,
+        message: String,
+    ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<LongPingReply, EchoError>>>>;
 }
 
 /// The server-side service implementation.
@@ -56,6 +128,62 @@ impl EchoService {
         } else {
             Ok(PingReply { message })
         }
+    }
+
+    #[zlink(more)]
+    async fn long_ping(
+        &self,
+        more: bool,
+        message: String,
+    ) -> impl futures::Stream<Item = zlink::Reply<LongPingReply>> + Unpin {
+        let total = message.chars().count() as u64;
+        let task_id = 1;
+        let mut replies: Vec<LongPingReply> = Vec::with_capacity(total as usize + 3);
+        replies.push(LongPingReply::Progress {
+            event: ProgressEvent {
+                task_id,
+                parent: None,
+                kind: ProgressKind::Started {
+                    label: format!("echoing {total} character(s)"),
+                    total: Some(total),
+                },
+            },
+        });
+        for i in 1..=total {
+            replies.push(LongPingReply::Progress {
+                event: ProgressEvent {
+                    task_id,
+                    parent: None,
+                    kind: ProgressKind::Advance { current: i },
+                },
+            });
+        }
+        replies.push(LongPingReply::Progress {
+            event: ProgressEvent {
+                task_id,
+                parent: None,
+                kind: ProgressKind::Finished,
+            },
+        });
+        replies.push(LongPingReply::Result {
+            reply: PingReply { message },
+        });
+
+        // Honour the varlink `more` flag: if the caller didn't ask for a
+        // stream, emit only the terminating result.
+        if !more {
+            let final_reply = replies.pop().expect("Result is always pushed last");
+            replies.clear();
+            replies.push(final_reply);
+        }
+
+        let n = replies.len();
+        futures::stream::iter(
+            replies
+                .into_iter()
+                .enumerate()
+                .map(move |(i, v)| zlink::Reply::new(Some(v)).set_continues(Some(i + 1 < n))),
+        )
     }
 }
 
@@ -214,6 +342,34 @@ mod tests {
 
                     let err = conn.ping("").await.expect("call").expect_err("error");
                     assert_eq!(err, EchoError::EmptyMessage);
+
+                    // Streaming long_ping: collect all replies and split into
+                    // progress events vs. final result.
+                    use futures::StreamExt;
+                    let stream = conn.long_ping("hi".into()).await.expect("subscribe");
+                    let mut stream = std::pin::pin!(stream);
+                    let mut events = Vec::new();
+                    let mut result = None;
+                    while let Some(item) = stream.next().await {
+                        match item.expect("transport").expect("ok reply") {
+                            LongPingReply::Progress { event } => events.push(event),
+                            LongPingReply::Result { reply } => {
+                                assert!(result.is_none(), "Result emitted twice");
+                                result = Some(reply);
+                            }
+                        }
+                    }
+                    let result = result.expect("stream ended without a Result");
+                    assert_eq!(result.message, "hi");
+                    assert_eq!(events.len(), 4, "Started, 2× Advance, Finished");
+                    assert!(matches!(
+                        events.first().unwrap().kind,
+                        ProgressKind::Started { total: Some(2), .. }
+                    ));
+                    assert!(matches!(
+                        events.last().unwrap().kind,
+                        ProgressKind::Finished
+                    ));
                 };
 
                 tokio::select! {
