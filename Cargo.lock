@@ -7083,6 +7083,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pixi_varlink"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "zlink",
+]
+
+[[package]]
 name = "pkcs1"
 version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13923,6 +13934,73 @@ name = "zlib-rs"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3be3d40e40a133f9c916ee3f9f4fa2d9d63435b5fbe1bfc6d9dae0aa0ada1513"
+
+[[package]]
+name = "zlink"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87e47ff8b8b50c7f2c667f16be6d1ed9e12d36149092ad941eb6e321fb46917a"
+dependencies = [
+ "zlink-smol",
+ "zlink-tokio",
+]
+
+[[package]]
+name = "zlink-core"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00b8f68307937a87e70b69f17408f216b69667d6cb16adc9d39e1b58f9e48b99"
+dependencies = [
+ "futures-util",
+ "itoa",
+ "libc",
+ "pin-project-lite",
+ "rustix 1.1.4",
+ "ryu",
+ "serde",
+ "serde_json",
+ "tracing",
+ "zlink-macros",
+]
+
+[[package]]
+name = "zlink-macros"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d37a758b45d8931c56f1ae8c4e7c8fd29788976a720d911d396aa2b75db22d6"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "zlink-smol"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae5be32f6b11365ce8d2f392cabed03c134fed2f90e83f5d342098ffd824bf6"
+dependencies = [
+ "async-broadcast",
+ "async-channel",
+ "async-io",
+ "futures-lite",
+ "futures-util",
+ "pin-project-lite",
+ "zlink-core",
+]
+
+[[package]]
+name = "zlink-tokio"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58b5362fbc2d5259d3e925454773c540ec7686ffcd2914a74aa777d56952eeda"
+dependencies = [
+ "futures-util",
+ "pin-project-lite",
+ "tokio",
+ "tokio-stream",
+ "zlink-core",
+]
 
 [[package]]
 name = "zmij"

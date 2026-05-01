@@ -1,0 +1,27 @@
+[package]
+authors.workspace = true
+description = "Varlink IPC server/client for pixi, built on the zlink crate"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "pixi_varlink"
+readme.workspace = true
+repository.workspace = true
+version = "0.1.0"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt", "sync"] }
+zlink = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = [
+  "fs",
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
