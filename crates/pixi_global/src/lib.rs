@@ -3,10 +3,14 @@ pub mod common;
 pub mod completions;
 pub mod install;
 pub mod list;
+#[cfg(unix)] // Symlink localisation is Unix-only; the daemon path is too.
+pub mod localise;
 pub mod project;
 pub mod trampoline;
 
 pub use common::{BinDir, EnvChanges, EnvDir, EnvRoot, EnvState, StateChange, StateChanges};
+#[cfg(unix)]
+pub use localise::{LocaliseError, localise_prefix};
 use pixi_utils::executable_from_path;
 pub use project::{EnvironmentName, ExposedName, Mapping, Project};
 
