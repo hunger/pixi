@@ -50,6 +50,14 @@ pub const SALT_LEN: usize = 16;
 /// Server-side configuration that enables the `Install` RPC. Both `data`
 /// and `cache` are mandatory in the calling layer (CLI / config); the
 /// service receives them already resolved to absolute, existing paths.
+///
+/// Carries a per-HASH lock map alongside the static config so the daemon
+/// can reject concurrent `Install` calls against the same prefix. The
+/// second concurrent caller fast-fails with
+/// [`InstallFailure::DuplicateEnvironment`] rather than blocking on the
+/// first; a sequential retry after the first finishes hits the engine's
+/// fingerprint short-circuit and returns the same prefix without
+/// re-running the rattler installer.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Root under which `<HASH>/` install prefixes live.
@@ -61,6 +69,12 @@ pub struct ServerConfig {
     /// HMAC key folded into the env hash. Defaults to all zeros when
     /// the operator doesn't set `--salt` / `serve.salt`.
     pub salt: [u8; SALT_LEN],
+    /// Per-HASH mutexes. The lock-map mutex is `parking_lot` (acquired
+    /// only for the lookup-or-insert), the per-HASH locks are
+    /// `tokio::sync::Mutex` (held across the install's `await` points).
+    /// In-memory only; on daemon restart the map starts empty, which is
+    /// fine because there are no in-flight installs at that point.
+    locks: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ServerConfig {
@@ -94,7 +108,26 @@ impl ServerConfig {
                 out
             }
         };
-        Ok(Self { data, cache, salt })
+        Ok(Self {
+            data,
+            cache,
+            salt,
+            locks: Arc::default(),
+        })
+    }
+
+    /// Look up or create the per-HASH mutex protecting installs into
+    /// `<data>/<hash>/`. The caller `try_lock_owned`s the returned
+    /// mutex; if it's already held, the install is rejected with
+    /// [`InstallFailure::DuplicateEnvironment`]. Otherwise the guard
+    /// is held across the entire install pipeline so the on-disk
+    /// state stays coherent.
+    fn install_lock(&self, hash: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock();
+        locks
+            .entry(hash.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }
 
@@ -248,6 +281,15 @@ pub enum InstallFailure {
         /// Concrete reason (e.g. "empty", "contains '/'").
         reason: String,
     },
+    /// Another install for the same `(auth_path, env_name)` pair is
+    /// already in flight on this daemon. The second request fails
+    /// fast rather than blocking on the first; the client should
+    /// wait for the in-flight install to finish and retry.
+    DuplicateEnvironment {
+        /// Echo of the env name, so the client knows which install
+        /// is already in flight when displaying the error.
+        env_name: String,
+    },
     /// Catch-all for install failures: solve errors, malformed
     /// match-specs, dispatcher errors, prefix I/O failures.
     InstallFailed {
@@ -273,6 +315,21 @@ pub(crate) async fn run_install(
 ) -> Result<PathBuf, InstallFailure> {
     let hash = env_hash(&cfg.salt, auth_path, &request.env_name);
     let prefix_path = cfg.data.join(&hash);
+
+    // Reject concurrent installs against the same prefix outright
+    // rather than serialising them: a user running `pixi global
+    // install foo` from two terminals at once should see the second
+    // attempt fail fast with an explanation, not silently block on
+    // the first. The guard is held across every await below; the
+    // next caller after the first completes acquires cleanly and,
+    // typically, hits the engine's `EnvironmentFingerprint::read`
+    // short-circuit.
+    let lock = cfg.install_lock(&hash);
+    let _guard = lock
+        .try_lock_owned()
+        .map_err(|_| InstallFailure::DuplicateEnvironment {
+            env_name: request.env_name.clone(),
+        })?;
 
     let channels = parse_channels(&request.channels)?;
     let platform = parse_platform(request.platform.as_deref())?;
@@ -730,6 +787,48 @@ mod tests {
         assert!(
             reason.contains("16 bytes"),
             "reason should name the expected length: {reason}"
+        );
+    }
+
+    /// `install_lock` returns the same `Arc<Mutex<()>>` for the same
+    /// hash and distinct ones for different hashes. Combined with
+    /// `try_lock_owned` in `run_install`, that gives the daemon
+    /// per-(auth_path, env_name) install-rejection: while one
+    /// install holds the guard, a second `try_lock` on the same hash
+    /// fails (and surfaces as
+    /// [`InstallFailure::DuplicateEnvironment`]); different hashes
+    /// proceed independently; once the first guard drops, a
+    /// sequential retry of the same install acquires cleanly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_lock_rejects_same_hash() {
+        let cfg = ServerConfig::from_parts(PathBuf::from("/d"), PathBuf::from("/c"), None).unwrap();
+
+        let lock_a1 = cfg.install_lock("hash-a");
+        let lock_a2 = cfg.install_lock("hash-a");
+        assert!(
+            Arc::ptr_eq(&lock_a1, &lock_a2),
+            "same hash must return the same Arc'd mutex"
+        );
+        let lock_b = cfg.install_lock("hash-b");
+        assert!(
+            !Arc::ptr_eq(&lock_a1, &lock_b),
+            "different hashes must return distinct Arcs"
+        );
+
+        let guard_a = lock_a1.clone().try_lock_owned().unwrap();
+        assert!(
+            lock_a2.try_lock().is_err(),
+            "second try_lock on the same hash must fail while the first guard is held"
+        );
+        assert!(
+            lock_b.try_lock().is_ok(),
+            "different-hash lock must remain free"
+        );
+
+        drop(guard_a);
+        assert!(
+            lock_a2.try_lock().is_ok(),
+            "lock releases once the first guard drops"
         );
     }
 

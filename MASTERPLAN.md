@@ -395,21 +395,32 @@ Locked-in scaffolding:
 
 #### Step 3. Concurrency & idempotency hardening
 
-**Goal.** Concurrent `Install` calls against the same HASH serialise; an
-already-up-to-date env returns the same prefix without rebuilding. Since
+**Goal.** Concurrent `Install` calls against the same HASH fail fast on
+the second one with `InstallFailure::DuplicateEnvironment` — silent
+serialisation would leave a user running `pixi global install foo`
+from two terminals at once blocked without any explanation. Sequential
+retries after the first install completes acquire cleanly and hit the
+engine's `EnvironmentFingerprint::read` short-circuit so the same
+prefix is returned without re-running the rattler installer. Since
 HASH already encodes both the auth path and the env name, locking is
 simply per-HASH — no need to compose a separate (HASH, env_name) key.
 
 **Files:**
 - `crates/pixi_varlink/src/install.rs` — per-HASH `tokio::sync::Mutex`
-  map. In-memory only; no persistence.
+  map on `ServerConfig`; `run_install` calls `try_lock_owned` and
+  surfaces `DuplicateEnvironment` on contention. In-memory only; no
+  persistence.
 - Existing `Project::environment_in_sync_internal` (project/mod.rs:235)
   short-circuits idempotent installs — exercised via the regular path.
 
 **Tests:**
-- New test: two `Connection`s authenticated against the same workdir issue
-  the same `Install` concurrently; assert exactly one writes the
-  fingerprint, both succeed, both receive the same prefix.
+- Unit test on the lock-map semantics: same hash → same Arc'd mutex,
+  different hashes → distinct Arcs, held guard makes the second
+  `try_lock` fail (which is what surfaces as `DuplicateEnvironment`),
+  released guard lets a sequential retry acquire cleanly. Live
+  concurrent two-client testing is timing-sensitive (small installs
+  finish before the second connect+handshake completes), so the unit
+  test plus design review is the verification.
 
 ---
 
