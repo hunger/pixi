@@ -2,7 +2,7 @@
 //!
 //! The listening socket is selected as follows:
 //!
-//!   1. `--socket <PATH>` on the CLI binds that path explicitly.
+//!   1. The global `--socket <PATH>` flag binds that path explicitly.
 //!   2. Otherwise the configuration decides: `remote.socket-activation = true`
 //!      adopts the systemd-passed socket, any other value binds
 //!      `remote.socket`.
@@ -12,21 +12,17 @@
 //! The configuration file is expected to set `remote.socket` whenever the
 //! `[remote]` section is present.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use miette::{IntoDiagnostic, miette};
 use pixi_config::Config;
 
+use crate::GlobalOptions;
+
 /// Run the pixi varlink IPC server.
 #[derive(Parser, Debug)]
-pub struct Args {
-    /// Path of the Unix domain socket to bind. Overrides the configuration
-    /// and disables socket activation. When omitted, `remote.socket` and
-    /// `remote.socket-activation` from the configuration are used.
-    #[arg(long, value_name = "PATH")]
-    pub socket: Option<PathBuf>,
-}
+pub struct Args {}
 
 #[derive(Debug)]
 enum Mode {
@@ -34,9 +30,9 @@ enum Mode {
     Bind(PathBuf),
 }
 
-fn select_mode(args: &Args, config: &Config) -> miette::Result<Mode> {
-    if let Some(path) = &args.socket {
-        return Ok(Mode::Bind(path.clone()));
+fn select_mode(cli_socket: Option<&Path>, config: &Config) -> miette::Result<Mode> {
+    if let Some(path) = cli_socket {
+        return Ok(Mode::Bind(path.to_path_buf()));
     }
     if config.remote.socket_activation == Some(true) {
         return Ok(Mode::Activation);
@@ -51,8 +47,8 @@ fn select_mode(args: &Args, config: &Config) -> miette::Result<Mode> {
 }
 
 #[tracing::instrument(level = "info", name = "pixi.serve", skip_all)]
-pub async fn execute(args: Args) -> miette::Result<()> {
-    let mode = select_mode(&args, &Config::load_global())?;
+pub async fn execute(_args: Args, global_options: &GlobalOptions) -> miette::Result<()> {
+    let mode = select_mode(global_options.socket.as_deref(), &Config::load_global())?;
     tracing::debug!(?mode, "pixi serve resolved listening mode");
     match mode {
         Mode::Bind(path) => {
@@ -80,10 +76,6 @@ mod tests {
     use pixi_config::RemoteConfig;
     use std::path::PathBuf;
 
-    fn args() -> Args {
-        Args { socket: None }
-    }
-
     #[test]
     fn cli_socket_wins_over_config_activation() {
         let config = Config {
@@ -93,10 +85,9 @@ mod tests {
             },
             ..Config::default()
         };
-        let mut a = args();
-        a.socket = Some(PathBuf::from("/from/cli.sock"));
-        match select_mode(&a, &config).unwrap() {
-            Mode::Bind(p) => assert_eq!(p, PathBuf::from("/from/cli.sock")),
+        let cli = PathBuf::from("/from/cli.sock");
+        match select_mode(Some(&cli), &config).unwrap() {
+            Mode::Bind(p) => assert_eq!(p, cli),
             Mode::Activation => panic!("expected Bind"),
         }
     }
@@ -111,7 +102,7 @@ mod tests {
             ..Config::default()
         };
         assert!(matches!(
-            select_mode(&args(), &config).unwrap(),
+            select_mode(None, &config).unwrap(),
             Mode::Activation
         ));
     }
@@ -125,7 +116,7 @@ mod tests {
             },
             ..Config::default()
         };
-        match select_mode(&args(), &config).unwrap() {
+        match select_mode(None, &config).unwrap() {
             Mode::Bind(p) => assert_eq!(p, PathBuf::from("/from/config.sock")),
             Mode::Activation => panic!("expected Bind"),
         }
@@ -140,7 +131,7 @@ mod tests {
             },
             ..Config::default()
         };
-        match select_mode(&args(), &config).unwrap() {
+        match select_mode(None, &config).unwrap() {
             Mode::Bind(p) => assert_eq!(p, PathBuf::from("/from/config.sock")),
             Mode::Activation => panic!("expected Bind"),
         }
@@ -148,7 +139,7 @@ mod tests {
 
     #[test]
     fn no_socket_anywhere_is_an_error() {
-        let err = select_mode(&args(), &Config::default()).unwrap_err();
+        let err = select_mode(None, &Config::default()).unwrap_err();
         assert!(err.to_string().contains("no socket configured"));
     }
 }

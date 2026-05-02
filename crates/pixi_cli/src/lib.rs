@@ -123,6 +123,13 @@ pub struct GlobalOptions {
     /// Hide all progress bars, always turned on if stderr is not a terminal.
     #[clap(long, default_value = "false", global = true, env = "PIXI_NO_PROGRESS", help_heading = consts::CLAP_GLOBAL_OPTIONS)]
     no_progress: bool,
+
+    /// Path of a `pixi serve` Unix domain socket to talk to. Currently only
+    /// consumed by `pixi serve` itself (where it determines the path to
+    /// bind); other subcommands accept the flag but do not yet route work
+    /// through it.
+    #[clap(long, global = true, value_name = "PATH", help_heading = consts::CLAP_GLOBAL_OPTIONS)]
+    pub socket: Option<std::path::PathBuf>,
 }
 
 impl Args {
@@ -357,6 +364,16 @@ pub async fn execute_command(
     command: Command,
     global_options: &GlobalOptions,
 ) -> miette::Result<()> {
+    // `--socket` is parseable on every subcommand (it's a global flag) but only
+    // `pixi serve` actually does anything with it today. Refuse it loudly on
+    // other subcommands so silent behaviour drift is impossible.
+    #[cfg(unix)]
+    if global_options.socket.is_some() && !matches!(command, Command::Serve(_)) {
+        panic!(
+            "--socket is only consumed by `pixi serve`; routing it through other subcommands is not implemented yet"
+        );
+    }
+
     match command {
         Command::Completion(cmd) => completion::execute(cmd),
         Command::Config(cmd) => config::execute(cmd).await,
@@ -383,7 +400,7 @@ pub async fn execute_command(
         #[cfg(not(feature = "self_update"))]
         Command::SelfUpdate(cmd) => self_update::execute_stub(cmd, global_options).await,
         #[cfg(unix)]
-        Command::Serve(cmd) => serve::execute(cmd).await,
+        Command::Serve(cmd) => serve::execute(cmd, global_options).await,
         Command::List(cmd) => list::execute(cmd).await,
         Command::Tree(cmd) => tree::execute(cmd).await,
         Command::Update(cmd) => update::execute(cmd).await,
