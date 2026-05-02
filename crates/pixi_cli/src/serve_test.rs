@@ -4,9 +4,9 @@
 //! Exposes:
 //!
 //! * `ping <message>` — round-trip a single `Ping` and print the reply.
-//! * `install-dry-run <env-name>` — drive the `Install` RPC end-to-end,
-//!   print the prefix path the server *would* materialise, and exit. No
-//!   solve / fetch / install runs (that lands in step 2).
+//! * `install <env-name>` — drive the `Install` RPC end-to-end and print
+//!   the server's prefix path. With `--inspect`, also assert the
+//!   environment-fingerprint marker landed under the prefix.
 
 use std::path::Path;
 
@@ -28,9 +28,8 @@ pub enum SubCommand {
     /// Send a single `Ping` and exit when the reply lands.
     Ping(PingArgs),
     /// Drive the `Install` RPC end-to-end and print the server's
-    /// prefix-path reply. Step 1 returns a deterministic path
-    /// (`<data>/<HASH>/`) without writing anything.
-    InstallDryRun(InstallDryRunArgs),
+    /// prefix-path reply.
+    Install(InstallArgs),
 }
 
 /// Arguments for `pixi serve-test ping`.
@@ -41,9 +40,9 @@ pub struct PingArgs {
     pub message: String,
 }
 
-/// Arguments for `pixi serve-test install-dry-run`.
+/// Arguments for `pixi serve-test install`.
 #[derive(Parser, Debug)]
-pub struct InstallDryRunArgs {
+pub struct InstallArgs {
     /// Environment name to install. Must match `EnvironmentName`
     /// (alphanumeric, `_`, `-`).
     pub env_name: String,
@@ -62,6 +61,13 @@ pub struct InstallDryRunArgs {
     /// host platform.
     #[arg(long, value_name = "PLATFORM")]
     pub platform: Option<String>,
+
+    /// After install, assert that
+    /// `<prefix>/conda-meta/.pixi-environment-fingerprint` exists. The
+    /// command exits non-zero if the marker is missing — useful as a
+    /// post-install sanity check in CI.
+    #[arg(long)]
+    pub inspect: bool,
 }
 
 #[tracing::instrument(level = "info", name = "pixi.serve-test", skip_all)]
@@ -75,7 +81,7 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
 
     match args.command {
         SubCommand::Ping(args) => ping(socket, args).await,
-        SubCommand::InstallDryRun(args) => install_dry_run(socket, args).await,
+        SubCommand::Install(args) => install(socket, args).await,
     }
 }
 
@@ -98,8 +104,8 @@ async fn ping(socket: &Path, args: PingArgs) -> miette::Result<()> {
     }
 }
 
-#[tracing::instrument(level = "info", name = "pixi.serve-test.install-dry-run", skip_all, fields(env = %args.env_name))]
-async fn install_dry_run(socket: &Path, args: InstallDryRunArgs) -> miette::Result<()> {
+#[tracing::instrument(level = "info", name = "pixi.serve-test.install", skip_all, fields(env = %args.env_name, inspect = args.inspect))]
+async fn install(socket: &Path, args: InstallArgs) -> miette::Result<()> {
     let cwd = std::env::current_dir().into_diagnostic()?;
     let mut conn = pixi_varlink::connect(socket, &cwd)
         .await
@@ -127,6 +133,7 @@ async fn install_dry_run(socket: &Path, args: InstallDryRunArgs) -> miette::Resu
 
     let stream = conn.install(request).await.into_diagnostic()?;
     let mut stream = std::pin::pin!(stream);
+    let mut prefix: Option<String> = None;
     while let Some(item) = stream.next().await {
         let reply = item
             .into_diagnostic()?
@@ -135,16 +142,36 @@ async fn install_dry_run(socket: &Path, args: InstallDryRunArgs) -> miette::Resu
             pixi_varlink::InstallReply::Progress { event } => {
                 tracing::info!(?event, "install progress");
             }
-            pixi_varlink::InstallReply::Success { prefix } => {
-                println!("{prefix}");
-                return Ok(());
+            pixi_varlink::InstallReply::Success { prefix: p } => {
+                prefix = Some(p);
+                break;
             }
             pixi_varlink::InstallReply::Failed { error } => {
                 return Err(miette!("install failed: {error:?}"));
             }
         }
     }
-    Err(miette!(
-        "install stream ended without a Success or Failed reply"
-    ))
+    let prefix =
+        prefix.ok_or_else(|| miette!("install stream ended without a Success or Failed reply"))?;
+
+    if args.inspect {
+        // Post-install sanity: the fingerprint marker is what tells
+        // future installs whether the prefix is up to date. If the
+        // server skipped writing it (or hit an I/O error) the next
+        // install will needlessly redo the rattler-installer pass, so
+        // bail loudly here rather than silently shipping a partial
+        // install.
+        let marker = Path::new(&prefix)
+            .join("conda-meta")
+            .join(".pixi-environment-fingerprint");
+        if !marker.exists() {
+            return Err(miette!(
+                "install completed but {} is missing",
+                marker.display()
+            ));
+        }
+    }
+
+    println!("{prefix}");
+    Ok(())
 }
