@@ -347,14 +347,15 @@ fn fd_canonical_path<F: AsFd>(fd: &F) -> std::io::Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_vec(buf)))
 }
 
-/// Build the single terminal reply step 1's install body emits.
+/// Build the single terminal reply emitted by the streaming `Install`
+/// method.
 ///
 /// All checks live here (auth, env-name shape, server config) so the
 /// streaming method body stays a thin shell. Failures land as
 /// [`InstallReply::Failed`] inside the stream rather than as a varlink
 /// `ReplyError`, because zlink can't currently carry typed errors out
 /// of a `#[zlink(more)]` method.
-fn compute_install_reply(
+async fn compute_install_reply(
     service: &EchoService,
     conn_id: usize,
     request: InstallRequest,
@@ -375,15 +376,16 @@ fn compute_install_reply(
         None => {
             return InstallReply::Failed {
                 error: InstallFailure::ServerNotConfigured {
-                    hint: "start `pixi serve` with `--data <PATH>` and `--cache <PATH>` (or the matching `[remote]` config keys)".to_string(),
+                    hint: "start `pixi serve` with `--data <PATH>` and `--cache <PATH>` (or the matching `[serve]` config keys)".to_string(),
                 },
             };
         }
     };
-    let hash = env_hash(&cfg.salt, &directory, &request.env_name);
-    let prefix = cfg.data.join(&hash);
-    InstallReply::Success {
-        prefix: prefix.display().to_string(),
+    match install::run_install(cfg, &directory, &request).await {
+        Ok(prefix) => InstallReply::Success {
+            prefix: prefix.display().to_string(),
+        },
+        Err(error) => InstallReply::Failed { error },
     }
 }
 
@@ -566,10 +568,10 @@ where
         }
     }
 
-    /// Step 1 install body: validate the request and return the
-    /// deterministic on-disk prefix path the install *would* materialise.
-    /// No solve, no fetch, no prefix written. Steps 2/7 swap the body
-    /// for a real install and progress events.
+    /// Solve the requested specs and lay down the resulting binary
+    /// records under `<data>/<HASH>/`. Returns a single terminal reply
+    /// (Success / Failed). Step 7 will interleave Progress events ahead
+    /// of the terminal reply.
     #[zlink(more)]
     #[instrument(level = "debug", skip(self, conn), fields(conn_id = conn.id(), env = %request.env_name, more))]
     async fn install(
@@ -580,9 +582,9 @@ where
     ) -> impl futures::Stream<Item = zlink::Reply<InstallReply>> + Unpin {
         // `more=false` means a non-streaming caller; we still emit the
         // single terminal reply unchanged. The flag matters for steps that
-        // emit Progress events; step 1 doesn't.
+        // emit Progress events.
         let _ = more;
-        let reply = compute_install_reply(self, conn.id(), request);
+        let reply = compute_install_reply(self, conn.id(), request).await;
         let item = zlink::Reply::new(Some(reply)).set_continues(Some(false));
         futures::stream::iter(vec![item])
     }
@@ -894,10 +896,11 @@ impl Connection {
         AuthProxy::long_ping(&mut self.inner, message).await
     }
 
-    /// Submit an `Install` request and stream replies. Step 1 emits a
-    /// single terminal [`InstallReply::Success`] or
-    /// [`InstallReply::Failed`]; step 7 will interleave
-    /// [`InstallReply::Progress`] events ahead of the terminal reply.
+    /// Submit an `Install` request and stream replies. The stream
+    /// currently contains exactly one terminal
+    /// [`InstallReply::Success`] or [`InstallReply::Failed`]; step 7
+    /// will interleave [`InstallReply::Progress`] events ahead of the
+    /// terminal reply.
     #[instrument(level = "debug", skip(self), fields(directory = %self.directory.display(), env = %request.env_name))]
     pub async fn install(
         &mut self,

@@ -1,16 +1,35 @@
 //! `Install` RPC: serve a `pixi global install` request from a daemon
 //! that owns a shared `data` and `cache` directory.
 //!
-//! Step 1 scope: the server validates inputs and returns the on-disk
-//! prefix path it *would* materialise (`<data>/<HASH>/`, where `HASH` is
-//! HMAC-SHA-256 of the authenticated client directory + the requested
-//! env name, keyed by a server-side salt). No solve, fetch, or install
-//! happens yet; that lands in step 2. Step 7 will add streaming progress
-//! events alongside the terminal `Result`.
+//! Per request the server: hashes the authenticated client directory +
+//! the requested env name into `<HASH>` (HMAC-SHA-256 keyed by a
+//! server-side salt), constructs a `pixi_command_dispatcher` over the
+//! configured `cache` root, solves the requested specs, lays down the
+//! resulting records under `<data>/<HASH>/`, and persists the
+//! environment fingerprint so subsequent identical requests
+//! short-circuit. The terminal reply is a single [`InstallReply::Success`]
+//! carrying the absolute prefix path or [`InstallReply::Failed`].
+//! Step 7 will interleave [`InstallReply::Progress`] events ahead of
+//! the terminal reply.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
+use ordermap::OrderMap;
+use pixi_command_dispatcher::{
+    BuildEnvironment, CacheDirs, CommandDispatcher, EnvironmentRef, EnvironmentSpec, EphemeralEnv,
+    InstallPixiEnvironmentSpec,
+    keys::{SolvePixiEnvironmentKey, SolvePixiEnvironmentSpec},
+};
+use pixi_path::AbsPathBuf;
+use pixi_spec::PixiSpec;
+use pixi_spec_containers::DependencyMap;
+use rattler_conda_types::{
+    ChannelConfig, ChannelUrl, MatchSpec, PackageName, ParseStrictness, Platform, prefix::Prefix,
+};
+use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zlink::introspect::Type;
@@ -28,9 +47,9 @@ pub const SALT_LEN: usize = 16;
 pub struct ServerConfig {
     /// Root under which `<HASH>/` install prefixes live.
     pub data: PathBuf,
-    /// Shared cache root for repodata, package archives, source-build
-    /// artifacts. Not used in step 1 (no install runs yet); reserved for
-    /// step 2.
+    /// Shared cache root for repodata, package archives, and
+    /// source-build artifacts. Passed to the dispatcher's
+    /// [`CacheDirs`] so every install reuses the same cached state.
     pub cache: PathBuf,
     /// HMAC key folded into the env hash. Defaults to all zeros when
     /// the operator doesn't set `--salt` / `serve.salt`.
@@ -152,14 +171,14 @@ pub struct ExposeMapping {
 
 /// One streaming reply from `Install`.
 ///
-/// `Install` is declared `#[zlink(more)]` from day one so progress
-/// events can land in step 7 without a wire-incompatible schema
-/// change. Step 1 emits exactly one terminal reply (either
-/// [`Success`](Self::Success) or [`Failed`](Self::Failed)).
+/// `Install` is declared `#[zlink(more)]` so step 7 can interleave
+/// [`Progress`](Self::Progress) events without a wire-incompatible
+/// schema change. Today the stream contains exactly one terminal
+/// reply, either [`Success`](Self::Success) or [`Failed`](Self::Failed).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InstallReply {
-    /// Streaming progress event. Not emitted in step 1.
+    /// Streaming progress event. Not emitted yet; reserved for step 7.
     Progress {
         /// The notification.
         event: crate::ProgressEvent,
@@ -206,12 +225,185 @@ pub enum InstallFailure {
         /// Concrete reason (e.g. "empty", "contains '/'").
         reason: String,
     },
-    /// Catch-all for install failures from step 2 onwards. Step 1 never
-    /// produces this variant.
+    /// Catch-all for install failures: solve errors, malformed
+    /// match-specs, dispatcher errors, prefix I/O failures.
     InstallFailed {
-        /// Free-form reason.
+        /// Free-form reason; safe to surface verbatim to the user.
         reason: String,
     },
+}
+
+/// Drive a real `Install` request end-to-end: build a dispatcher
+/// rooted at the server's `cache` dir, solve the requested specs into
+/// records, and lay them down in `<data>/<HASH>/`. Persists the
+/// fingerprint marker so subsequent identical requests short-circuit.
+///
+/// On success returns the absolute prefix path the records were
+/// installed into. Failures land in [`InstallFailure::InstallFailed`]
+/// with the underlying message — the daemon hides nothing from the
+/// caller because all failures here are operator-actionable (network,
+/// disk, malformed spec).
+pub(crate) async fn run_install(
+    cfg: &ServerConfig,
+    auth_path: &Path,
+    request: &InstallRequest,
+) -> Result<PathBuf, InstallFailure> {
+    let hash = env_hash(&cfg.salt, auth_path, &request.env_name);
+    let prefix_path = cfg.data.join(&hash);
+
+    let channels = parse_channels(&request.channels)?;
+    let platform = parse_platform(request.platform.as_deref())?;
+    let virtual_packages = VirtualPackages::detect(&VirtualPackageOverrides::default())
+        .map_err(|e| InstallFailure::InstallFailed {
+            reason: format!("could not detect virtual packages: {e}"),
+        })?
+        .into_generic_virtual_packages()
+        .collect();
+    let build_environment = BuildEnvironment::simple(platform, virtual_packages);
+
+    let channel_config = default_channel_config();
+    let dependencies = parse_specs(&request.specs, &channel_config)?;
+
+    let cache_root = AbsPathBuf::new(cfg.cache.clone())
+        .map_err(|err| InstallFailure::InstallFailed {
+            reason: format!("--cache must be absolute: {err}"),
+        })?
+        .into_assume_dir();
+
+    let dispatcher = CommandDispatcher::builder()
+        .with_cache_dirs(CacheDirs::new(cache_root))
+        .with_channel_config(channel_config)
+        .finish();
+
+    let solve_spec = SolvePixiEnvironmentSpec {
+        dependencies,
+        constraints: DependencyMap::default(),
+        dev_sources: OrderMap::new(),
+        installed: Arc::from([]),
+        installed_source_hints: Default::default(),
+        strategy: Default::default(),
+        preferred_build_source: Arc::new(BTreeMap::new()),
+        env_ref: EnvironmentRef::Ephemeral(EphemeralEnv::new(
+            request.env_name.clone(),
+            EnvironmentSpec {
+                channels: channels.clone(),
+                build_environment: build_environment.clone(),
+                variants: Default::default(),
+                exclude_newer: None,
+                channel_priority: Default::default(),
+            },
+        )),
+    };
+    let records_arc = dispatcher
+        .engine()
+        .compute(&SolvePixiEnvironmentKey::new(solve_spec))
+        .await
+        .map_err(|e| InstallFailure::InstallFailed {
+            reason: format!("solve failed: {e}"),
+        })?
+        .map_err(|e| InstallFailure::InstallFailed {
+            reason: format!("solve failed: {e}"),
+        })?;
+
+    fs_err::create_dir_all(&prefix_path).map_err(|e| InstallFailure::InstallFailed {
+        reason: format!("could not create prefix {}: {e}", prefix_path.display()),
+    })?;
+    let prefix = Prefix::create(&prefix_path).map_err(|e| InstallFailure::InstallFailed {
+        reason: format!("could not initialise prefix {}: {e}", prefix_path.display()),
+    })?;
+
+    let install_spec = InstallPixiEnvironmentSpec {
+        name: request.env_name.clone(),
+        records: records_arc.iter().cloned().map(Into::into).collect(),
+        prefix,
+        installed: None,
+        ignore_packages: None,
+        build_environment,
+        force_reinstall: if request.force_reinstall {
+            records_arc.iter().map(|r| r.name().clone()).collect()
+        } else {
+            Default::default()
+        },
+        exclude_newer: None,
+        channels,
+        variant_configuration: None,
+        variant_files: None,
+    };
+    let install_result = dispatcher
+        .install_pixi_environment(install_spec)
+        .await
+        .map_err(|e| InstallFailure::InstallFailed {
+            reason: format!("install failed: {e}"),
+        })?;
+
+    // Persist the fingerprint so future requests with the same record
+    // set short-circuit through `EnvironmentFingerprint::read` inside
+    // the engine's install primitive. Errors here are non-fatal: the
+    // install already succeeded, the worst that happens is the next
+    // invocation re-runs the rattler installer.
+    if let Err(e) = install_result.installed_fingerprint.write(&prefix_path) {
+        tracing::warn!(
+            path = %prefix_path.display(),
+            error = %e,
+            "could not persist environment fingerprint"
+        );
+    }
+
+    Ok(prefix_path)
+}
+
+fn parse_channels(channels: &[String]) -> Result<Vec<ChannelUrl>, InstallFailure> {
+    let parsed: Result<Vec<ChannelUrl>, _> = channels
+        .iter()
+        .map(|c| {
+            url::Url::parse(c)
+                .map(ChannelUrl::from)
+                .map_err(|e| (c.clone(), e))
+        })
+        .collect();
+    parsed.map_err(|(channel, err)| InstallFailure::InstallFailed {
+        reason: format!("invalid channel URL {channel:?}: {err}"),
+    })
+}
+
+fn parse_platform(platform: Option<&str>) -> Result<Platform, InstallFailure> {
+    match platform {
+        None => Ok(Platform::current()),
+        Some(p) => p.parse().map_err(|e| InstallFailure::InstallFailed {
+            reason: format!("invalid platform {p:?}: {e}"),
+        }),
+    }
+}
+
+fn parse_specs(
+    specs: &[String],
+    channel_config: &ChannelConfig,
+) -> Result<DependencyMap<PackageName, PixiSpec>, InstallFailure> {
+    let mut deps = DependencyMap::default();
+    for spec_str in specs {
+        let match_spec = MatchSpec::from_str(spec_str, ParseStrictness::Lenient).map_err(|e| {
+            InstallFailure::InstallFailed {
+                reason: format!("invalid match spec {spec_str:?}: {e}"),
+            }
+        })?;
+        let (name_matcher, nameless) = match_spec.into_nameless();
+        let name = name_matcher
+            .as_exact()
+            .ok_or_else(|| InstallFailure::InstallFailed {
+                reason: format!("match spec {spec_str:?} must name a package"),
+            })?
+            .clone();
+        deps.insert(
+            name,
+            PixiSpec::from_nameless_matchspec(nameless, channel_config),
+        );
+    }
+    Ok(deps)
+}
+
+fn default_channel_config() -> ChannelConfig {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    ChannelConfig::default_with_root_dir(cwd)
 }
 
 /// Validate a candidate environment name.

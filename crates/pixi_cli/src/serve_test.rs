@@ -47,6 +47,21 @@ pub struct InstallDryRunArgs {
     /// Environment name to install. Must match `EnvironmentName`
     /// (alphanumeric, `_`, `-`).
     pub env_name: String,
+
+    /// Match-spec to install into the environment. Repeatable; defaults
+    /// to a single spec equal to the env name.
+    #[arg(long = "spec", value_name = "MATCHSPEC")]
+    pub specs: Vec<String>,
+
+    /// Channel URL to query during solve. Repeatable. Defaults to
+    /// `https://prefix.dev/conda-forge` when no `--channel` is given.
+    #[arg(long = "channel", value_name = "URL")]
+    pub channels: Vec<String>,
+
+    /// Platform to solve for (e.g. `linux-64`). Defaults to the daemon's
+    /// host platform.
+    #[arg(long, value_name = "PLATFORM")]
+    pub platform: Option<String>,
 }
 
 #[tracing::instrument(level = "info", name = "pixi.serve-test", skip_all)]
@@ -90,11 +105,22 @@ async fn install_dry_run(socket: &Path, args: InstallDryRunArgs) -> miette::Resu
         .await
         .into_diagnostic()?;
 
+    let specs = if args.specs.is_empty() {
+        vec![args.env_name.clone()]
+    } else {
+        args.specs
+    };
+    let channels = if args.channels.is_empty() {
+        vec!["https://prefix.dev/conda-forge".to_string()]
+    } else {
+        args.channels
+    };
+
     let request = pixi_varlink::InstallRequest {
         env_name: args.env_name,
-        specs: Vec::new(),
-        channels: Vec::new(),
-        platform: None,
+        specs,
+        channels,
+        platform: args.platform,
         expose: Vec::new(),
         force_reinstall: false,
     };
