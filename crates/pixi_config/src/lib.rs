@@ -1274,6 +1274,12 @@ pub struct Config {
     #[serde(skip_serializing_if = "RemoteConfig::is_default")]
     pub remote: RemoteConfig,
 
+    /// Server-side configuration for `pixi serve`'s install RPC. Holds the
+    /// `data` and `cache` roots and the prefix-naming salt.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "ServeConfig::is_default")]
+    pub serve: ServeConfig,
+
     /// Experimental features that can be enabled.
     #[serde(default)]
     #[serde(skip_serializing_if = "ExperimentalConfig::is_default")]
@@ -1362,6 +1368,7 @@ impl Default for Config {
             pinning_strategy: None,
             shell: ShellConfig::default(),
             remote: RemoteConfig::default(),
+            serve: ServeConfig::default(),
             experimental: ExperimentalConfig::default(),
             concurrency: ConcurrencyConfig::default(),
             run_post_link_scripts: None,
@@ -1492,7 +1499,9 @@ impl ShellConfig {
     }
 }
 
-/// Configuration for `pixi serve` and other remote-control endpoints.
+/// Transport configuration for `pixi serve`: how the daemon's varlink
+/// socket is reached (where it binds, or whether it adopts an inherited
+/// listener). Server-side install behaviour lives in [`ServeConfig`].
 #[derive(Clone, Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RemoteConfig {
@@ -1508,7 +1517,28 @@ pub struct RemoteConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket_activation: Option<bool>,
+}
 
+impl RemoteConfig {
+    pub fn is_default(&self) -> bool {
+        self.socket.is_none() && self.socket_activation.is_none()
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            socket: other.socket.or(self.socket),
+            socket_activation: other.socket_activation.or(self.socket_activation),
+        }
+    }
+}
+
+/// Server-side configuration for `pixi serve`'s `Install` RPC. Distinct
+/// from [`RemoteConfig`] (which is about transport): these settings
+/// govern *what* the daemon does once a client is connected, not *how*
+/// it is reached.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ServeConfig {
     /// Root directory under which `pixi serve` materialises per-environment
     /// install prefixes. Required (along with `cache`) to enable the
     /// `Install` RPC; without it the daemon serves the echo interface only.
@@ -1531,19 +1561,13 @@ pub struct RemoteConfig {
     pub salt: Option<String>,
 }
 
-impl RemoteConfig {
+impl ServeConfig {
     pub fn is_default(&self) -> bool {
-        self.socket.is_none()
-            && self.socket_activation.is_none()
-            && self.data.is_none()
-            && self.cache.is_none()
-            && self.salt.is_none()
+        self.data.is_none() && self.cache.is_none() && self.salt.is_none()
     }
 
     pub fn merge(self, other: Self) -> Self {
         Self {
-            socket: other.socket.or(self.socket),
-            socket_activation: other.socket_activation.or(self.socket_activation),
             data: other.data.or(self.data),
             cache: other.cache.or(self.cache),
             salt: other.salt.or(self.salt),
@@ -1997,9 +2021,6 @@ impl Config {
             "pypi-config.index-url",
             "pypi-config.keyring-provider",
             "remote",
-            "remote.cache",
-            "remote.data",
-            "remote.salt",
             "remote.socket",
             "remote.socket-activation",
             "repodata-config",
@@ -2015,6 +2036,10 @@ impl Config {
             "s3-options.<bucket>.endpoint-url",
             "s3-options.<bucket>.force-path-style",
             "s3-options.<bucket>.region",
+            "serve",
+            "serve.cache",
+            "serve.data",
+            "serve.salt",
             "shell",
             "shell.change-ps1",
             "shell.force-activate",
@@ -2063,6 +2088,7 @@ impl Config {
             pinning_strategy: other.pinning_strategy.or(self.pinning_strategy),
             shell: self.shell.merge(other.shell),
             remote: self.remote.merge(other.remote),
+            serve: self.serve.merge(other.serve),
             experimental: self.experimental.merge(other.experimental),
             // Make other take precedence over self to allow for setting the value through the CLI
             concurrency: self.concurrency.merge(other.concurrency),
@@ -2506,14 +2532,30 @@ impl Config {
                         self.remote.socket_activation =
                             value.map(|v| v.parse()).transpose().into_diagnostic()?;
                     }
+                    _ => return Err(err),
+                }
+            }
+            key if key.starts_with("serve") => {
+                if key == "serve" {
+                    if let Some(value) = value {
+                        self.serve = serde_json::de::from_str(&value).into_diagnostic()?;
+                    } else {
+                        self.serve = ServeConfig::default();
+                    }
+                    return Ok(());
+                } else if !key.starts_with("serve.") {
+                    return Err(err);
+                }
+                let subkey = key.strip_prefix("serve.").unwrap();
+                match subkey {
                     "data" => {
-                        self.remote.data = value.map(PathBuf::from);
+                        self.serve.data = value.map(PathBuf::from);
                     }
                     "cache" => {
-                        self.remote.cache = value.map(PathBuf::from);
+                        self.serve.cache = value.map(PathBuf::from);
                     }
                     "salt" => {
-                        self.remote.salt = value;
+                        self.serve.salt = value;
                     }
                     _ => return Err(err),
                 }
@@ -3042,6 +3084,8 @@ UNUSED = "unused"
             remote: RemoteConfig {
                 socket: Some(PathBuf::from("/run/pixi/pixi.sock")),
                 socket_activation: Some(true),
+            },
+            serve: ServeConfig {
                 data: Some(PathBuf::from("/var/lib/pixi/data")),
                 cache: Some(PathBuf::from("/var/cache/pixi")),
                 salt: Some("0123456789abcdef0123456789abcdef".to_string()),

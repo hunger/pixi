@@ -33,7 +33,7 @@ pub struct ServerConfig {
     /// step 2.
     pub cache: PathBuf,
     /// HMAC key folded into the env hash. Defaults to all zeros when
-    /// the operator doesn't set `--salt` / `remote.salt`.
+    /// the operator doesn't set `--salt` / `serve.salt`.
     pub salt: [u8; SALT_LEN],
 }
 
@@ -191,7 +191,7 @@ pub enum InstallFailure {
     /// handshake.
     NotAuthenticated,
     /// `pixi serve` was started without `--data` / `--cache` (or
-    /// `remote.data` / `remote.cache`); the install RPC has nowhere to
+    /// `serve.data` / `serve.cache`); the install RPC has nowhere to
     /// materialise prefixes.
     ServerNotConfigured {
         /// Operator-facing hint (e.g. "pass --data and --cache to

@@ -12,7 +12,7 @@
 //! The configuration file is expected to set `remote.socket` whenever the
 //! `[remote]` section is present.
 //!
-//! `--data` and `--cache` (or the matching `remote.data` / `remote.cache`
+//! `--data` and `--cache` (or the matching `serve.data` / `serve.cache`
 //! config keys) enable the `Install` RPC: when both resolve to a path,
 //! the daemon takes exclusive `flock`s on `<data>/.pixi-serve.lock` and
 //! `<cache>/.pixi-serve.lock` and starts in install-capable mode. With
@@ -34,19 +34,19 @@ use crate::GlobalOptions;
 pub struct Args {
     /// Root directory under which `pixi serve` materialises per-environment
     /// install prefixes. Required (along with `--cache`) to enable the
-    /// `Install` RPC. Overrides `remote.data` from config.
+    /// `Install` RPC. Overrides `serve.data` from config.
     #[arg(long, value_name = "PATH")]
     pub data: Option<PathBuf>,
 
     /// Root directory the daemon uses for shared package / repodata /
     /// source-build caches. Required (along with `--data`) to enable the
-    /// `Install` RPC. Overrides `remote.cache` from config.
+    /// `Install` RPC. Overrides `serve.cache` from config.
     #[arg(long, value_name = "PATH")]
     pub cache: Option<PathBuf>,
 
     /// Hex-encoded 16-byte HMAC key used to derive per-environment
     /// install-prefix names. Optional; defaults to a 16-byte all-zero
-    /// key. Overrides `remote.salt` from config.
+    /// key. Overrides `serve.salt` from config.
     #[arg(long, value_name = "HEX")]
     pub salt: Option<String>,
 }
@@ -84,19 +84,19 @@ fn select_install_config(
     args: &Args,
     config: &Config,
 ) -> miette::Result<Option<pixi_varlink::ServerConfig>> {
-    let data = args.data.clone().or_else(|| config.remote.data.clone());
-    let cache = args.cache.clone().or_else(|| config.remote.cache.clone());
-    let salt = args.salt.clone().or_else(|| config.remote.salt.clone());
+    let data = args.data.clone().or_else(|| config.serve.data.clone());
+    let cache = args.cache.clone().or_else(|| config.serve.cache.clone());
+    let salt = args.salt.clone().or_else(|| config.serve.salt.clone());
 
     match (data, cache) {
         (None, None) => Ok(None),
         (Some(_), None) => Err(miette!(
-            help = "pass --cache <PATH> or set `remote.cache` in pixi config",
-            "pixi serve: --data / `remote.data` is set without --cache / `remote.cache`",
+            help = "pass --cache <PATH> or set `serve.cache` in pixi config",
+            "pixi serve: --data / `serve.data` is set without --cache / `serve.cache`",
         )),
         (None, Some(_)) => Err(miette!(
-            help = "pass --data <PATH> or set `remote.data` in pixi config",
-            "pixi serve: --cache / `remote.cache` is set without --data / `remote.data`",
+            help = "pass --data <PATH> or set `serve.data` in pixi config",
+            "pixi serve: --cache / `serve.cache` is set without --data / `serve.data`",
         )),
         (Some(data), Some(cache)) => {
             let cfg = pixi_varlink::ServerConfig::from_parts(data, cache, salt.as_deref())
@@ -161,7 +161,7 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixi_config::RemoteConfig;
+    use pixi_config::{RemoteConfig, ServeConfig};
     use std::path::PathBuf;
 
     fn empty_args() -> Args {
@@ -194,7 +194,6 @@ mod tests {
             remote: RemoteConfig {
                 socket: Some(PathBuf::from("/ignored.sock")),
                 socket_activation: Some(true),
-                ..RemoteConfig::default()
             },
             ..Config::default()
         };
@@ -210,7 +209,6 @@ mod tests {
             remote: RemoteConfig {
                 socket: Some(PathBuf::from("/from/config.sock")),
                 socket_activation: Some(false),
-                ..RemoteConfig::default()
             },
             ..Config::default()
         };
@@ -273,10 +271,10 @@ mod tests {
     #[test]
     fn cli_data_wins_over_config_data() {
         let config = Config {
-            remote: RemoteConfig {
+            serve: ServeConfig {
                 data: Some(PathBuf::from("/from/config")),
                 cache: Some(PathBuf::from("/from/config-cache")),
-                ..RemoteConfig::default()
+                salt: None,
             },
             ..Config::default()
         };
