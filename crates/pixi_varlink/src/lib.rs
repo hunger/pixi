@@ -1,11 +1,15 @@
 //! Varlink IPC server/client for pixi, built on top of the [`zlink`] crate.
 //!
-//! This crate defines a small `dev.prefix.pixi.Echo` Varlink interface and
+//! This crate defines a `dev.prefix.pixi.Echo` Varlink interface and
 //! exposes both ends of a connection:
 //!
 //! * [`serve`] runs the server on a Unix domain socket. When started by
 //!   systemd with socket activation, it picks up the inherited socket
-//!   automatically; otherwise it binds `socket_path`.
+//!   automatically; otherwise it binds `socket_path`. Echo-only mode.
+//! * [`serve_with_install`] adds the `Install` RPC on top of the same
+//!   interface, taking exclusive `flock`s on the configured `data` and
+//!   `cache` roots so a second daemon against the same directories
+//!   refuses to start.
 //! * [`take_socket_activation_listener`] and [`serve_on`] are the lower-level
 //!   primitives that [`serve`] is built from.
 //! * [`connect`] returns an authenticated [`Connection`] by performing the
@@ -14,6 +18,13 @@
 //!   `UnauthorizedConnection` type; together they form a typestate that
 //!   prevents business methods from being called on an unauthenticated
 //!   connection at compile time.
+
+mod install;
+
+pub use install::{
+    ExposeMapping, InstallFailure, InstallReply, InstallRequest, SALT_LEN, ServerConfig,
+    ServerConfigError, env_hash, validate_env_name,
+};
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -24,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use async_fd_lock::LockWrite;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
 use parking_lot::Mutex;
@@ -174,6 +186,12 @@ trait AuthProxy {
         &mut self,
         message: String,
     ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<LongPingReply, EchoError>>>>;
+
+    #[zlink(more)]
+    async fn install(
+        &mut self,
+        request: InstallRequest,
+    ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<InstallReply, EchoError>>>>;
 }
 
 /// Per-connection auth state, tracked by zlink's connection id.
@@ -196,7 +214,11 @@ enum AuthState {
 
 /// The server-side service implementation.
 ///
-/// Holds a per-connection auth-state map keyed by zlink's connection id.
+/// Holds a per-connection auth-state map keyed by zlink's connection id,
+/// plus an optional [`ServerConfig`] that enables the [`Install`](EchoService::install)
+/// RPC. Without a config the install method returns
+/// [`InstallFailure::ServerNotConfigured`] so the wire schema is the
+/// same in either mode.
 ///
 /// **Lifecycle / memory note.** zlink doesn't currently surface a
 /// "connection closed" hook to `Service` implementations, so entries in
@@ -217,6 +239,25 @@ enum AuthState {
 #[derive(Debug, Clone, Default)]
 pub struct EchoService {
     auth: Arc<Mutex<HashMap<usize, AuthState>>>,
+    install_config: Option<Arc<ServerConfig>>,
+}
+
+impl EchoService {
+    /// Build a service that exposes only the echo interface; the
+    /// `Install` RPC will reject every call with
+    /// [`InstallFailure::ServerNotConfigured`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a service that handles `Install` against `config` in
+    /// addition to echo.
+    pub fn with_install_config(config: ServerConfig) -> Self {
+        Self {
+            auth: Arc::default(),
+            install_config: Some(Arc::new(config)),
+        }
+    }
 }
 
 /// Ask the kernel for the canonical path the directory FD currently lives at.
@@ -304,6 +345,46 @@ fn fd_canonical_path<F: AsFd>(fd: &F) -> std::io::Result<PathBuf> {
     };
 
     Ok(PathBuf::from(OsString::from_vec(buf)))
+}
+
+/// Build the single terminal reply step 1's install body emits.
+///
+/// All checks live here (auth, env-name shape, server config) so the
+/// streaming method body stays a thin shell. Failures land as
+/// [`InstallReply::Failed`] inside the stream rather than as a varlink
+/// `ReplyError`, because zlink can't currently carry typed errors out
+/// of a `#[zlink(more)]` method.
+fn compute_install_reply(
+    service: &EchoService,
+    conn_id: usize,
+    request: InstallRequest,
+) -> InstallReply {
+    let directory = match service.require_authenticated(conn_id) {
+        Ok(d) => d,
+        Err(_) => {
+            return InstallReply::Failed {
+                error: InstallFailure::NotAuthenticated,
+            };
+        }
+    };
+    if let Err(failure) = validate_env_name(&request.env_name) {
+        return InstallReply::Failed { error: failure };
+    }
+    let cfg = match service.install_config.as_deref() {
+        Some(c) => c,
+        None => {
+            return InstallReply::Failed {
+                error: InstallFailure::ServerNotConfigured {
+                    hint: "start `pixi serve` with `--data <PATH>` and `--cache <PATH>` (or the matching `[remote]` config keys)".to_string(),
+                },
+            };
+        }
+    };
+    let hash = env_hash(&cfg.salt, &directory, &request.env_name);
+    let prefix = cfg.data.join(&hash);
+    InstallReply::Success {
+        prefix: prefix.display().to_string(),
+    }
 }
 
 impl EchoService {
@@ -485,6 +566,27 @@ where
         }
     }
 
+    /// Step 1 install body: validate the request and return the
+    /// deterministic on-disk prefix path the install *would* materialise.
+    /// No solve, no fetch, no prefix written. Steps 2/7 swap the body
+    /// for a real install and progress events.
+    #[zlink(more)]
+    #[instrument(level = "debug", skip(self, conn), fields(conn_id = conn.id(), env = %request.env_name, more))]
+    async fn install(
+        &self,
+        more: bool,
+        request: InstallRequest,
+        #[zlink(connection)] conn: &mut zlink::Connection<Sock>,
+    ) -> impl futures::Stream<Item = zlink::Reply<InstallReply>> + Unpin {
+        // `more=false` means a non-streaming caller; we still emit the
+        // single terminal reply unchanged. The flag matters for steps that
+        // emit Progress events; step 1 doesn't.
+        let _ = more;
+        let reply = compute_install_reply(self, conn.id(), request);
+        let item = zlink::Reply::new(Some(reply)).set_continues(Some(false));
+        futures::stream::iter(vec![item])
+    }
+
     #[zlink(more)]
     #[instrument(level = "debug", skip(self, conn), fields(conn_id = conn.id(), len = message.len(), more))]
     async fn long_ping(
@@ -560,28 +662,100 @@ where
 /// first so that a stale file from a previous run does not block the bind.
 #[instrument(level = "info", skip_all, fields(path = %socket_path.display()))]
 pub async fn serve(socket_path: PathBuf) -> Result<(), Error> {
-    let listener = match take_socket_activation_listener()? {
-        Some(listener) => listener,
-        None => {
-            let _ = tokio::fs::remove_file(&socket_path).await;
-            info!(path = %socket_path.display(), "binding unix socket");
-            unix::bind(&socket_path)?
-        }
-    };
+    let listener = take_or_bind_listener(&socket_path).await?;
     serve_on(listener).await
+}
+
+/// Serve the echo interface plus the `Install` RPC against `config`.
+///
+/// Takes an exclusive [`flock`](async_fd_lock) on
+/// `<data>/.pixi-serve.lock` and `<cache>/.pixi-serve.lock` before
+/// starting the listener. If either lock is already held — by another
+/// `pixi serve` instance or any external locker — the call returns
+/// [`Error::ServerLockHeld`] naming the contested lock's full absolute
+/// path. The locks are released automatically when the returned future
+/// is dropped.
+#[instrument(level = "info", skip_all, fields(path = %socket_path.display()))]
+pub async fn serve_with_install(socket_path: PathBuf, config: ServerConfig) -> Result<(), Error> {
+    // Acquire the locks first so a misconfigured second daemon fails
+    // before it ever touches the listener.
+    let _data_lock = take_serve_lock(&config.data).await?;
+    let _cache_lock = take_serve_lock(&config.cache).await?;
+    let listener = take_or_bind_listener(&socket_path).await?;
+    serve_on_with_service(listener, EchoService::with_install_config(config)).await
 }
 
 /// Serve the echo interface on a pre-built listener.
 #[instrument(level = "info", skip_all, fields(interface = INTERFACE))]
 pub async fn serve_on(listener: unix::Listener) -> Result<(), Error> {
+    serve_on_with_service(listener, EchoService::default()).await
+}
+
+async fn serve_on_with_service(
+    listener: unix::Listener,
+    service: EchoService,
+) -> Result<(), Error> {
     info!("starting varlink server");
-    let server = Server::new(listener, EchoService::default());
+    let server = Server::new(listener, service);
     let result = server.run().await;
     match &result {
         Ok(()) => info!("varlink server stopped"),
         Err(error) => debug!(?error, "varlink server stopped with error"),
     }
     Ok(result?)
+}
+
+async fn take_or_bind_listener(socket_path: &Path) -> Result<unix::Listener, Error> {
+    match take_socket_activation_listener()? {
+        Some(listener) => Ok(listener),
+        None => {
+            let _ = tokio::fs::remove_file(socket_path).await;
+            info!(path = %socket_path.display(), "binding unix socket");
+            Ok(unix::bind(socket_path)?)
+        }
+    }
+}
+
+/// Lock file name placed at the root of `data` and `cache` to block a
+/// second `pixi serve` against the same directories.
+const SERVE_LOCK_FILE: &str = ".pixi-serve.lock";
+
+/// Take an exclusive `flock` on `<dir>/.pixi-serve.lock`. The returned
+/// guard owns the file handle; dropping it releases the lock, so
+/// callers must keep it alive for the duration they want the lock.
+///
+/// `dir` is canonicalised first so the error message names the
+/// absolute path the kernel would actually lock — diagnostics surface
+/// the truth, not whatever relative path the operator typed.
+async fn take_serve_lock(
+    dir: &Path,
+) -> Result<async_fd_lock::RwLockWriteGuard<tokio::fs::File>, Error> {
+    let dir = tokio::fs::canonicalize(dir).await.map_err(|e| {
+        Error::ServerLockHeld(format!(
+            "could not canonicalise lock root {}: {e}",
+            dir.display()
+        ))
+    })?;
+    let lock_path = dir.join(SERVE_LOCK_FILE);
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .await
+        .map_err(|e| {
+            Error::ServerLockHeld(format!("could not open {}: {e}", lock_path.display()))
+        })?;
+    match file.try_lock_write().await {
+        Ok(guard) => Ok(guard),
+        Err(err) => {
+            warn!(path = %lock_path.display(), error = ?err.error, "serve lock contended");
+            Err(Error::ServerLockHeld(format!(
+                "another pixi serve is holding {}; refusing to start",
+                lock_path.display()
+            )))
+        }
+    }
 }
 
 /// Initial handshake state. The only operation reachable on this type is
@@ -719,6 +893,20 @@ impl Connection {
         trace!("calling LongPing");
         AuthProxy::long_ping(&mut self.inner, message).await
     }
+
+    /// Submit an `Install` request and stream replies. Step 1 emits a
+    /// single terminal [`InstallReply::Success`] or
+    /// [`InstallReply::Failed`]; step 7 will interleave
+    /// [`InstallReply::Progress`] events ahead of the terminal reply.
+    #[instrument(level = "debug", skip(self), fields(directory = %self.directory.display(), env = %request.env_name))]
+    pub async fn install(
+        &mut self,
+        request: InstallRequest,
+    ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<InstallReply, EchoError>>>>
+    {
+        trace!("calling Install");
+        AuthProxy::install(&mut self.inner, request).await
+    }
 }
 
 /// Connect to a `pixi serve` socket and complete the `Hello` / `Authenticate`
@@ -852,6 +1040,12 @@ pub enum Error {
     /// The Hello / Authenticate handshake could not be completed.
     #[error("varlink handshake: {0}")]
     Handshake(String),
+
+    /// The exclusive `flock` on `<data>/.pixi-serve.lock` or
+    /// `<cache>/.pixi-serve.lock` is held by another process. The
+    /// message names the contested path.
+    #[error("{0}")]
+    ServerLockHeld(String),
 }
 
 #[cfg(test)]

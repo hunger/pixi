@@ -1508,17 +1508,45 @@ pub struct RemoteConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket_activation: Option<bool>,
+
+    /// Root directory under which `pixi serve` materialises per-environment
+    /// install prefixes. Required (along with `cache`) to enable the
+    /// `Install` RPC; without it the daemon serves the echo interface only.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<PathBuf>,
+
+    /// Root directory the daemon uses for shared package / repodata /
+    /// source-build caches. Required (along with `data`) to enable the
+    /// `Install` RPC.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<PathBuf>,
+
+    /// Hex-encoded 16-byte HMAC key folded into the per-(client,env) hash
+    /// that names install prefixes under `data`. Optional; defaults to a
+    /// 16-byte all-zero key when unset.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
 }
 
 impl RemoteConfig {
     pub fn is_default(&self) -> bool {
-        self.socket.is_none() && self.socket_activation.is_none()
+        self.socket.is_none()
+            && self.socket_activation.is_none()
+            && self.data.is_none()
+            && self.cache.is_none()
+            && self.salt.is_none()
     }
 
     pub fn merge(self, other: Self) -> Self {
         Self {
             socket: other.socket.or(self.socket),
             socket_activation: other.socket_activation.or(self.socket_activation),
+            data: other.data.or(self.data),
+            cache: other.cache.or(self.cache),
+            salt: other.salt.or(self.salt),
         }
     }
 }
@@ -1969,6 +1997,9 @@ impl Config {
             "pypi-config.index-url",
             "pypi-config.keyring-provider",
             "remote",
+            "remote.cache",
+            "remote.data",
+            "remote.salt",
             "remote.socket",
             "remote.socket-activation",
             "repodata-config",
@@ -2474,6 +2505,15 @@ impl Config {
                     "socket-activation" => {
                         self.remote.socket_activation =
                             value.map(|v| v.parse()).transpose().into_diagnostic()?;
+                    }
+                    "data" => {
+                        self.remote.data = value.map(PathBuf::from);
+                    }
+                    "cache" => {
+                        self.remote.cache = value.map(PathBuf::from);
+                    }
+                    "salt" => {
+                        self.remote.salt = value;
                     }
                     _ => return Err(err),
                 }
@@ -3002,6 +3042,9 @@ UNUSED = "unused"
             remote: RemoteConfig {
                 socket: Some(PathBuf::from("/run/pixi/pixi.sock")),
                 socket_activation: Some(true),
+                data: Some(PathBuf::from("/var/lib/pixi/data")),
+                cache: Some(PathBuf::from("/var/cache/pixi")),
+                salt: Some("0123456789abcdef0123456789abcdef".to_string()),
             },
             // Deprecated keys
             change_ps1: None,

@@ -7156,11 +7156,15 @@ dependencies = [
 name = "pixi_varlink"
 version = "0.1.0"
 dependencies = [
+ "async-fd-lock",
  "cap-std",
  "futures",
+ "hex",
+ "hmac",
  "libc",
  "parking_lot 0.12.5",
  "serde",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

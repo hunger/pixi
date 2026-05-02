@@ -1,14 +1,17 @@
 //! `pixi serve-test` — quick client-side smoke tests against a running
 //! `pixi serve`.
 //!
-//! Currently exposes a single `ping` subcommand. It opens a varlink
-//! connection on the socket given via the global `--socket` flag, completes
-//! the `Hello` / `Authenticate` handshake against the current working
-//! directory, sends one `Ping` request, prints the echoed reply, and exits.
+//! Exposes:
+//!
+//! * `ping <message>` — round-trip a single `Ping` and print the reply.
+//! * `install-dry-run <env-name>` — drive the `Install` RPC end-to-end,
+//!   print the prefix path the server *would* materialise, and exit. No
+//!   solve / fetch / install runs (that lands in step 2).
 
 use std::path::Path;
 
 use clap::Parser;
+use futures::StreamExt;
 use miette::{IntoDiagnostic, miette};
 
 use crate::GlobalOptions;
@@ -24,6 +27,10 @@ pub struct Args {
 pub enum SubCommand {
     /// Send a single `Ping` and exit when the reply lands.
     Ping(PingArgs),
+    /// Drive the `Install` RPC end-to-end and print the server's
+    /// prefix-path reply. Step 1 returns a deterministic path
+    /// (`<data>/<HASH>/`) without writing anything.
+    InstallDryRun(InstallDryRunArgs),
 }
 
 /// Arguments for `pixi serve-test ping`.
@@ -32,6 +39,14 @@ pub struct PingArgs {
     /// Message to echo. Must be non-empty (the server rejects empty messages).
     #[arg(default_value = "ping")]
     pub message: String,
+}
+
+/// Arguments for `pixi serve-test install-dry-run`.
+#[derive(Parser, Debug)]
+pub struct InstallDryRunArgs {
+    /// Environment name to install. Must match `EnvironmentName`
+    /// (alphanumeric, `_`, `-`).
+    pub env_name: String,
 }
 
 #[tracing::instrument(level = "info", name = "pixi.serve-test", skip_all)]
@@ -45,6 +60,7 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
 
     match args.command {
         SubCommand::Ping(args) => ping(socket, args).await,
+        SubCommand::InstallDryRun(args) => install_dry_run(socket, args).await,
     }
 }
 
@@ -65,4 +81,44 @@ async fn ping(socket: &Path, args: PingArgs) -> miette::Result<()> {
         }
         Err(err) => Err(miette!("server returned error: {err:?}")),
     }
+}
+
+#[tracing::instrument(level = "info", name = "pixi.serve-test.install-dry-run", skip_all, fields(env = %args.env_name))]
+async fn install_dry_run(socket: &Path, args: InstallDryRunArgs) -> miette::Result<()> {
+    let cwd = std::env::current_dir().into_diagnostic()?;
+    let mut conn = pixi_varlink::connect(socket, &cwd)
+        .await
+        .into_diagnostic()?;
+
+    let request = pixi_varlink::InstallRequest {
+        env_name: args.env_name,
+        specs: Vec::new(),
+        channels: Vec::new(),
+        platform: None,
+        expose: Vec::new(),
+        force_reinstall: false,
+    };
+
+    let stream = conn.install(request).await.into_diagnostic()?;
+    let mut stream = std::pin::pin!(stream);
+    while let Some(item) = stream.next().await {
+        let reply = item
+            .into_diagnostic()?
+            .map_err(|err| miette!("server returned error: {err:?}"))?;
+        match reply {
+            pixi_varlink::InstallReply::Progress { event } => {
+                tracing::info!(?event, "install progress");
+            }
+            pixi_varlink::InstallReply::Success { prefix } => {
+                println!("{prefix}");
+                return Ok(());
+            }
+            pixi_varlink::InstallReply::Failed { error } => {
+                return Err(miette!("install failed: {error:?}"));
+            }
+        }
+    }
+    Err(miette!(
+        "install stream ended without a Success or Failed reply"
+    ))
 }

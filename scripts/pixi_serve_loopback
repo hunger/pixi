@@ -2,22 +2,60 @@
 #
 # Run a `pixi` subcommand against a freshly-spawned `pixi serve`.
 #
-#   scripts/pixi_serve_loopback [<server-args>... --] <client-args>...
+#   scripts/pixi_serve_loopback [<script-args>... --] [<server-args>... --] \
+#       <client-args>...
 #
-# Spawns `pixi <server-args> serve --socket $tmp/pixi.sock` in the background,
-# waits for the socket to appear, then runs
-# `pixi <client-args> --socket $tmp/pixi.sock` against it.
+# Spawns `pixi <server-args> serve --socket $tmp/pixi.sock --data <tmp>/data
+# --cache <tmp>/cache --salt 0...` in the background, waits for the socket
+# to appear, then runs `pixi <client-args> --socket $tmp/pixi.sock` against
+# it.
 #
-# Without a `--` separator, *all* arguments go to the client and the server is
-# spawned with no extra arguments — i.e. the previous behaviour. To pass flags
-# (like `-vv`) through to the server, separate them with `--`:
+# The number of `--` separators selects which argument groups are present:
 #
-#   PIXI=./target/debug/pixi scripts/pixi_serve_loopback -vv -- serve-test ping
+#   0 separators: every arg is a client arg (the original calling convention).
+#   1 separator:  args before `--` are server-extra-args, args after are
+#                 client-args. Same as the old two-section form.
+#   2 separators: args before the first `--` are script-args (see below);
+#                 args between separators are server-extra-args; args after
+#                 the second `--` are client-args.
 #
-# Each line is prefixed with `SERVER (out): ` / `SERVER (err): ` for the
-# server and `CLIENT (out): ` / `CLIENT (err): ` for the client so the two
-# processes' output channels can be told apart in interleaved output. The
-# server is killed and the tempdir removed on exit.
+# Examples:
+#
+#   PIXI=./target/debug/pixi scripts/pixi_serve_loopback -- -vv -- serve-test ping
+#   PIXI=./target/debug/pixi scripts/pixi_serve_loopback                    \
+#       --directory /tmp/persist                                            \
+#       -- -vv                                                              \
+#       -- global install xz
+#
+# Script-args:
+#   --directory <PATH>  Use PATH as the working directory instead of creating
+#                       a fresh tempdir. PATH is created if missing and is
+#                       NOT removed on exit, so consecutive invocations can
+#                       share the daemon's `<dir>/data` and `<dir>/cache`
+#                       caches. Any pre-existing `<dir>/pixi.sock` is unlinked
+#                       before the daemon starts.
+#
+# **Output handling.** The client's stdout/stderr pass through to the
+# script's own stdout/stderr unmodified, so `indicatif`'s TTY detection
+# still kicks in and progress bars render the way they would for a direct
+# `pixi global install` invocation.
+#
+# The server's stdout and stderr land on **FDs 3 and 4** respectively.
+# Both default to `/dev/null` when the caller hasn't redirected them, so
+# the daemon is silent in normal use. Capture by redirecting at invocation:
+#
+#   scripts/pixi_serve_loopback -- -vv -- serve-test ping \
+#       3>/tmp/server.out 4>/tmp/server.err
+#
+# Or merge into a single log:
+#
+#   scripts/pixi_serve_loopback -- -vv -- serve-test ping 3>&4 4>/tmp/server.log
+#
+# Install-capable mode: `--data`, `--cache`, and `--salt` are auto-injected
+# as `pixi serve` subcommand flags so every loopback invocation is
+# install-capable against per-tempdir directories. Each flag is suppressed
+# if already present in the caller's server-extra-args, so tests that want
+# to override one of them just pass it on the command line.
 #
 # Override which binary is invoked by setting `$PIXI` (default: `pixi` from
 # PATH).
@@ -26,90 +64,164 @@ set -euo pipefail
 
 readonly PIXI="${PIXI:-pixi}"
 
-# Split $@ on `--`. Without the separator, everything is for the client and
-# the server gets no extra args (preserves the original calling convention).
-server_extra_args=()
-client_args=()
-seen_separator=false
-for arg in "$@"; do
-    if "$seen_separator"; then
-        client_args+=("$arg")
-    elif [[ "$arg" == "--" ]]; then
-        seen_separator=true
-    else
-        server_extra_args+=("$arg")
-    fi
-done
-if ! "$seen_separator"; then
-    client_args=("${server_extra_args[@]}")
-    server_extra_args=()
+# Probe FDs 3 and 4 — the contract is "caller redirects them, otherwise
+# server output is dropped." `: >&N` succeeds iff FD `N` is open in the
+# script's environment; if it isn't, point it at /dev/null so the server's
+# `>&3` / `>&4` redirections downstream don't fail.
+if ! { : >&3; } 2>/dev/null; then
+    exec 3>/dev/null
+fi
+if ! { : >&4; } 2>/dev/null; then
+    exec 4>/dev/null
 fi
 
-if (( ${#client_args[@]} == 0 )); then
-    echo "usage: $(basename "$0") [<server-args>... --] <client-args>..." >&2
+# Count `--` separators in $@ to pick the parsing form.
+n_sep=0
+for arg in "$@"; do
+    [[ $arg == "--" ]] && n_sep=$((n_sep + 1))
+done
+
+script_args=()
+server_extra_args=()
+client_args=()
+
+case "$n_sep" in
+0)
+    # Legacy: every arg is a client arg.
+    client_args=("$@")
+    ;;
+1)
+    # Legacy: server-extra-args -- client-args.
+    seen=false
+    for arg in "$@"; do
+        if "$seen"; then
+            client_args+=("$arg")
+        elif [[ $arg == "--" ]]; then
+            seen=true
+        else
+            server_extra_args+=("$arg")
+        fi
+    done
+    ;;
+2)
+    # New: script-args -- server-extra-args -- client-args.
+    seen=0
+    for arg in "$@"; do
+        if [[ $arg == "--" ]]; then
+            seen=$((seen + 1))
+            continue
+        fi
+        case "$seen" in
+        0) script_args+=("$arg") ;;
+        1) server_extra_args+=("$arg") ;;
+        2) client_args+=("$arg") ;;
+        esac
+    done
+    ;;
+*)
+    echo "$(basename "$0"): too many '--' separators (got $n_sep, max 2)" >&2
+    exit 2
+    ;;
+esac
+
+# Parse script-args. Currently only `--directory <PATH>` is supported; an
+# unknown flag is a usage error rather than getting silently forwarded.
+working_dir=""
+i=0
+while ((i < ${#script_args[@]})); do
+    case "${script_args[i]}" in
+    --directory)
+        if ((i + 1 >= ${#script_args[@]})); then
+            echo "$(basename "$0"): --directory needs a path" >&2
+            exit 2
+        fi
+        working_dir="${script_args[i + 1]}"
+        i=$((i + 2))
+        ;;
+    --directory=*)
+        working_dir="${script_args[i]#--directory=}"
+        i=$((i + 1))
+        ;;
+    *)
+        echo "$(basename "$0"): unknown script arg: ${script_args[i]}" >&2
+        exit 2
+        ;;
+    esac
+done
+
+if ((${#client_args[@]} == 0)); then
+    echo "usage: $(basename "$0") [<script-args>... --] [<server-args>... --] <client-args>..." >&2
     exit 2
 fi
 
-# ANSI markers for the SERVER / CLIENT tags. Bold cyan and magenta — distinct
-# from one another and from the conventional red/green/yellow that already
-# carry meaning in shell tooling. Honours `NO_COLOR` and only emits the codes
-# when the *target* stream is a TTY, so redirects keep clean output.
-readonly cyan=$'\033[1;36m' magenta=$'\033[1;35m' reset=$'\033[0m'
-if [[ -z "${NO_COLOR:-}" ]] && [[ -t 1 ]]; then
-    out_server="${cyan}SERVER (out):${reset}"
-    out_client="${magenta}CLIENT (out):${reset}"
+# Pick the working dir. With `--directory`, the caller owns the path: we
+# create it if missing but don't delete it on exit (so caches and built
+# envs persist across runs). Without `--directory`, fall back to a fresh
+# tempdir that gets wiped on exit.
+cleanup_tmp=false
+if [[ -n $working_dir ]]; then
+    tmp="$working_dir"
+    mkdir -p "$tmp"
 else
-    out_server='SERVER (out):'
-    out_client='CLIENT (out):'
+    tmp="$(mktemp -d -t pixi-serve-loopback.XXXXXX)"
+    cleanup_tmp=true
 fi
-if [[ -z "${NO_COLOR:-}" ]] && [[ -t 2 ]]; then
-    err_server="${cyan}SERVER (err):${reset}"
-    err_client="${magenta}CLIENT (err):${reset}"
-else
-    err_server='SERVER (err):'
-    err_client='CLIENT (err):'
-fi
-
-# Read stdin line-by-line and write it to stdout with `$1 ` prepended. Uses
-# `read -r` so each line is forwarded as soon as it is complete — no buffering
-# tricks needed (and no dependency on GNU `sed -u` / BSD `sed -l`). The
-# trailing-line guard handles processes that don't terminate their final line
-# with a newline.
-prefix_stream() {
-    local prefix="$1" line
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        printf '%s %s\n' "$prefix" "$line"
-    done
-}
-
-tmp="$(mktemp -d -t pixi-serve-loopback.XXXXXX)"
 socket="$tmp/pixi.sock"
+mkdir -p "$tmp/data" "$tmp/cache"
+# A leftover socket file from a previous run would make `pixi serve` fail
+# its bind. Removing it is safe because we own `$tmp` either via mktemp or
+# by the caller having pointed `--directory` at a path under their control.
+[[ -e $socket ]] && rm -f "$socket"
 server_pid=""
 
+# Auto-inject install-capable flags for `pixi serve` unless the caller
+# already supplied them in server-extra-args. The injected directories
+# live under the loopback tempdir, so every invocation is self-contained
+# and the server's `<dir>/.pixi-serve.lock` files never collide across
+# parallel runs.
+serve_extra_flags=()
+have_flag() {
+    local needle="$1" arg
+    for arg in "${server_extra_args[@]}"; do
+        if [[ $arg == "$needle" || $arg == "$needle="* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+have_flag "--data" || serve_extra_flags+=("--data" "$tmp/data")
+have_flag "--cache" || serve_extra_flags+=("--cache" "$tmp/cache")
+# Fixed all-zero salt makes test hashes deterministic across runs.
+have_flag "--salt" || serve_extra_flags+=("--salt" "00000000000000000000000000000000")
+
 cleanup() {
-    if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+    if [[ -n $server_pid ]] && kill -0 "$server_pid" 2>/dev/null; then
         kill "$server_pid" 2>/dev/null || true
         wait "$server_pid" 2>/dev/null || true
     fi
-    # Drain any prefix_stream subshells the server left behind so their final
-    # lines aren't lost when the script exits.
-    wait 2>/dev/null || true
-    rm -rf "$tmp"
+    if "$cleanup_tmp"; then
+        rm -rf "$tmp"
+    fi
 }
 trap cleanup EXIT
 
 # Server-extra args go *before* `serve` so global flags (e.g. `-vv`) parse
 # in their conventional position; clap accepts them later too, but this is
-# the form humans copy out of the help text.
-"$PIXI" "${server_extra_args[@]}" serve --socket "$socket" \
-    > >(prefix_stream "$out_server") \
-    2> >(prefix_stream "$err_server" >&2) &
+# the form humans copy out of the help text. The auto-injected
+# `serve_extra_flags` go after `--socket` because they're `serve`
+# subcommand flags, not global flags.
+#
+# `>&3 2>&4` rebinds the daemon's stdout/stderr onto the side FDs the
+# caller (optionally) opened. The shell's parent stdout/stderr stay
+# untouched, so any logging goes only where the caller asked for it.
+"$PIXI" "${server_extra_args[@]}" serve --socket "$socket" "${serve_extra_flags[@]}" \
+    >&3 2>&4 &
 server_pid=$!
 
 # Poll for the socket. If the server crashes before binding, bail out
 # instead of timing out silently.
 for _ in $(seq 1 100); do
-    if [[ -S "$socket" ]]; then
+    if [[ -S $socket ]]; then
         break
     fi
     if ! kill -0 "$server_pid" 2>/dev/null; then
@@ -121,17 +233,23 @@ for _ in $(seq 1 100); do
     sleep 0.05
 done
 
-if [[ ! -S "$socket" ]]; then
+if [[ ! -S $socket ]]; then
     echo "pixi_serve_loopback: timed out waiting for $socket" >&2
     exit 1
 fi
 
-# Run the client. `set -e` would bail on a non-zero exit from the client, but
-# we want to forward the exit code through cleanup, so disarm it here.
+# Run the client. Stdout and stderr inherit from the script — i.e. the
+# caller's terminal — so indicatif sees a TTY and renders bars normally.
+# `set -e` would bail on a non-zero exit, but we want to forward the exit
+# code through cleanup, so disarm it here.
+#
+# `--socket` goes *before* the client subcommand because it's a global
+# flag. Putting it at the tail would be eaten by subcommands that use
+# `trailing_var_arg = true` (e.g. `pixi exec <command> <args...>`,
+# `pixi run <task> <args...>`) — there, every trailing arg lands in the
+# command vec and the daemon never sees the socket.
 set +e
-"$PIXI" "${client_args[@]}" --socket "$socket" \
-    > >(prefix_stream "$out_client") \
-    2> >(prefix_stream "$err_client" >&2)
+"$PIXI" --socket "$socket" "${client_args[@]}"
 client_status=$?
 set -e
 
@@ -139,7 +257,7 @@ set -e
 # the EXIT trap. This guarantees the server is gone before the script
 # returns control, so callers never see lingering output or a still-bound
 # socket race with the next invocation.
-if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+if [[ -n $server_pid ]] && kill -0 "$server_pid" 2>/dev/null; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
 fi
