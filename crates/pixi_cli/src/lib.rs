@@ -45,6 +45,8 @@ pub mod search;
 pub mod self_update;
 #[cfg(unix)]
 pub mod serve;
+#[cfg(unix)]
+pub mod serve_test;
 mod shared;
 pub mod shell;
 pub mod shell_hook;
@@ -193,6 +195,8 @@ pub enum Command {
     SelfUpdate(self_update::Args),
     #[cfg(unix)]
     Serve(serve::Args),
+    #[cfg(unix)]
+    ServeTest(serve_test::Args),
     #[clap(visible_alias = "s")]
     Shell(shell::Args),
     ShellHook(shell_hook::Args),
@@ -365,12 +369,15 @@ pub async fn execute_command(
     global_options: &GlobalOptions,
 ) -> miette::Result<()> {
     // `--socket` is parseable on every subcommand (it's a global flag) but only
-    // `pixi serve` actually does anything with it today. Refuse it loudly on
-    // other subcommands so silent behaviour drift is impossible.
+    // `pixi serve` and `pixi serve-test` actually do anything with it today.
+    // Refuse it loudly on other subcommands so silent behaviour drift is
+    // impossible.
     #[cfg(unix)]
-    if global_options.socket.is_some() && !matches!(command, Command::Serve(_)) {
+    if global_options.socket.is_some()
+        && !matches!(command, Command::Serve(_) | Command::ServeTest(_))
+    {
         panic!(
-            "--socket is only consumed by `pixi serve`; routing it through other subcommands is not implemented yet"
+            "--socket is only consumed by `pixi serve` and `pixi serve-test`; routing it through other subcommands is not implemented yet"
         );
     }
 
@@ -401,6 +408,8 @@ pub async fn execute_command(
         Command::SelfUpdate(cmd) => self_update::execute_stub(cmd, global_options).await,
         #[cfg(unix)]
         Command::Serve(cmd) => serve::execute(cmd, global_options).await,
+        #[cfg(unix)]
+        Command::ServeTest(cmd) => serve_test::execute(cmd, global_options).await,
         Command::List(cmd) => list::execute(cmd).await,
         Command::Tree(cmd) => tree::execute(cmd).await,
         Command::Update(cmd) => update::execute(cmd).await,

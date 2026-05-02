@@ -107,4 +107,14 @@ set +e
 client_status=$?
 set -e
 
+# Kill the server eagerly now that the client is done, instead of relying on
+# the EXIT trap. This guarantees the server is gone before the script
+# returns control, so callers never see lingering output or a still-bound
+# socket race with the next invocation.
+if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+fi
+server_pid=""
+
 exit "$client_status"
