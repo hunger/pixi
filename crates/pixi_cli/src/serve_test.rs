@@ -68,6 +68,14 @@ pub struct InstallArgs {
     /// post-install sanity check in CI.
     #[arg(long)]
     pub inspect: bool,
+
+    /// Trampoline mapping in the form `<exe_name>=<package>/<binary>`,
+    /// e.g. `--expose lzcat=xz/lzcat`. Repeatable. The daemon writes
+    /// each trampoline under `<prefix>/.trampoline/<exe_name>` (with
+    /// a `.exe` suffix on Windows); the client derives the path from
+    /// the prefix it receives in the install reply.
+    #[arg(long = "expose", value_name = "EXE=PKG/BIN")]
+    pub expose: Vec<String>,
 }
 
 #[tracing::instrument(level = "info", name = "pixi.serve-test", skip_all)]
@@ -122,14 +130,33 @@ async fn install(socket: &Path, args: InstallArgs) -> miette::Result<()> {
         args.channels
     };
 
+    let expose = args
+        .expose
+        .iter()
+        .map(|s| {
+            let (exe_name, source) = s.split_once('=').ok_or_else(|| {
+                miette!(
+                    help = "format is `--expose <exe_name>=<package>/<binary>`",
+                    "invalid --expose value {s:?}"
+                )
+            })?;
+            Ok(pixi_varlink::ExposeMapping {
+                exe_name: exe_name.to_string(),
+                source: source.to_string(),
+            })
+        })
+        .collect::<miette::Result<Vec<_>>>()?;
+
     let request = pixi_varlink::InstallRequest {
         env_name: args.env_name,
         specs,
         channels,
         platform: args.platform,
-        expose: Vec::new(),
+        expose,
         force_reinstall: false,
     };
+
+    let exe_names: Vec<String> = request.expose.iter().map(|m| m.exe_name.clone()).collect();
 
     let stream = conn.install(request).await.into_diagnostic()?;
     let mut stream = std::pin::pin!(stream);
@@ -173,5 +200,15 @@ async fn install(socket: &Path, args: InstallArgs) -> miette::Result<()> {
     }
 
     println!("{prefix}");
+    let trampoline_dir = Path::new(&prefix).join(".trampoline");
+    for exe_name in &exe_names {
+        let bin_name = if cfg!(windows) {
+            format!("{exe_name}.exe")
+        } else {
+            exe_name.clone()
+        };
+        let binary_path = trampoline_dir.join(&bin_name);
+        println!("trampoline {}: {}", exe_name, binary_path.display());
+    }
     Ok(())
 }

@@ -46,11 +46,15 @@ zlink = { workspace = true }
 # constructs its own dispatcher per install call against the server's
 # `data` / `cache` roots.
 pixi_command_dispatcher = { workspace = true }
+pixi_global = { workspace = true }
 pixi_path = { workspace = true }
 pixi_spec = { workspace = true }
 pixi_spec_containers = { workspace = true }
+pixi_utils = { workspace = true }
 rattler_conda_types = { workspace = true }
+rattler_shell = { workspace = true }
 rattler_virtual_packages = { workspace = true }
+itertools = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

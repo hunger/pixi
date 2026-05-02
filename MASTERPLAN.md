@@ -365,16 +365,22 @@ Locked-in scaffolding:
      `original_executable = <auth_path>/<env_name>/bin/<real-name>`.
      The auth path is the directory recorded in the connection's
      `Authenticated` state — server already has it.
-     **Verify during implementation** that pixi's trampoline binary
-     resolves its sibling JSON via `realpath(/proc/self/exe)` (which
-     would follow the client's symlink back to `<data>/<HASH>/.trampoline/`)
-     vs. `argv[0]` (which would stop at `~/.pixi/bin/<exe>`); the
-     answer dictates whether server-side JSONs work as-is or whether
-     we need an extra layer of symlinks under
-     `~/.pixi/bin/trampoline_configuration/`.
-  4. Reply with `InstallReply { prefix, trampolines: Vec<TrampolineEntry> }`
-     where each `TrampolineEntry { exe_name, binary_path, json_path }`
-     names the absolute server-side paths the client should symlink.
+     Resolved during step 2 implementation: pixi's trampoline binary
+     calls `current_exe().canonicalize()` which on Linux reads
+     `/proc/self/exe` (the canonical target) and on macOS canonicalises
+     `_NSGetExecutablePath`'s result. So invoking the trampoline
+     through the client's `~/.pixi/bin/<exe>` symlink resolves to
+     `<data>/<HASH>/.trampoline/<exe>` and the sibling-JSON lookup
+     lands in `<data>/<HASH>/.trampoline/trampoline_configuration/<exe>.json`.
+     **Server-side JSONs work as-is — no extra symlink layer under
+     `~/.pixi/bin/trampoline_configuration/` is needed.**
+  4. Reply with `InstallReply { prefix }`. Trampoline locations are
+     deterministic from `prefix` + each `ExposeMapping.exe_name`
+     (`<prefix>/.trampoline/<exe_name>` and
+     `<prefix>/.trampoline/trampoline_configuration/<exe_name>.json`,
+     with a `.exe` suffix on Windows), so the client derives them
+     itself rather than the server returning a redundant
+     `Vec<TrampolineEntry>`.
 - `crates/pixi_cli/src/serve_test.rs` — promote `install-dry-run` to
   `install [--inspect]`; `--inspect` asserts
   `<prefix>/conda-meta/.pixi-environment-fingerprint` exists.
@@ -496,14 +502,16 @@ using systemd activation. One mental model for the whole feature.
   `Config::load_global().remote.socket.is_some()`), build an
   `InstallRequest` from `args`, `connect()` to that socket against
   `EnvRoot::from_env()`, call `Install`, receive
-  `InstallReply { prefix, trampolines }`, then locally:
+  `InstallReply { prefix }`, then locally:
   1. `localise_prefix(server_prefix, env_root.join(env_name))` —
      single symlink (Step 4).
-  2. For each `TrampolineEntry` from the reply, symlink
-     `~/.pixi/bin/<exe>` and
-     `~/.pixi/bin/trampoline_configuration/<exe>.json` to the
-     server-side files. (Removing stale symlinks first if they
-     already exist.)
+  2. For each `ExposeMapping` the client itself sent in the request,
+     symlink `~/.pixi/bin/<exe_name>` to
+     `<server_prefix>/.trampoline/<exe_name>` (with `.exe` on Windows).
+     The trampoline canonicalises `current_exe()` at runtime so it
+     finds its sibling JSON on the server side — no
+     `~/.pixi/bin/trampoline_configuration/` symlinks needed.
+     (Removing stale symlinks first if they already exist.)
   3. `Project::finalise_environment_no_trampolines` for completions
      + manifest + OS shortcuts.
 
