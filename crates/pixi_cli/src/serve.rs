@@ -194,6 +194,7 @@ mod tests {
             remote: RemoteConfig {
                 socket: Some(PathBuf::from("/ignored.sock")),
                 socket_activation: Some(true),
+                ..RemoteConfig::default()
             },
             ..Config::default()
         };
@@ -209,6 +210,7 @@ mod tests {
             remote: RemoteConfig {
                 socket: Some(PathBuf::from("/from/config.sock")),
                 socket_activation: Some(false),
+                ..RemoteConfig::default()
             },
             ..Config::default()
         };

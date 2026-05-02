@@ -43,6 +43,7 @@ rattler_networking = { workspace = true }
 rattler_repodata_gateway = { workspace = true }
 rattler_shell = { workspace = true }
 rattler_virtual_packages = { workspace = true }
+reflink-copy = "0.1"
 regex = { workspace = true }
 rstest = { workspace = true }
 serde = { workspace = true }
@@ -55,6 +56,7 @@ toml-span = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+walkdir = "2"
 zstd = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

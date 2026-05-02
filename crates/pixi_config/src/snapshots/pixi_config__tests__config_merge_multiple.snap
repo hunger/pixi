@@ -128,6 +128,7 @@ Config {
     remote: RemoteConfig {
         socket: None,
         socket_activation: None,
+        localise: None,
     },
     serve: ServeConfig {
         data: None,

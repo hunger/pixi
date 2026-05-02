@@ -17,7 +17,6 @@ dirs = { workspace = true }
 dunce = { workspace = true }
 fs-err = { workspace = true }
 futures = { workspace = true }
-indexmap = { workspace = true }
 itertools = { workspace = true }
 miette = { workspace = true }
 nanoid = { workspace = true }

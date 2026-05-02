@@ -16,7 +16,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.metadata.cargo-shear]
-ignored = ["pixi_varlink"]
+ignored = ["pixi_compute_engine"]
 
 [workspace.package]
 authors = ["pixi contributors <hi@prefix.dev>"]
@@ -132,8 +132,8 @@ pixi_url = { path = "crates/pixi_url" }
 pixi_utils = { path = "crates/pixi_utils", default-features = false }
 pixi_uv_context = { path = "crates/pixi_uv_context" }
 pixi_uv_conversions = { path = "crates/pixi_uv_conversions" }
-pixi_varlink = { path = "crates/pixi_varlink" }
 pixi_variant = { path = "crates/pixi_variant" }
+pixi_varlink = { path = "crates/pixi_varlink" }
 pypi_mapping = { path = "crates/pypi_mapping" }
 pypi_modifiers = { path = "crates/pypi_modifiers" }
 pyproject-toml = "0.13.7"

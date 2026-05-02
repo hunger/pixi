@@ -17,8 +17,8 @@ use crate::GlobalOptions;
 use crate::global::{global_specs::GlobalSpecs, revert_environment_after_error};
 use pixi_config::{self, Config, ConfigCli};
 use pixi_global::{
-    self, BinDir, EnvChanges, EnvRoot, EnvState, EnvironmentName, Mapping, Project, StateChange,
-    StateChanges,
+    self, BinDir, EnvChanges, EnvRoot, EnvState, EnvironmentName, LocaliseMode, Mapping, Project,
+    StateChange, StateChanges,
     common::{NotChangedReason, contains_menuinst_document},
     list::list_all_global_environments,
     project::{ExposedType, GlobalSpec},
@@ -83,6 +83,18 @@ pub struct Args {
     #[arg(action, long, alias = "no-shortcut")]
     no_shortcuts: bool,
 
+    /// How a daemon-routed install materialises the prefix at
+    /// `~/.pixi/envs/<env>`: `reflink` (default; walk the server
+    /// tree and reflink-copy each file, falling back to a plain
+    /// byte copy on non-CoW filesystems), `copy` (always
+    /// plain-copy; works anywhere), or `symlink` (single symlink
+    /// to the server's `<data>/<HASH>/` — cheapest, but the local
+    /// prefix breaks if the server's `data/` is GC'd). Ignored
+    /// when running without `--socket`. Overrides
+    /// `PIXI_GLOBAL_LOCALISE` and `[remote] localise = "..."`.
+    #[arg(long, value_name = "MODE")]
+    localise_mode: Option<String>,
+
     /// Optional backend override (primarily for testing, not exposed in CLI)
     #[clap(skip)]
     pub backend_override: Option<pixi_build_frontend::BackendOverride>,
@@ -99,6 +111,10 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
         .socket
         .clone()
         .or_else(|| config.remote.socket.clone());
+
+    // Localise-mode resolution: CLI flag > env var > config > default.
+    // Only consulted on the daemon path; ignored otherwise.
+    let localise_mode = resolve_localise_mode(args.localise_mode.as_deref(), &config)?;
 
     // Load the global config and ensure
     // that the root_dir is relative to the manifest directory
@@ -147,7 +163,15 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
         let mut project = last_updated_project.clone();
         let install_result = match socket.as_deref() {
             Some(socket) => {
-                setup_environment_via_daemon(env_name, &args, specs, &mut project, socket).await
+                setup_environment_via_daemon(
+                    env_name,
+                    &args,
+                    specs,
+                    &mut project,
+                    socket,
+                    localise_mode,
+                )
+                .await
             }
             None => setup_environment(env_name, &args, specs, &mut project).await,
         };
@@ -195,6 +219,22 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
             tracing::warn!("Couldn't install {}\n{err:?}", env_name.fancy_display());
         }
         Err(miette::miette!("Some environments couldn't be installed."))
+    }
+}
+
+/// Pick a [`LocaliseMode`] from (in priority order) the
+/// `--localise-mode` CLI flag, the `PIXI_GLOBAL_LOCALISE` env var,
+/// the `[remote] localise = "..."` config key, falling back to
+/// [`LocaliseMode::default`] (`Reflink`) when none is set. Each
+/// layer takes a string, parsed via the mode's `FromStr`.
+fn resolve_localise_mode(cli: Option<&str>, config: &Config) -> miette::Result<LocaliseMode> {
+    let raw = cli
+        .map(str::to_owned)
+        .or_else(|| std::env::var("PIXI_GLOBAL_LOCALISE").ok())
+        .or_else(|| config.remote.localise.clone());
+    match raw {
+        Some(s) => s.parse().map_err(|e: String| miette!("{e}")),
+        None => Ok(LocaliseMode::default()),
     }
 }
 
@@ -333,6 +373,7 @@ async fn setup_environment_via_daemon(
     specs: &[GlobalSpec],
     project: &mut Project,
     socket: &Path,
+    localise_mode: LocaliseMode,
 ) -> miette::Result<StateChanges> {
     let mut state_changes = StateChanges::new_with_env(env_name.clone());
 
@@ -452,11 +493,21 @@ async fn setup_environment_via_daemon(
         .ok_or_else(|| miette!("daemon ended the install stream without a terminal reply"))?;
 
     let local_prefix = env_root.path().join(env_name.as_str());
-    pixi_global::localise_prefix(&server_prefix, &local_prefix)
+    pixi_global::localise_prefix(&server_prefix, &local_prefix, localise_mode)
         .await
         .map_err(|e| miette!("{e}"))?;
 
-    let trampoline_dir = server_prefix.join(".trampoline");
+    // Pick the trampoline directory the bin-dir symlinks should point
+    // at. In `Symlink` mode the local prefix is itself just a symlink
+    // back to `server_prefix`, so either works; in `Reflink`/`Copy`
+    // mode the walk already reflink/copy'd `.trampoline/` into the
+    // local tree, so pointing at the local path keeps the install
+    // self-contained (the loopback test exercises this — the server
+    // tempdir is gone before the user runs the trampoline).
+    let trampoline_dir = match localise_mode {
+        LocaliseMode::Symlink => server_prefix.join(".trampoline"),
+        LocaliseMode::Reflink | LocaliseMode::Copy => local_prefix.join(".trampoline"),
+    };
     for mapping in &args.expose {
         let exe_name = mapping.exposed_name().to_string();
         let bin_name = if cfg!(windows) {
@@ -464,9 +515,9 @@ async fn setup_environment_via_daemon(
         } else {
             exe_name.clone()
         };
-        let server_trampoline = trampoline_dir.join(&bin_name);
+        let trampoline = trampoline_dir.join(&bin_name);
         let local_path = bin_dir.path().join(&bin_name);
-        pixi_global::localise_trampoline(&server_trampoline, &local_path)
+        pixi_global::localise_trampoline(&trampoline, &local_path)
             .await
             .map_err(|e| miette!("{e}"))?;
     }

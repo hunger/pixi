@@ -6665,6 +6665,7 @@ dependencies = [
  "rattler_repodata_gateway",
  "rattler_shell",
  "rattler_virtual_packages",
+ "reflink-copy",
  "regex",
  "rstest",
  "serde",
@@ -6677,6 +6678,7 @@ dependencies = [
  "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
  "url",
+ "walkdir",
  "zstd",
 ]
 

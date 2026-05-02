@@ -574,9 +574,8 @@ breaking clients.
 
 Pick the mode via priority `--localise-mode <mode>` flag > env var
 `PIXI_GLOBAL_LOCALISE` > `[remote] localise = "..."` config. Default
-remains `symlink` until we have run-time evidence reflink works on the
-mainstream filesystems we care about; then flip the default to reflink in
-a follow-up commit.
+is `reflink` (with per-file copy fallback for non-CoW filesystems);
+`symlink` and `copy` stay selectable.
 
 **Files:**
 - `crates/pixi_global/src/localise.rs` — add `Mode { Symlink, Reflink,
@@ -716,13 +715,13 @@ inline so they don't need re-discussion during implementation.
 - **Hash function.** HMAC-SHA-256, keyed by the salt, message
   `<auth_path>/<env_name>`. Both `hmac` and `sha2` are already
   transitively in the workspace. Output: 32 bytes hex-lowercase.
-- **Localise default.** Long-term default is reflink-copy with a
-  per-file copy fallback; symlink mode stays selectable via config
-  (`[remote] localise-mode = "reflink" | "symlink" | "copy"`).
-  Implementation order: ship symlink-only first (Step 4) so we have
-  a working `pixi global install` over the daemon; add the reflink
-  mode in Step 7; flip the default to reflink in Step 7's commit (or
-  the immediate follow-up) once it's been exercised in CI.
+- **Localise default.** Default is reflink-copy with a per-file
+  copy fallback; symlink and copy modes stay selectable via config
+  (`[remote] localise = "reflink" | "symlink" | "copy"`) or the
+  `--localise-mode` CLI flag. Implementation order: shipped
+  symlink-only first (Step 4) so we had a working
+  `pixi global install` over the daemon; added reflink/copy walks
+  in Step 7; flipped the default to reflink in the same step.
 - **Manifest source-of-truth.** The client's
   `~/.pixi/manifests/pixi-global.toml` is the user-facing truth. The
   server doesn't keep a manifest of its own — it produces a prefix

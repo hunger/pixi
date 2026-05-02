@@ -1517,17 +1517,27 @@ pub struct RemoteConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket_activation: Option<bool>,
+
+    /// Localisation mode for daemon-routed `pixi global install`. One
+    /// of `reflink`, `copy`, `symlink`. Picks how the server-side
+    /// prefix at `<data>/<HASH>/` is materialised under
+    /// `~/.pixi/envs/<env>`. Default is `reflink` (cheap on CoW
+    /// filesystems; falls back to a plain byte copy elsewhere).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub localise: Option<String>,
 }
 
 impl RemoteConfig {
     pub fn is_default(&self) -> bool {
-        self.socket.is_none() && self.socket_activation.is_none()
+        self.socket.is_none() && self.socket_activation.is_none() && self.localise.is_none()
     }
 
     pub fn merge(self, other: Self) -> Self {
         Self {
             socket: other.socket.or(self.socket),
             socket_activation: other.socket_activation.or(self.socket_activation),
+            localise: other.localise.or(self.localise),
         }
     }
 }
@@ -2021,6 +2031,7 @@ impl Config {
             "pypi-config.index-url",
             "pypi-config.keyring-provider",
             "remote",
+            "remote.localise",
             "remote.socket",
             "remote.socket-activation",
             "repodata-config",
@@ -2525,6 +2536,9 @@ impl Config {
                 }
                 let subkey = key.strip_prefix("remote.").unwrap();
                 match subkey {
+                    "localise" => {
+                        self.remote.localise = value;
+                    }
                     "socket" => {
                         self.remote.socket = value.map(PathBuf::from);
                     }
@@ -3084,6 +3098,7 @@ UNUSED = "unused"
             remote: RemoteConfig {
                 socket: Some(PathBuf::from("/run/pixi/pixi.sock")),
                 socket_activation: Some(true),
+                localise: Some("reflink".to_string()),
             },
             serve: ServeConfig {
                 data: Some(PathBuf::from("/var/lib/pixi/data")),

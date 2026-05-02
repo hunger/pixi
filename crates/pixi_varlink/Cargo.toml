@@ -32,7 +32,13 @@ parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync"] }
+tokio = { workspace = true, features = [
+  "fs",
+  "io-util",
+  "macros",
+  "rt",
+  "sync",
+] }
 tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
@@ -45,6 +51,7 @@ zlink = { workspace = true }
 # delegates the binary phase to `pixi_compute_engine`). The daemon
 # constructs its own dispatcher per install call against the server's
 # `data` / `cache` roots.
+itertools = { workspace = true }
 pixi_command_dispatcher = { workspace = true }
 pixi_global = { workspace = true }
 pixi_path = { workspace = true }
@@ -54,7 +61,6 @@ pixi_utils = { workspace = true }
 rattler_conda_types = { workspace = true }
 rattler_shell = { workspace = true }
 rattler_virtual_packages = { workspace = true }
-itertools = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -10,7 +10,7 @@ pub mod trampoline;
 
 pub use common::{BinDir, EnvChanges, EnvDir, EnvRoot, EnvState, StateChange, StateChanges};
 #[cfg(unix)]
-pub use localise::{LocaliseError, localise_prefix, localise_trampoline};
+pub use localise::{LocaliseError, Mode as LocaliseMode, localise_prefix, localise_trampoline};
 use pixi_utils::executable_from_path;
 pub use project::{EnvironmentName, ExposedName, Mapping, Project};
 
