@@ -1,21 +1,29 @@
-use std::{ops::Not, str::FromStr};
+use std::{
+    ops::Not,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use indexmap::IndexMap;
 
 use clap::Parser;
 use fancy_display::FancyDisplay;
+use futures::StreamExt;
 use itertools::Itertools;
-use miette::Report;
+use miette::{IntoDiagnostic, Report, miette};
 use rattler_conda_types::{MatchSpec, NamedChannelOrUrl, Platform};
 
+use crate::GlobalOptions;
 use crate::global::{global_specs::GlobalSpecs, revert_environment_after_error};
 use pixi_config::{self, Config, ConfigCli};
 use pixi_global::{
-    self, EnvChanges, EnvState, EnvironmentName, Mapping, Project, StateChange, StateChanges,
+    self, BinDir, EnvChanges, EnvRoot, EnvState, EnvironmentName, Mapping, Project, StateChange,
+    StateChanges,
     common::{NotChangedReason, contains_menuinst_document},
     list::list_all_global_environments,
     project::{ExposedType, GlobalSpec},
 };
+use pixi_varlink::{ExposeMapping, InstallReply, InstallRequest};
 
 /// Installs the defined packages in a globally accessible location and exposes their command line applications.
 ///
@@ -80,8 +88,17 @@ pub struct Args {
     pub backend_override: Option<pixi_build_frontend::BackendOverride>,
 }
 
-pub async fn execute(args: Args) -> miette::Result<()> {
+pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Result<()> {
     let config = Config::with_cli_config(&args.config);
+
+    // Daemon-routing trigger: CLI `--socket` overrides config; either
+    // resolves to a socket path means we send `Install` over varlink
+    // instead of running the install locally. The local path is
+    // unchanged when neither is set.
+    let socket: Option<PathBuf> = global_options
+        .socket
+        .clone()
+        .or_else(|| config.remote.socket.clone());
 
     // Load the global config and ensure
     // that the root_dir is relative to the manifest directory
@@ -128,7 +145,13 @@ pub async fn execute(args: Args) -> miette::Result<()> {
 
     for (env_name, specs) in &env_to_specs {
         let mut project = last_updated_project.clone();
-        match setup_environment(env_name, &args, specs, &mut project).await {
+        let install_result = match socket.as_deref() {
+            Some(socket) => {
+                setup_environment_via_daemon(env_name, &args, specs, &mut project, socket).await
+            }
+            None => setup_environment(env_name, &args, specs, &mut project).await,
+        };
+        match install_result {
             Ok(state_changes) => {
                 if state_changes.has_changed() {
                     env_changes
@@ -278,6 +301,180 @@ async fn setup_environment(
     state_changes |= project.sync_completions(env_name).await?;
 
     project.manifest.save().await?;
+    Ok(state_changes)
+}
+
+/// Daemon-routed counterpart to [`setup_environment`].
+///
+/// Same client-side manifest manipulation as the local path (add the
+/// env entry, set platform, register dependencies + expose mappings),
+/// but instead of running the install locally, send an `Install` RPC
+/// to the daemon at `socket`. The daemon owns the on-disk prefix and
+/// trampolines under its `data` root; the client localises the prefix
+/// at `~/.pixi/envs/<env_name>` (single symlink — see
+/// [`pixi_global::localise_prefix`]) and symlinks each exposed
+/// trampoline under `~/.pixi/bin/`. The shortcut + completion +
+/// manifest-save tail is shared with the local path via
+/// [`Project::finalise_environment_no_trampolines`].
+///
+/// Limitations of this first cut:
+/// - Only explicit `--expose` mappings are surfaced; default
+///   "expose every binary in the package" doesn't apply yet (the
+///   client would have to introspect a prefix that doesn't exist
+///   yet to enumerate the binaries).
+/// - `add_packages_from_install_changes` isn't wired through, so
+///   the `state_changes` summary only carries `AddedEnvironment` /
+///   `UpdatedEnvironment` markers without per-package detail.
+/// - `complex executable_relname` like `dotnet/dotnet` isn't
+///   supported by the daemon's `parse_expose_source` yet.
+async fn setup_environment_via_daemon(
+    env_name: &EnvironmentName,
+    args: &Args,
+    specs: &[GlobalSpec],
+    project: &mut Project,
+    socket: &Path,
+) -> miette::Result<StateChanges> {
+    let mut state_changes = StateChanges::new_with_env(env_name.clone());
+
+    if args.force_reinstall && project.environment(env_name).is_some() {
+        state_changes |= project.remove_environment(env_name).await?;
+    }
+
+    let channels = if args.channels.is_empty() {
+        project.config().default_channels()
+    } else {
+        args.channels.clone()
+    };
+
+    if !project.manifest.parsed.envs.contains_key(env_name) {
+        project
+            .manifest
+            .add_environment(env_name, Some(channels.clone()))?;
+        state_changes.insert_change(env_name, StateChange::AddedEnvironment);
+    }
+
+    if let Some(platform) = args.platform {
+        project.manifest.set_platform(env_name, platform)?;
+    }
+
+    let converted_with_inclusions = args
+        .with
+        .iter()
+        .map(|spec| {
+            GlobalSpec::try_from_matchspec_with_name(
+                spec.clone(),
+                project.config().global_channel_config(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let packages_to_add = specs
+        .iter()
+        .chain(converted_with_inclusions.iter())
+        .collect_vec();
+
+    for spec in &packages_to_add {
+        project.manifest.add_dependency(env_name, spec)?;
+    }
+
+    if !args.expose.is_empty() {
+        project.manifest.remove_all_exposed_mappings(env_name)?;
+        for mapping in &args.expose {
+            project.manifest.add_exposed_mapping(env_name, mapping)?;
+        }
+    }
+
+    // Build the wire request: resolve channel URLs via the project's
+    // channel config, render specs as match-spec strings, convert
+    // expose mappings to the daemon's wire shape.
+    let channel_config = project.config().global_channel_config().clone();
+    let channel_urls: Vec<String> = channels
+        .iter()
+        .filter_map(|c| c.clone().into_base_url(&channel_config).ok())
+        .map(|url| url.to_string())
+        .collect();
+    let spec_strings: Vec<String> = packages_to_add
+        .iter()
+        .map(|spec| {
+            spec.spec()
+                .clone()
+                .to_match_spec(spec.name(), &channel_config)
+                .map(|ms| ms.to_string())
+                .into_diagnostic()
+        })
+        .collect::<miette::Result<Vec<_>>>()?;
+    let expose_for_wire: Vec<ExposeMapping> = args
+        .expose
+        .iter()
+        .map(|m| ExposeMapping {
+            exe_name: m.exposed_name().to_string(),
+            source: m.executable_name().to_string(),
+        })
+        .collect();
+
+    let request = InstallRequest {
+        env_name: env_name.as_str().to_string(),
+        specs: spec_strings,
+        channels: channel_urls,
+        platform: args.platform.map(|p| p.to_string()),
+        expose: expose_for_wire,
+        force_reinstall: args.force_reinstall,
+    };
+
+    // Auth target is `~/.pixi/envs/`: the directory the localised
+    // prefix symlink will live under.
+    let env_root = EnvRoot::from_env().await?;
+    let bin_dir = BinDir::from_env().await?;
+
+    let mut conn = pixi_varlink::connect(socket, env_root.path())
+        .await
+        .into_diagnostic()
+        .map_err(|e| e.wrap_err(format!("could not connect to {}", socket.display())))?;
+    let stream = conn.install(request).await.into_diagnostic()?;
+    let mut stream = std::pin::pin!(stream);
+    let mut server_prefix: Option<PathBuf> = None;
+    while let Some(item) = stream.next().await {
+        let reply = item
+            .into_diagnostic()?
+            .map_err(|err| miette!("daemon rejected install: {err:?}"))?;
+        match reply {
+            InstallReply::Progress { event } => tracing::debug!(?event, "install progress"),
+            InstallReply::Success { prefix } => {
+                server_prefix = Some(PathBuf::from(prefix));
+                break;
+            }
+            InstallReply::Failed { error } => {
+                return Err(miette!("daemon install failed: {error:?}"));
+            }
+        }
+    }
+    let server_prefix = server_prefix
+        .ok_or_else(|| miette!("daemon ended the install stream without a terminal reply"))?;
+
+    let local_prefix = env_root.path().join(env_name.as_str());
+    pixi_global::localise_prefix(&server_prefix, &local_prefix)
+        .await
+        .map_err(|e| miette!("{e}"))?;
+
+    let trampoline_dir = server_prefix.join(".trampoline");
+    for mapping in &args.expose {
+        let exe_name = mapping.exposed_name().to_string();
+        let bin_name = if cfg!(windows) {
+            format!("{exe_name}.exe")
+        } else {
+            exe_name.clone()
+        };
+        let server_trampoline = trampoline_dir.join(&bin_name);
+        let local_path = bin_dir.path().join(&bin_name);
+        pixi_global::localise_trampoline(&server_trampoline, &local_path)
+            .await
+            .map_err(|e| miette!("{e}"))?;
+    }
+
+    state_changes |= project
+        .finalise_environment_no_trampolines(env_name, !args.no_shortcuts, specs)
+        .await?;
+
     Ok(state_changes)
 }
 

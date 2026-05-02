@@ -107,6 +107,62 @@ pub async fn localise_prefix(server_prefix: &Path, local_path: &Path) -> Result<
         .map_err(|e| LocaliseError::io("create symlink", local_path, e))
 }
 
+/// Symlink a server-side trampoline binary to a `~/.pixi/bin/<exe>`
+/// entry on the client. Mirrors [`localise_prefix`]'s idempotency
+/// rules but is willing to clobber a real file at `local_path` —
+/// that's almost always a stale trampoline written by an earlier
+/// non-daemon install of the same exposed name, and refusing to
+/// overwrite it would leave the user with a broken binary on their
+/// `PATH`.
+///
+/// `server_trampoline` is the absolute server-side path
+/// (`<server_prefix>/.trampoline/<exe>`); `local_path` is the
+/// `~/.pixi/bin/<exe>` entry. Both are caller-determined; this helper
+/// just writes the symlink atomically.
+#[cfg(unix)]
+pub async fn localise_trampoline(
+    server_trampoline: &Path,
+    local_path: &Path,
+) -> Result<(), LocaliseError> {
+    match tokio_fs::symlink_metadata(local_path).await {
+        Ok(meta) if meta.file_type().is_symlink() => match tokio_fs::read_link(local_path).await {
+            Ok(target) if target == server_trampoline => return Ok(()),
+            Ok(_) | Err(_) => {
+                tokio_fs::remove_file(local_path)
+                    .await
+                    .map_err(|e| LocaliseError::io("remove existing symlink", local_path, e))?;
+            }
+        },
+        Ok(meta) if meta.is_file() => {
+            // Stale trampoline binary from an earlier local install. Replace.
+            tokio_fs::remove_file(local_path)
+                .await
+                .map_err(|e| LocaliseError::io("remove existing trampoline", local_path, e))?;
+        }
+        Ok(_) => {
+            // Directory or other oddity. Refuse.
+            return Err(LocaliseError::FileConflict(local_path.to_path_buf()));
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // Will create below.
+        }
+        Err(e) => {
+            return Err(LocaliseError::io("stat", local_path, e));
+        }
+    }
+
+    if let Some(parent) = local_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .map_err(|e| LocaliseError::io("create parent directory", parent, e))?;
+    }
+    tokio_fs::symlink(server_trampoline, local_path)
+        .await
+        .map_err(|e| LocaliseError::io("create symlink", local_path, e))
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
@@ -226,6 +282,113 @@ mod tests {
         assert!(
             matches!(err, LocaliseError::FileConflict(_)),
             "expected FileConflict, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trampoline_creates_symlink_when_target_missing() {
+        let server = TempDir::new().unwrap();
+        let trampoline = server.path().join("lzcat");
+        tokio_fs::write(&trampoline, b"trampoline").await.unwrap();
+
+        let bin_dir = TempDir::new().unwrap();
+        let bin_path = bin_dir.path().join("lzcat");
+
+        localise_trampoline(&trampoline, &bin_path).await.unwrap();
+        assert_eq!(tokio::fs::read_link(&bin_path).await.unwrap(), trampoline);
+    }
+
+    #[tokio::test]
+    async fn trampoline_second_call_with_same_target_is_noop() {
+        let server = TempDir::new().unwrap();
+        let trampoline = server.path().join("lzcat");
+        tokio_fs::write(&trampoline, b"trampoline").await.unwrap();
+
+        let bin_dir = TempDir::new().unwrap();
+        let bin_path = bin_dir.path().join("lzcat");
+
+        localise_trampoline(&trampoline, &bin_path).await.unwrap();
+        let mtime_first = tokio::fs::symlink_metadata(&bin_path)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        localise_trampoline(&trampoline, &bin_path).await.unwrap();
+        let mtime_second = tokio::fs::symlink_metadata(&bin_path)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        assert_eq!(mtime_first, mtime_second);
+    }
+
+    #[tokio::test]
+    async fn trampoline_stale_symlink_is_rewritten() {
+        let bin_dir = TempDir::new().unwrap();
+        let bin_path = bin_dir.path().join("lzcat");
+
+        let old_server = TempDir::new().unwrap();
+        let old_trampoline = old_server.path().join("lzcat");
+        tokio_fs::write(&old_trampoline, b"old").await.unwrap();
+        let new_server = TempDir::new().unwrap();
+        let new_trampoline = new_server.path().join("lzcat");
+        tokio_fs::write(&new_trampoline, b"new").await.unwrap();
+
+        localise_trampoline(&old_trampoline, &bin_path)
+            .await
+            .unwrap();
+        localise_trampoline(&new_trampoline, &bin_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_link(&bin_path).await.unwrap(),
+            new_trampoline
+        );
+    }
+
+    /// Distinct from `localise_prefix`: the trampoline helper *replaces*
+    /// a stale regular file at `local_path`, because that's almost
+    /// always a leftover trampoline binary from a previous local
+    /// install — leaving it in place would leave a broken
+    /// `~/.pixi/bin/<exe>` on the user's PATH.
+    #[tokio::test]
+    async fn trampoline_clobbers_regular_file() {
+        let server = TempDir::new().unwrap();
+        let trampoline = server.path().join("lzcat");
+        tokio_fs::write(&trampoline, b"trampoline").await.unwrap();
+
+        let bin_dir = TempDir::new().unwrap();
+        let bin_path = bin_dir.path().join("lzcat");
+        tokio::fs::write(&bin_path, b"stale binary").await.unwrap();
+
+        localise_trampoline(&trampoline, &bin_path).await.unwrap();
+        let meta = tokio::fs::symlink_metadata(&bin_path).await.unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "stale regular file must be replaced with a symlink"
+        );
+        assert_eq!(tokio::fs::read_link(&bin_path).await.unwrap(), trampoline);
+    }
+
+    #[tokio::test]
+    async fn trampoline_refuses_directory() {
+        let server = TempDir::new().unwrap();
+        let trampoline = server.path().join("lzcat");
+        tokio_fs::write(&trampoline, b"trampoline").await.unwrap();
+
+        let bin_dir = TempDir::new().unwrap();
+        let bin_path = bin_dir.path().join("lzcat");
+        tokio::fs::create_dir_all(&bin_path).await.unwrap();
+
+        let err = localise_trampoline(&trampoline, &bin_path)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LocaliseError::FileConflict(_)),
+            "expected FileConflict for a directory, got {err:?}"
         );
     }
 }

@@ -98,7 +98,7 @@ pub struct Args {
     list: bool,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Default, Parser)]
 pub struct GlobalOptions {
     /// Display help information
     #[clap(
@@ -368,16 +368,19 @@ pub async fn execute_command(
     command: Command,
     global_options: &GlobalOptions,
 ) -> miette::Result<()> {
-    // `--socket` is parseable on every subcommand (it's a global flag) but only
-    // `pixi serve` and `pixi serve-test` actually do anything with it today.
-    // Refuse it loudly on other subcommands so silent behaviour drift is
-    // impossible.
+    // `--socket` is parseable on every subcommand (it's a global flag) but
+    // only `pixi serve`, `pixi serve-test`, and `pixi global install` actually
+    // do anything with it today. Refuse it loudly on other subcommands so
+    // silent behaviour drift is impossible.
     #[cfg(unix)]
     if global_options.socket.is_some()
-        && !matches!(command, Command::Serve(_) | Command::ServeTest(_))
+        && !matches!(
+            command,
+            Command::Serve(_) | Command::ServeTest(_) | Command::Global(_)
+        )
     {
         panic!(
-            "--socket is only consumed by `pixi serve` and `pixi serve-test`; routing it through other subcommands is not implemented yet"
+            "--socket is only consumed by `pixi serve`, `pixi serve-test`, and `pixi global install`; routing it through other subcommands is not implemented yet"
         );
     }
 
@@ -388,7 +391,7 @@ pub async fn execute_command(
         Command::Add(cmd) => add::execute(cmd).await,
         Command::Clean(cmd) => clean::execute(cmd).await,
         Command::Run(cmd) => run::execute(cmd).await,
-        Command::Global(cmd) => global::execute(cmd).await,
+        Command::Global(cmd) => global::execute(cmd, global_options).await,
         Command::Auth(cmd) => rattler::cli::auth::execute(cmd).await.into_diagnostic(),
         Command::Install(cmd) => install::execute(cmd).await,
         Command::Reinstall(cmd) => reinstall::execute(cmd).await,

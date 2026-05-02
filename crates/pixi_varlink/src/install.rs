@@ -530,18 +530,18 @@ async fn build_trampolines(
     Ok(())
 }
 
-/// Parse `package/binary` (the [`ExposeMapping::source`] format) and
-/// return the binary name. The package half is informational — pixi
-/// resolves the binary relative to the prefix's `bin/` directory.
+/// Parse the [`ExposeMapping::source`] format and return the binary
+/// name. Accepts both `<package>/<binary>` (the package half is
+/// informational, kept for compatibility) and a bare `<binary>`. The
+/// last `/`-separated segment is taken as the binary name; deeper
+/// relative paths (`dotnet/dotnet/dotnet`-style multi-component
+/// layouts) aren't supported by the daemon path yet — users with that
+/// need run the local install instead.
 fn parse_expose_source(source: &str) -> Result<String, InstallFailure> {
-    let (_pkg, binary) = source
-        .split_once('/')
-        .ok_or_else(|| InstallFailure::InstallFailed {
-            reason: format!("expose source {source:?} must be `<package>/<binary>`"),
-        })?;
-    if binary.is_empty() || binary.contains('/') {
+    let binary = source.rsplit('/').next().unwrap_or(source);
+    if binary.is_empty() {
         return Err(InstallFailure::InstallFailed {
-            reason: format!("expose source {source:?} binary half must be a single path component"),
+            reason: format!("expose source {source:?} doesn't name a binary"),
         });
     }
     Ok(binary.to_string())

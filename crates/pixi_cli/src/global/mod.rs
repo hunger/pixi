@@ -2,6 +2,7 @@ use clap::Parser;
 use miette::IntoDiagnostic;
 use tokio::fs as tokio_fs;
 
+use crate::GlobalOptions;
 use pixi_global::EnvironmentName;
 
 mod add;
@@ -59,11 +60,16 @@ pub struct Args {
 }
 
 /// Maps global command enum variants to their function handlers.
-pub async fn execute(cmd: Args) -> miette::Result<()> {
+///
+/// `global_options` is forwarded so `pixi global install` can consult
+/// the daemon-routing `--socket` flag; the remaining subcommands ignore
+/// it (the panic guard in `crate::execute_command` still rejects
+/// `--socket` against any other global subcommand).
+pub async fn execute(cmd: Args, global_options: &GlobalOptions) -> miette::Result<()> {
     match cmd.command {
         Command::Add(args) => add::execute(args).await?,
         Command::Edit(args) => edit::execute(args).await?,
-        Command::Install(args) => install::execute(args).await?,
+        Command::Install(args) => install::execute(args, global_options).await?,
         Command::Uninstall(args) => uninstall::execute(args).await?,
         Command::Remove(args) => remove::execute(args).await?,
         Command::List(args) => list::execute(args).await?,

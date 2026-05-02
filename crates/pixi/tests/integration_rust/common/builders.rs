@@ -742,7 +742,7 @@ impl IntoFuture for GlobalInstallBuilder {
                 ("PIXI_HOME", Some(self.tmpdir.clone())),
                 ("PIXI_CACHE_DIR", Some(self.tmpdir.clone())),
             ],
-            async { global::execute(args).await },
+            async { global::execute(args, &Default::default()).await },
         )
         .boxed_local()
     }

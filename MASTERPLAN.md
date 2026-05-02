@@ -751,7 +751,7 @@ inline so they don't need re-discussion during implementation.
   side)
 - `crates/pixi_global/src/localise.rs` (new)
 - `crates/pixi_global/Cargo.toml`
-- `tests/` (top-level integration test for `--remote`)
+- `tests/` (top-level integration test for `--socket`)
 
 ## Verification
 
@@ -762,7 +762,8 @@ End-to-end:
 - `cargo test -p pixi_cli` — steps 6+ add CLI integration tests.
 - `scripts/pixi_serve_loopback -- serve-test install xz` — manual smoke
   test after step 2.
-- `scripts/pixi_serve_loopback -- global install --remote xz` after step 6,
+- `scripts/pixi_serve_loopback -- global install xz` after step 6
+  (the loopback already injects `--socket` into the client invocation),
   followed by running `~/.pixi/bin/xz --version`.
 - After step 6: a `diff -ur` of `~/.pixi/{envs,bin,manifests}` between a
   remote-install and a local-install of the same packages, modulo file
