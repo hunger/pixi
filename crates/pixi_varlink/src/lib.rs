@@ -8,15 +8,28 @@
 //!   automatically; otherwise it binds `socket_path`.
 //! * [`take_socket_activation_listener`] and [`serve_on`] are the lower-level
 //!   primitives that [`serve`] is built from.
-//! * [`connect`] returns a [`zlink::Connection`] on which the proxy methods
-//!   from [`EchoProxy`] are available.
+//! * [`connect`] returns an authenticated [`Connection`] by performing the
+//!   `Hello` / `Authenticate` handshake against a directory the caller can
+//!   write to. The pre-handshake side is represented by an internal
+//!   `UnauthorizedConnection` type; together they form a typestate that
+//!   prevents business methods from being called on an unauthenticated
+//!   connection at compile time.
 
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::io::Read;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, instrument, trace};
+use tracing::{debug, info, instrument, trace, warn};
+use uuid::Uuid;
 use zlink::{ReplyError, Server, introspect, proxy, service, unix};
 
 /// Reverse-DNS interface name shared between the server and the client.
@@ -72,7 +85,7 @@ pub enum ProgressKind {
     Finished,
 }
 
-/// One element of [`EchoProxy::long_ping`]'s reply stream.
+/// One element of [`Connection::long_ping`]'s reply stream.
 ///
 /// Intermediate replies carry [`Progress`](Self::Progress) events; the final
 /// reply carries [`Result`](Self::Result) and ends the stream.
@@ -91,25 +104,71 @@ pub enum LongPingReply {
     },
 }
 
+/// Server reply to the `Hello` handshake step. The client must write a file
+/// `<directory>/pixi-serve-challenge-<challenge>` containing the exact
+/// `challenge` string back to disk and then call `Authenticate` to finish
+/// the handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelloReply {
+    /// The challenge token (a UUID). Must round-trip through the filesystem.
+    pub challenge: String,
+}
+
+/// Server reply to the `Authenticate` handshake step. Empty today; reserved
+/// for future fields like a session id or capability set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthReply {}
+
 /// Errors that the echo service can return to a peer.
 #[derive(Debug, Clone, PartialEq, ReplyError, introspect::ReplyError)]
 #[zlink(interface = "dev.prefix.pixi.Echo")]
 pub enum EchoError {
     /// The caller sent an empty message.
     EmptyMessage,
+    /// The connection has not yet completed the `Hello` / `Authenticate`
+    /// handshake, so no business methods may be called.
+    NotAuthenticated,
+    /// `Hello` was called more than once on the same connection. A
+    /// connection is bound to one directory for its lifetime.
+    AlreadyHandshaken,
+    /// `Authenticate` was called outside the awaiting-proof state.
+    NotAwaitingProof,
+    /// The challenge file could not be read or its content didn't match the
+    /// issued UUID.
+    ChallengeFailed {
+        /// Human-readable reason: missing file, wrong content, I/O error.
+        reason: String,
+    },
+    /// The directory sent in `Hello` could not be opened, or the kernel's
+    /// canonical path for the resulting FD didn't match what the client
+    /// sent — meaning either the path was non-canonical (relative,
+    /// `.`/`..` components, trailing slash, etc.) or some component
+    /// resolved through a symlink. Send the absolute, symlink-resolved
+    /// path the kernel reports back.
+    NonCanonicalDirectory {
+        /// Human-readable reason: either the path the FD actually points
+        /// at vs. what the client sent, or the I/O error from the open.
+        reason: String,
+    },
 }
 
-/// Client-side proxy. Implemented for [`zlink::Connection`] by the
-/// `#[proxy]` macro, so callers can simply do `conn.ping("hi").await?`.
+/// Pre-handshake proxy methods. Private to this crate: external callers
+/// should drive the handshake through [`UnauthorizedConnection::hello`] and
+/// [`AwaitingProof::authenticate`], not by invoking these directly.
 #[proxy("dev.prefix.pixi.Echo")]
-pub trait EchoProxy {
-    /// Echoes `message` back to the caller.
+trait UnauthProxy {
+    async fn hello(&mut self, directory: &str) -> zlink::Result<Result<HelloReply, EchoError>>;
+
+    async fn authenticate(&mut self) -> zlink::Result<Result<AuthReply, EchoError>>;
+}
+
+/// Post-handshake proxy methods. Private to this crate: external callers
+/// reach these through inherent methods on [`Connection`] so the
+/// authenticated typestate can't be bypassed.
+#[proxy("dev.prefix.pixi.Echo")]
+trait AuthProxy {
     async fn ping(&mut self, message: &str) -> zlink::Result<Result<PingReply, EchoError>>;
 
-    /// Like [`ping`](Self::ping), but streams a [`ProgressEvent`] for each
-    /// character of the message before delivering the terminating
-    /// [`LongPingReply::Result`]. Demonstrates how a long-running RPC carries
-    /// its own progress notifications.
     #[zlink(more)]
     async fn long_ping(
         &mut self,
@@ -117,14 +176,307 @@ pub trait EchoProxy {
     ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<LongPingReply, EchoError>>>>;
 }
 
+/// Per-connection auth state, tracked by zlink's connection id.
+#[derive(Debug, Clone)]
+enum AuthState {
+    /// `Hello` has been called and we're awaiting `Authenticate`. The
+    /// `dir` handle is opened against the canonical directory at `Hello`
+    /// time and used to read the challenge file later — anchoring the
+    /// read to the directory's inode means a path-component symlink swap
+    /// between `Hello` and `Authenticate` can't redirect us elsewhere.
+    AwaitingProof {
+        directory: PathBuf,
+        challenge: Uuid,
+        dir: Arc<Dir>,
+    },
+    /// `Authenticate` succeeded; business methods are allowed against
+    /// `directory`.
+    Authenticated { directory: PathBuf },
+}
+
 /// The server-side service implementation.
-#[derive(Debug, Default)]
-pub struct EchoService;
+///
+/// Holds a per-connection auth-state map keyed by zlink's connection id.
+///
+/// **Lifecycle / memory note.** zlink doesn't currently surface a
+/// "connection closed" hook to `Service` implementations, so entries in
+/// `auth` are never removed: they accumulate for the daemon's lifetime
+/// and a restart is the only thing that frees them. This is *only* a
+/// bookkeeping concern, not an authentication one — zlink's connection
+/// ids are issued via a process-global `AtomicUsize::fetch_add(1)`
+/// (`zlink-core/src/connection/mod.rs`), so they're strictly monotonic
+/// and never reused. A new connection is guaranteed to see an empty slot
+/// in `auth` regardless of how many old, since-closed connections came
+/// before it.
+///
+/// For typical pixi-serve usage (single user, occasional connections,
+/// the daemon gets restarted on package upgrade) the leak is well below
+/// any threshold worth coding around. If a long-running daemon ever
+/// needs cleanup, the right fix is upstream — patch zlink to add an
+/// `on_disconnect(conn_id)` hook to `Service`.
+#[derive(Debug, Clone, Default)]
+pub struct EchoService {
+    auth: Arc<Mutex<HashMap<usize, AuthState>>>,
+}
+
+/// Ask the kernel for the canonical path the directory FD currently lives at.
+///
+/// On Linux this reads the `/proc/self/fd/<n>` magic symlink; on every other
+/// Unix we go through `fcntl(F_GETPATH)` (which both macOS and FreeBSD
+/// expose). The result is the kernel's authoritative view of where the FD
+/// points, so comparing it to what the client sent in `Hello` rejects every
+/// shape of symlink resolution that could have happened during the open —
+/// final-component, intermediate-component, or even between the client's
+/// rename and our open. We're already `cfg(unix)` from the surrounding
+/// crate, so no compile-time fallback is needed.
+fn fd_canonical_path<F: AsFd>(fd: &F) -> std::io::Result<PathBuf> {
+    /// Refuse paths longer than this; bounds both Linux's grow-loop and the
+    /// memory the function will allocate. Real filesystems with paths past
+    /// PATH_MAX are exotic; honoring them past 16 × PATH_MAX would be a DoS
+    /// surface.
+    const MAX_PATH_BYTES: usize = libc::PATH_MAX as usize * 16;
+
+    let raw = fd.as_fd().as_raw_fd();
+
+    #[cfg(target_os = "linux")]
+    let buf = {
+        let proc_path = format!("/proc/self/fd/{raw}\0");
+        // `readlink(2)` writes up to `bufsiz` bytes and returns that count;
+        // there's no separate "would have written more" signal, so we
+        // grow the buffer until the result is strictly shorter than the
+        // buffer (i.e. definitively not truncated). Cap the growth so a
+        // pathologically deep mount can't make us allocate forever.
+        let mut size = libc::PATH_MAX as usize;
+        loop {
+            let mut buf = vec![0u8; size];
+            // SAFETY: `proc_path` is NUL-terminated and points to a valid C
+            // string for the duration of the call; `buf` is writable for
+            // `buf.len()` bytes.
+            let n = unsafe {
+                libc::readlink(
+                    proc_path.as_ptr() as *const libc::c_char,
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            };
+            if n == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let n = n as usize;
+            if n < buf.len() {
+                buf.truncate(n);
+                break buf;
+            }
+            // Filled the buffer — content may have been truncated.
+            if size >= MAX_PATH_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("FD canonical path exceeds {MAX_PATH_BYTES} bytes"),
+                ));
+            }
+            size = size.saturating_mul(2).min(MAX_PATH_BYTES);
+        }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let buf = {
+        // `F_GETPATH` requires a buffer of at least `MAXPATHLEN` (== PATH_MAX
+        // on macOS / *BSD) and returns `ENAMETOOLONG` if the path doesn't
+        // fit. So a single PATH_MAX-sized call is sufficient: either we get
+        // the path or `last_os_error` surfaces the kernel's error.
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: `buf` is writable for at least `PATH_MAX` bytes, which is
+        // what `F_GETPATH` writes into.
+        let r = unsafe {
+            libc::fcntl(
+                raw,
+                libc::F_GETPATH,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+            )
+        };
+        if r == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // `F_GETPATH` writes a NUL-terminated string; trim at the first NUL.
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        buf.truncate(len);
+        buf
+    };
+
+    Ok(PathBuf::from(OsString::from_vec(buf)))
+}
+
+impl EchoService {
+    /// Returns the directory the connection is authenticated against, or
+    /// [`EchoError::NotAuthenticated`] if it isn't. Logs the rejection so
+    /// servers can spot misbehaving clients.
+    fn require_authenticated(&self, conn_id: usize) -> Result<PathBuf, EchoError> {
+        match self.auth.lock().get(&conn_id) {
+            Some(AuthState::Authenticated { directory }) => Ok(directory.clone()),
+            Some(AuthState::AwaitingProof { .. }) => {
+                debug!(conn_id, "rejecting request: handshake not yet completed");
+                Err(EchoError::NotAuthenticated)
+            }
+            None => {
+                debug!(conn_id, "rejecting request: connection has not sent Hello");
+                Err(EchoError::NotAuthenticated)
+            }
+        }
+    }
+}
 
 #[service(interface = "dev.prefix.pixi.Echo")]
-impl EchoService {
-    #[instrument(level = "debug", skip(self), fields(len = message.len()))]
-    async fn ping(&mut self, message: String) -> Result<PingReply, EchoError> {
+impl<Sock> EchoService
+where
+    Sock: zlink::connection::Socket,
+{
+    /// Step 1 of the handshake. Records the directory the client wants and
+    /// issues a UUID challenge. Refuses if the connection has already sent
+    /// `Hello`.
+    #[instrument(level = "debug", skip(self, conn), fields(conn_id = conn.id(), directory))]
+    async fn hello(
+        &self,
+        directory: String,
+        #[zlink(connection)] conn: &mut zlink::Connection<Sock>,
+    ) -> Result<HelloReply, EchoError> {
+        let conn_id = conn.id();
+        // Reject duplicate Hello early so we don't spend a `canonicalize`
+        // syscall on it.
+        if self.auth.lock().contains_key(&conn_id) {
+            return Err(EchoError::AlreadyHandshaken);
+        }
+
+        let directory = PathBuf::from(directory);
+
+        // Open the directory and immediately ask the kernel for the FD's
+        // canonical path. Comparing that to what the client sent rejects
+        // every shape of symlink resolution that could have happened
+        // during the open — including symlinks above `directory` — in a
+        // single check, with no canonicalize→open race window.
+        let dir = Dir::open_ambient_dir(&directory, ambient_authority()).map_err(|e| {
+            debug!(directory = %directory.display(), error = %e, "rejecting Hello: open failed");
+            EchoError::NonCanonicalDirectory {
+                reason: format!("could not open {}: {e}", directory.display()),
+            }
+        })?;
+        let fd_path = fd_canonical_path(&dir).map_err(|e| EchoError::NonCanonicalDirectory {
+            reason: format!(
+                "could not query kernel path for {}: {e}",
+                directory.display()
+            ),
+        })?;
+        // Compare as `OsStr`, not `Path`: `Path::eq` normalises `.`
+        // components away (so `/foo/.` would compare equal to `/foo`),
+        // which silently accepts non-canonical input. Byte-level OsStr
+        // equality matches the stated contract.
+        if fd_path.as_os_str() != directory.as_os_str() {
+            debug!(
+                directory = %directory.display(),
+                fd_path = %fd_path.display(),
+                "rejecting Hello: kernel reports a different path for the FD"
+            );
+            return Err(EchoError::NonCanonicalDirectory {
+                reason: format!(
+                    "directory FD resolves to {}, but client sent {}",
+                    fd_path.display(),
+                    directory.display()
+                ),
+            });
+        }
+
+        let challenge = Uuid::new_v4();
+        self.auth.lock().insert(
+            conn_id,
+            AuthState::AwaitingProof {
+                directory: fd_path.clone(),
+                challenge,
+                dir: Arc::new(dir),
+            },
+        );
+        // The challenge is the bearer secret of the handshake — keep it
+        // out of `info`/`warn` events so it doesn't leak into log files.
+        debug!(%challenge, "issued challenge");
+        info!(directory = %fd_path.display(), "issued auth challenge");
+        Ok(HelloReply {
+            challenge: challenge.to_string(),
+        })
+    }
+
+    /// Step 2 of the handshake. Reads
+    /// `<directory>/pixi-serve-challenge-<UUID>` and, if its contents match
+    /// the UUID issued by `Hello`, marks the connection authenticated.
+    #[instrument(level = "debug", skip(self, conn), fields(conn_id = conn.id()))]
+    async fn authenticate(
+        &self,
+        #[zlink(connection)] conn: &mut zlink::Connection<Sock>,
+    ) -> Result<AuthReply, EchoError> {
+        let conn_id = conn.id();
+        // Snapshot the awaiting-proof state, including the cap-std `Dir`
+        // handle that anchors the upcoming open to the directory's inode.
+        let (directory, challenge, dir) = match self.auth.lock().get(&conn_id) {
+            Some(AuthState::AwaitingProof {
+                directory,
+                challenge,
+                dir,
+            }) => (directory.clone(), *challenge, Arc::clone(dir)),
+            _ => return Err(EchoError::NotAwaitingProof),
+        };
+
+        // Read the challenge file via the captured `Dir`:
+        //
+        //   * The open is `openat(dir_fd, …)` — directory-component symlink
+        //     swaps between `Hello` and now can't redirect the read because
+        //     the FD already names the inode.
+        //   * `O_NOFOLLOW` (via `custom_flags`) refuses a symlink at the
+        //     final component itself.
+        //
+        // Together these close the symlink-attack window the previous
+        // canonicalize-and-compare approximated.
+        let filename = format!("pixi-serve-challenge-{challenge}");
+        let mut opts = OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = dir
+            .open_with(&filename, &opts)
+            .map_err(|e| EchoError::ChallengeFailed {
+                reason: format!("could not open {filename} in {}: {e}", directory.display()),
+            })?;
+        // Bound the read: a legitimate challenge file holds a UUID (~36
+        // bytes plus optional whitespace). Anyone with write access to
+        // the directory could otherwise plant a multi-GB file at this
+        // name and force the server to allocate it on every Authenticate.
+        const MAX_CHALLENGE_FILE_BYTES: u64 = 256;
+        let mut contents = String::with_capacity(MAX_CHALLENGE_FILE_BYTES as usize);
+        file.take(MAX_CHALLENGE_FILE_BYTES)
+            .read_to_string(&mut contents)
+            .map_err(|e| EchoError::ChallengeFailed {
+                reason: format!("could not read {filename} in {}: {e}", directory.display()),
+            })?;
+        if contents.trim() != challenge.to_string() {
+            return Err(EchoError::ChallengeFailed {
+                reason: format!(
+                    "challenge file {filename} in {} has wrong content",
+                    directory.display()
+                ),
+            });
+        }
+
+        self.auth.lock().insert(
+            conn_id,
+            AuthState::Authenticated {
+                directory: directory.clone(),
+            },
+        );
+        info!(directory = %directory.display(), "connection authenticated");
+        Ok(AuthReply {})
+    }
+
+    #[instrument(level = "debug", skip(self, conn), fields(conn_id = conn.id(), len = message.len()))]
+    async fn ping(
+        &self,
+        message: String,
+        #[zlink(connection)] conn: &mut zlink::Connection<Sock>,
+    ) -> Result<PingReply, EchoError> {
+        self.require_authenticated(conn.id())?;
         if message.is_empty() {
             debug!("rejecting empty Ping message");
             Err(EchoError::EmptyMessage)
@@ -134,12 +486,21 @@ impl EchoService {
     }
 
     #[zlink(more)]
-    #[instrument(level = "debug", skip(self), fields(len = message.len(), more))]
+    #[instrument(level = "debug", skip(self, conn), fields(conn_id = conn.id(), len = message.len(), more))]
     async fn long_ping(
         &self,
         more: bool,
         message: String,
+        #[zlink(connection)] conn: &mut zlink::Connection<Sock>,
     ) -> impl futures::Stream<Item = zlink::Reply<LongPingReply>> + Unpin {
+        // Streaming methods can't carry per-method errors through zlink
+        // today. If the caller isn't authenticated, log loudly and emit an
+        // empty stream so they can't extract any work.
+        if self.require_authenticated(conn.id()).is_err() {
+            warn!("rejecting unauthenticated long_ping");
+            return futures::stream::iter(Vec::new());
+        }
+
         let total = message.chars().count() as u64;
         let task_id = 1;
         let mut replies: Vec<LongPingReply> = Vec::with_capacity(total as usize + 3);
@@ -183,12 +544,12 @@ impl EchoService {
 
         let n = replies.len();
         trace!(replies = n, "long_ping stream prepared");
-        futures::stream::iter(
-            replies
-                .into_iter()
-                .enumerate()
-                .map(move |(i, v)| zlink::Reply::new(Some(v)).set_continues(Some(i + 1 < n))),
-        )
+        let items: Vec<zlink::Reply<LongPingReply>> = replies
+            .into_iter()
+            .enumerate()
+            .map(move |(i, v)| zlink::Reply::new(Some(v)).set_continues(Some(i + 1 < n)))
+            .collect();
+        futures::stream::iter(items)
     }
 }
 
@@ -214,7 +575,7 @@ pub async fn serve(socket_path: PathBuf) -> Result<(), Error> {
 #[instrument(level = "info", skip_all, fields(interface = INTERFACE))]
 pub async fn serve_on(listener: unix::Listener) -> Result<(), Error> {
     info!("starting varlink server");
-    let server = Server::new(listener, EchoService);
+    let server = Server::new(listener, EchoService::default());
     let result = server.run().await;
     match &result {
         Ok(()) => info!("varlink server stopped"),
@@ -223,11 +584,177 @@ pub async fn serve_on(listener: unix::Listener) -> Result<(), Error> {
     Ok(result?)
 }
 
-/// Connect to a server previously started with [`serve`].
+/// Initial handshake state. The only operation reachable on this type is
+/// [`hello`](Self::hello), which advances to [`AwaitingProof`].
+pub(crate) struct UnauthorizedConnection {
+    inner: unix::Connection,
+}
+
+impl UnauthorizedConnection {
+    /// Send `Hello { directory }`. The server records the directory and
+    /// returns a UUID challenge that the client must subsequently echo
+    /// through the filesystem (handled by [`AwaitingProof::authenticate`]).
+    #[instrument(level = "info", skip(self), fields(directory = %directory.display()))]
+    pub(crate) async fn hello(mut self, directory: &Path) -> Result<AwaitingProof, Error> {
+        let dir_str = directory
+            .to_str()
+            .ok_or_else(|| Error::Handshake("directory path is not valid UTF-8".into()))?;
+
+        debug!("sending Hello");
+        let hello = self
+            .inner
+            .hello(dir_str)
+            .await?
+            .map_err(|e| Error::Handshake(format!("Hello rejected: {e:?}")))?;
+        // Same secret-handling rule as the server side: keep the
+        // challenge out of `info` so it doesn't end up in log files.
+        debug!(challenge = %hello.challenge, "received challenge");
+        info!("received challenge");
+        Ok(AwaitingProof {
+            inner: self.inner,
+            directory: directory.to_path_buf(),
+            challenge: hello.challenge,
+        })
+    }
+}
+
+/// Post-`Hello`, pre-`Authenticate` state. Holds the directory the client
+/// claimed and the challenge UUID the server issued. The only operation
+/// reachable on this type is [`authenticate`](Self::authenticate), which
+/// writes the challenge file, asks the server to verify it, removes the
+/// file, and advances to [`Connection`].
+pub(crate) struct AwaitingProof {
+    inner: unix::Connection,
+    directory: PathBuf,
+    challenge: String,
+}
+
+impl AwaitingProof {
+    /// The directory this connection is awaiting proof against.
+    // Used by in-crate tests; production code reaches the directory via
+    // [`Connection::directory`] after `authenticate` completes.
+    #[allow(dead_code)]
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// The path the server expects the challenge file at.
+    // Used by in-crate tests; production code never has to compute this — the
+    // file is written and removed inside `authenticate`.
+    #[allow(dead_code)]
+    pub(crate) fn challenge_path(&self) -> PathBuf {
+        self.directory
+            .join(format!("pixi-serve-challenge-{}", self.challenge))
+    }
+
+    /// Finish the handshake: write the challenge file, send `Authenticate`,
+    /// remove the file (best effort), and yield an authenticated
+    /// [`Connection`] on success.
+    // Span is at info, but the challenge is intentionally omitted from
+    // its fields — that span is rendered into log lines for every event
+    // inside, so including the secret would leak it to the log subscriber.
+    #[instrument(level = "info", skip(self), fields(directory = %self.directory.display()))]
+    pub(crate) async fn authenticate(mut self) -> Result<Connection, Error> {
+        let challenge_path = self.challenge_path();
+
+        debug!(path = %challenge_path.display(), "writing challenge file");
+        tokio::fs::write(&challenge_path, &self.challenge)
+            .await
+            .map_err(|e| Error::Handshake(format!("writing {}: {e}", challenge_path.display())))?;
+
+        debug!("sending Authenticate");
+        let auth_result = self.inner.authenticate().await;
+        // Best-effort cleanup of the challenge file regardless of outcome —
+        // the server has already read it, and leaving it on disk would be
+        // visible to anyone watching the directory.
+        if let Err(e) = tokio::fs::remove_file(&challenge_path).await {
+            debug!(path = %challenge_path.display(), error = %e, "challenge file removal failed");
+        } else {
+            debug!(path = %challenge_path.display(), "challenge file removed");
+        }
+
+        match auth_result? {
+            Ok(_) => {
+                info!("handshake complete");
+                Ok(Connection {
+                    inner: self.inner,
+                    directory: self.directory,
+                })
+            }
+            Err(e) => Err(Error::Handshake(format!("Authenticate rejected: {e:?}"))),
+        }
+    }
+}
+
+/// Authenticated varlink connection bound to a specific directory.
+///
+/// All exposed methods are post-handshake; the type system guarantees that
+/// callers cannot send business RPCs without having proved access to the
+/// directory recorded here.
+pub struct Connection {
+    inner: unix::Connection,
+    directory: PathBuf,
+}
+
+impl Connection {
+    /// The directory this connection is authenticated for.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Echo `message` back from the server.
+    #[instrument(level = "debug", skip(self), fields(directory = %self.directory.display(), len = message.len()))]
+    pub async fn ping(&mut self, message: &str) -> zlink::Result<Result<PingReply, EchoError>> {
+        trace!("calling Ping");
+        AuthProxy::ping(&mut self.inner, message).await
+    }
+
+    /// Stream a `LongPingReply` per character, finishing with the final reply.
+    #[instrument(level = "debug", skip(self), fields(directory = %self.directory.display(), len = message.len()))]
+    pub async fn long_ping(
+        &mut self,
+        message: String,
+    ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<LongPingReply, EchoError>>>>
+    {
+        trace!("calling LongPing");
+        AuthProxy::long_ping(&mut self.inner, message).await
+    }
+}
+
+/// Connect to a `pixi serve` socket and complete the `Hello` / `Authenticate`
+/// handshake against `directory`. Returns a [`Connection`] ready to send
+/// business RPCs.
+///
+/// `directory` is canonicalised before being sent — the server enforces a
+/// canonical path, so this saves clients from tripping that check on
+/// relative paths or symlinked roots like macOS's `/tmp`.
+///
+/// Walks the typestate explicitly so the protocol's stages remain visible
+/// in the implementation.
+#[instrument(level = "debug", skip_all, fields(socket = %socket_path.display(), directory = %directory.display()))]
+pub async fn connect(socket_path: &Path, directory: &Path) -> Result<Connection, Error> {
+    let canonical = tokio::fs::canonicalize(directory).await.map_err(|e| {
+        Error::Handshake(format!(
+            "could not canonicalize {}: {e}",
+            directory.display()
+        ))
+    })?;
+    let unauth = connect_unauthenticated(socket_path).await?;
+    let awaiting = unauth.hello(&canonical).await?;
+    awaiting.authenticate().await
+}
+
+/// Open the underlying socket without performing the handshake. Crate-private
+/// so tests in this module can exercise the server's pre-handshake state
+/// machine; production callers must go through [`connect`].
 #[instrument(level = "debug", skip_all, fields(path = %socket_path.display()))]
-pub async fn connect(socket_path: &Path) -> Result<unix::Connection, Error> {
+pub(crate) async fn connect_unauthenticated(
+    socket_path: &Path,
+) -> Result<UnauthorizedConnection, Error> {
     debug!("connecting to varlink socket");
-    Ok(unix::connect(socket_path).await?)
+    Ok(UnauthorizedConnection {
+        inner: unix::connect(socket_path).await?,
+    })
 }
 
 /// First file descriptor passed by systemd via socket activation.
@@ -321,6 +848,10 @@ pub enum Error {
     /// The systemd socket-activation environment was malformed.
     #[error("systemd socket activation: {0}")]
     SocketActivation(String),
+
+    /// The Hello / Authenticate handshake could not be completed.
+    #[error("varlink handshake: {0}")]
+    Handshake(String),
 }
 
 #[cfg(test)]
@@ -333,6 +864,45 @@ mod tests {
     /// Serializes tests that read or write the systemd activation env vars,
     /// since `LISTEN_PID` / `LISTEN_FDS` are process-wide.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Drive a single test client against a fresh server. Spins up `serve()`
+    /// in a `LocalSet` (`Server::run` is `!Send`, see its doc comment and
+    /// rust-lang/rust#100013), waits for the socket to appear, then runs
+    /// `client_logic(socket_path)` with the server racing it via
+    /// `tokio::select!`. `ENV_LOCK` is held for the duration so server-side
+    /// `LISTEN_*` reads don't collide with the env-mutating test.
+    #[allow(clippy::await_holding_lock)]
+    async fn run_against_server<F, Fut, T>(client_logic: F) -> T
+    where
+        F: FnOnce(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("echo.varlink");
+        let client_path = socket.clone();
+
+        let result = LocalSet::new()
+            .run_until(async move {
+                let client = async move {
+                    for _ in 0..50 {
+                        if tokio::fs::try_exists(&client_path).await.unwrap_or(false) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    client_logic(client_path).await
+                };
+                tokio::select! {
+                    res = serve(socket) => panic!("server exited: {res:?}"),
+                    r = client => r,
+                }
+            })
+            .await;
+
+        drop(dir);
+        result
+    }
 
     /// `Server::run` cannot be sent across threads (see its doc comment and
     /// rust-lang/rust#100013), so we drive both ends from a `LocalSet` and
@@ -361,15 +931,37 @@ mod tests {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
 
-                    let mut conn = connect(&client_socket).await.expect("connect");
+                    // Server-side enforcement check: bypass the typestate by
+                    // using the private proxy traits directly. The server
+                    // must reject business methods before the handshake even
+                    // when the client tries.
+                    let mut raw = unix::connect(&client_socket).await.expect("raw connect");
+                    let err = AuthProxy::ping(&mut raw, "nope")
+                        .await
+                        .expect("call")
+                        .expect_err("server should refuse ping before handshake");
+                    assert_eq!(err, EchoError::NotAuthenticated);
+                    drop(raw);
+
+                    // Happy path through the public API. Canonicalise the
+                    // workdir up front: on macOS `TempDir` lives under
+                    // `/var/folders` reachable through the `/tmp` symlink,
+                    // so the path that comes out of `TempDir::path()` may
+                    // not equal its own canonical form.
+                    let workdir = TempDir::new().unwrap();
+                    let workdir_path = workdir.path().canonicalize().unwrap();
+                    let mut conn = connect(&client_socket, &workdir_path)
+                        .await
+                        .expect("connect+handshake");
+
+                    assert_eq!(conn.directory(), workdir_path);
+
                     let reply = conn.ping("hello").await.expect("call").expect("reply");
                     assert_eq!(reply.message, "hello");
 
                     let err = conn.ping("").await.expect("call").expect_err("error");
                     assert_eq!(err, EchoError::EmptyMessage);
 
-                    // Streaming long_ping: collect all replies and split into
-                    // progress events vs. final result.
                     use futures::StreamExt;
                     let stream = conn.long_ping("hi".into()).await.expect("subscribe");
                     let mut stream = std::pin::pin!(stream);
@@ -395,6 +987,51 @@ mod tests {
                         events.last().unwrap().kind,
                         ProgressKind::Finished
                     ));
+
+                    // Server-side enforcement check: a second `Hello` on the
+                    // *same* connection must be rejected. Drive that via
+                    // `connect_unauthenticated` and the private proxy.
+                    let mut raw = unix::connect(&client_socket).await.expect("raw connect");
+                    UnauthProxy::hello(&mut raw, workdir_path.to_str().unwrap())
+                        .await
+                        .expect("call")
+                        .expect("first hello on raw conn");
+                    let err = UnauthProxy::hello(&mut raw, workdir_path.to_str().unwrap())
+                        .await
+                        .expect("call")
+                        .expect_err("second hello should fail");
+                    assert_eq!(err, EchoError::AlreadyHandshaken);
+                    drop(raw);
+
+                    // Drive the handshake one typestate transition at a time
+                    // so the AwaitingProof intermediate state is exercised
+                    // independently of the all-in-one `connect` helper.
+                    let workdir2 = TempDir::new().unwrap();
+                    let workdir2_path = workdir2.path().canonicalize().unwrap();
+                    let unauth = connect_unauthenticated(&client_socket)
+                        .await
+                        .expect("connect_unauthenticated");
+                    let awaiting = unauth.hello(&workdir2_path).await.expect("hello");
+                    assert_eq!(awaiting.directory(), workdir2_path);
+                    let challenge_path = awaiting.challenge_path();
+                    assert!(challenge_path.starts_with(&workdir2_path));
+                    let mut conn2 = awaiting.authenticate().await.expect("authenticate");
+                    assert_eq!(
+                        conn2
+                            .ping("staged")
+                            .await
+                            .expect("call")
+                            .expect("reply")
+                            .message,
+                        "staged"
+                    );
+
+                    // The handshake helper cleans up the challenge file.
+                    let mut entries = tokio::fs::read_dir(&workdir_path).await.unwrap();
+                    assert!(
+                        entries.next_entry().await.unwrap().is_none(),
+                        "challenge file should be removed by handshake"
+                    );
                 };
 
                 tokio::select! {
@@ -403,6 +1040,291 @@ mod tests {
                 }
             })
             .await;
+    }
+
+    /// Server-side `Hello` should reject a path that isn't in canonical form
+    /// (here: a path with a `..` component that resolves back to the same
+    /// directory). The error must point at the canonical equivalent so the
+    /// client can correct itself.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn hello_with_non_canonical_path_is_rejected() {
+        run_against_server(|socket_path| async move {
+            let workdir = TempDir::new().unwrap();
+            let canonical = workdir.path().canonicalize().unwrap();
+            // `<canonical>/../<basename>` resolves to `<canonical>` but isn't
+            // itself canonical: `Path::components()` preserves the `..`,
+            // unlike `.` which is normalised away during equality checks.
+            let basename = canonical.file_name().unwrap().to_owned();
+            let non_canonical = canonical.join("..").join(&basename);
+            assert_ne!(non_canonical, canonical, "test setup: paths must differ");
+            assert_eq!(
+                non_canonical.canonicalize().unwrap(),
+                canonical,
+                "test setup: non_canonical must resolve to canonical"
+            );
+
+            let mut raw = unix::connect(&socket_path).await.expect("raw connect");
+            let err = UnauthProxy::hello(&mut raw, non_canonical.to_str().unwrap())
+                .await
+                .expect("transport")
+                .expect_err("non-canonical path must be rejected");
+            match err {
+                EchoError::NonCanonicalDirectory { reason } => {
+                    assert!(
+                        reason.contains("directory FD resolves to"),
+                        "unexpected reason: {reason}"
+                    );
+                    assert!(
+                        reason.contains(canonical.to_str().unwrap()),
+                        "reason should name the canonical path: {reason}"
+                    );
+                }
+                other => panic!("expected NonCanonicalDirectory, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    /// Server-side `Hello` should reject a `.`-component path even though
+    /// `Path::eq` would consider it equal to the canonical form. We
+    /// compare via `OsStr` precisely to keep this strict.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn hello_with_curdir_component_is_rejected() {
+        run_against_server(|socket_path| async move {
+            let workdir = TempDir::new().unwrap();
+            let canonical = workdir.path().canonicalize().unwrap();
+            let dotted = canonical.join(".");
+            // Sanity: `Path::eq` *does* consider these equal (the bug we're
+            // guarding against), but `OsStr::eq` does not.
+            assert_eq!(dotted, canonical, "test premise: Path::eq normalises `.`");
+            assert_ne!(
+                dotted.as_os_str(),
+                canonical.as_os_str(),
+                "test premise: OsStr::eq does not"
+            );
+
+            let mut raw = unix::connect(&socket_path).await.expect("raw connect");
+            let err = UnauthProxy::hello(&mut raw, dotted.to_str().unwrap())
+                .await
+                .expect("transport")
+                .expect_err("`.`-component must be rejected");
+            assert!(
+                matches!(err, EchoError::NonCanonicalDirectory { .. }),
+                "expected NonCanonicalDirectory, got {err:?}"
+            );
+        })
+        .await;
+    }
+
+    /// Server-side `Hello` should reject a path that doesn't resolve at all,
+    /// surfacing the underlying I/O error.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn hello_with_unresolvable_path_is_rejected() {
+        run_against_server(|socket_path| async move {
+            let workdir = TempDir::new().unwrap();
+            let bogus = workdir.path().join("does-not-exist");
+            let mut raw = unix::connect(&socket_path).await.expect("raw connect");
+            let err = UnauthProxy::hello(&mut raw, bogus.to_str().unwrap())
+                .await
+                .expect("transport")
+                .expect_err("unresolvable path must be rejected");
+            match err {
+                EchoError::NonCanonicalDirectory { reason } => assert!(
+                    reason.contains("could not open"),
+                    "unexpected reason: {reason}"
+                ),
+                other => panic!("expected NonCanonicalDirectory, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    /// Directory-component swap defence (only catchable because cap-std
+    /// anchors the read to the directory FD captured at `Hello` time):
+    /// after `Hello` issues a challenge against `<workdir>`, an attacker
+    /// renames `<workdir>` away and puts a symlink with the same name
+    /// pointing at a parallel directory holding a forged challenge file.
+    /// The server must read the *original* directory's file (i.e. fail,
+    /// because the legitimate client never wrote anything) rather than the
+    /// decoy.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn authenticate_uses_dir_fd_not_repath() {
+        run_against_server(|socket_path| async move {
+            // Two siblings under one parent: `original` is what the client
+            // claims, `decoy` is the attacker's prepared replacement.
+            let parent = TempDir::new().unwrap();
+            let parent_path = parent.path().canonicalize().unwrap();
+            let original = parent_path.join("original");
+            let decoy = parent_path.join("decoy");
+            tokio::fs::create_dir(&original).await.unwrap();
+            tokio::fs::create_dir(&decoy).await.unwrap();
+
+            let mut raw = unix::connect(&socket_path).await.expect("raw connect");
+            let hello = UnauthProxy::hello(&mut raw, original.to_str().unwrap())
+                .await
+                .expect("transport")
+                .expect("hello accepted");
+
+            // Plant the forged challenge file in the decoy directory.
+            tokio::fs::write(
+                decoy.join(format!("pixi-serve-challenge-{}", hello.challenge)),
+                &hello.challenge,
+            )
+            .await
+            .unwrap();
+
+            // Swap: rename `original` away, replace it with a symlink to
+            // `decoy`. A path-based `open(<original>/<challenge>)` would
+            // now read the decoy file and authenticate — cap-std's FD
+            // anchor must prevent that.
+            let renamed = parent_path.join("original-moved-out-of-the-way");
+            tokio::fs::rename(&original, &renamed).await.unwrap();
+            tokio::fs::symlink(&decoy, &original).await.unwrap();
+
+            let err = UnauthProxy::authenticate(&mut raw)
+                .await
+                .expect("transport")
+                .expect_err("dir-swap attack must fail");
+            assert!(
+                matches!(err, EchoError::ChallengeFailed { .. }),
+                "expected ChallengeFailed, got {err:?}"
+            );
+        })
+        .await;
+    }
+
+    /// Symlink-swap defence: between `Hello` and `Authenticate` the client
+    /// (or anyone with write access to the workdir) replaces the challenge
+    /// file with a symlink that points at a file with the right content
+    /// elsewhere. The server must refuse rather than read through the link.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn authenticate_refuses_symlinked_challenge_file() {
+        run_against_server(|socket_path| async move {
+            let workdir = TempDir::new().unwrap();
+            let workdir_path = workdir.path().canonicalize().unwrap();
+            let mut raw = unix::connect(&socket_path).await.expect("raw connect");
+            let hello = UnauthProxy::hello(&mut raw, workdir_path.to_str().unwrap())
+                .await
+                .expect("transport")
+                .expect("hello accepted");
+
+            // Decoy file outside the workdir holding the right UUID — what
+            // the attacker would point the symlink at.
+            let elsewhere = TempDir::new().unwrap();
+            let decoy = elsewhere.path().canonicalize().unwrap().join("decoy");
+            tokio::fs::write(&decoy, &hello.challenge).await.unwrap();
+
+            // Plant the symlink where the challenge file would be.
+            let challenge_path =
+                workdir_path.join(format!("pixi-serve-challenge-{}", hello.challenge));
+            tokio::fs::symlink(&decoy, &challenge_path).await.unwrap();
+
+            let err = UnauthProxy::authenticate(&mut raw)
+                .await
+                .expect("transport")
+                .expect_err("authenticate via symlinked challenge must fail");
+            match err {
+                EchoError::ChallengeFailed { reason } => assert!(
+                    reason.contains("could not open"),
+                    "unexpected reason: {reason}"
+                ),
+                other => panic!("expected ChallengeFailed, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    /// Server-side `Authenticate` as the very first message must be rejected
+    /// with `NotAwaitingProof`: until `Hello` has been sent the connection is
+    /// in the initial state and has no challenge to verify.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn authenticate_before_hello_reports_not_awaiting_proof() {
+        run_against_server(|socket_path| async move {
+            let mut raw = unix::connect(&socket_path).await.expect("raw connect");
+            let err = UnauthProxy::authenticate(&mut raw)
+                .await
+                .expect("transport")
+                .expect_err("authenticate before hello must fail");
+            assert_eq!(err, EchoError::NotAwaitingProof);
+        })
+        .await;
+    }
+
+    /// Server-side `Authenticate` should fail with a `ChallengeFailed` whose
+    /// reason names the missing path when the client never wrote the file.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn authenticate_without_challenge_file_reports_missing() {
+        run_against_server(|socket_path| async move {
+            let workdir = TempDir::new().unwrap();
+            let workdir_path = workdir.path().canonicalize().unwrap();
+            let mut raw = unix::connect(&socket_path).await.expect("raw connect");
+            UnauthProxy::hello(&mut raw, workdir_path.to_str().unwrap())
+                .await
+                .expect("transport")
+                .expect("hello accepted");
+            let err = UnauthProxy::authenticate(&mut raw)
+                .await
+                .expect("transport")
+                .expect_err("authenticate without file must fail");
+            match err {
+                EchoError::ChallengeFailed { reason } => {
+                    assert!(
+                        reason.contains("could not open"),
+                        "unexpected reason: {reason}"
+                    );
+                    assert!(
+                        reason.contains("pixi-serve-challenge-"),
+                        "reason should name the challenge file: {reason}"
+                    );
+                }
+                other => panic!("expected ChallengeFailed, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    /// Server-side `Authenticate` should fail with a `ChallengeFailed` whose
+    /// reason flags wrong content when the file exists but holds the wrong
+    /// UUID.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn authenticate_with_wrong_content_reports_mismatch() {
+        run_against_server(|socket_path| async move {
+            let workdir = TempDir::new().unwrap();
+            let workdir_path = workdir.path().canonicalize().unwrap();
+            let mut raw = unix::connect(&socket_path).await.expect("raw connect");
+            let hello = UnauthProxy::hello(&mut raw, workdir_path.to_str().unwrap())
+                .await
+                .expect("transport")
+                .expect("hello accepted");
+            let challenge_path =
+                workdir_path.join(format!("pixi-serve-challenge-{}", hello.challenge));
+            // Write garbage instead of the issued UUID. Different length and
+            // different bytes — covers both the trim() and the equality check.
+            tokio::fs::write(&challenge_path, "not-the-right-uuid")
+                .await
+                .unwrap();
+
+            let err = UnauthProxy::authenticate(&mut raw)
+                .await
+                .expect("transport")
+                .expect_err("authenticate with bad content must fail");
+            match err {
+                EchoError::ChallengeFailed { reason } => assert!(
+                    reason.contains("wrong content"),
+                    "unexpected reason: {reason}"
+                ),
+                other => panic!("expected ChallengeFailed, got {other:?}"),
+            }
+        })
+        .await;
     }
 
     /// Walks through the env-variable branches of

@@ -10,11 +10,21 @@ repository.workspace = true
 version = "0.1.0"
 
 [dependencies]
+# Capability-bound filesystem API. `cap_std::fs::Dir` anchors the
+# challenge-file read to the directory FD captured at `Hello` time, so a
+# directory-component symlink swap between `Hello` and `Authenticate`
+# can't redirect the read.
+cap-std = { workspace = true }
 futures = { workspace = true }
+# `libc::O_NOFOLLOW` for the symlink-resistant challenge-file open. The flag
+# value differs per platform, so hard-coding is wrong.
+libc = { workspace = true }
+parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync"] }
 tracing = { workspace = true }
+uuid = { workspace = true }
 # `zlink`'s default features include `tracing`, which turns on zlink's
 # connection-layer span/event output through the same subscriber.
 zlink = { workspace = true }

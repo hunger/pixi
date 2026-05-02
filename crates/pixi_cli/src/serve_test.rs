@@ -1,13 +1,15 @@
 //! `pixi serve-test` — quick client-side smoke tests against a running
 //! `pixi serve`.
 //!
-//! Currently exposes a single `ping` subcommand that opens a varlink
-//! connection on the socket given via the global `--socket` flag, sends
-//! one `Ping` request, prints the echoed reply, and exits.
+//! Currently exposes a single `ping` subcommand. It opens a varlink
+//! connection on the socket given via the global `--socket` flag, completes
+//! the `Hello` / `Authenticate` handshake against the current working
+//! directory, sends one `Ping` request, prints the echoed reply, and exits.
+
+use std::path::Path;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, miette};
-use pixi_varlink::EchoProxy;
 
 use crate::GlobalOptions;
 
@@ -32,6 +34,7 @@ pub struct PingArgs {
     pub message: String,
 }
 
+#[tracing::instrument(level = "info", name = "pixi.serve-test", skip_all)]
 pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Result<()> {
     let socket = global_options.socket.as_deref().ok_or_else(|| {
         miette!(
@@ -41,15 +44,25 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
     })?;
 
     match args.command {
-        SubCommand::Ping(PingArgs { message }) => {
-            let mut conn = pixi_varlink::connect(socket).await.into_diagnostic()?;
-            match conn.ping(&message).await.into_diagnostic()? {
-                Ok(reply) => {
-                    println!("{}", reply.message);
-                    Ok(())
-                }
-                Err(err) => Err(miette!("server returned error: {err:?}")),
-            }
+        SubCommand::Ping(args) => ping(socket, args).await,
+    }
+}
+
+#[tracing::instrument(level = "info", name = "pixi.serve-test.ping", skip_all, fields(message = %args.message))]
+async fn ping(socket: &Path, args: PingArgs) -> miette::Result<()> {
+    // `connect` performs the Hello/Authenticate handshake against the cwd and
+    // only hands back a [`pixi_varlink::Connection`] once the server has
+    // accepted us; there is no way to call `ping` against the unauthenticated
+    // typestate.
+    let cwd = std::env::current_dir().into_diagnostic()?;
+    let mut conn = pixi_varlink::connect(socket, &cwd)
+        .await
+        .into_diagnostic()?;
+    match conn.ping(&args.message).await.into_diagnostic()? {
+        Ok(reply) => {
+            println!("{}", reply.message);
+            Ok(())
         }
+        Err(err) => Err(miette!("server returned error: {err:?}")),
     }
 }
