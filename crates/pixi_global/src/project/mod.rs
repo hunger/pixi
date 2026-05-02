@@ -56,7 +56,9 @@ use toml_edit::DocumentMut;
 use self::trampoline::{Configuration, ConfigurationParseError, Trampoline};
 use super::{
     BinDir, EnvRoot, StateChange, StateChanges,
-    common::{EnvironmentUpdate, get_install_changes, shortcuts_sync_status},
+    common::{
+        EnvironmentUpdate, contains_menuinst_document, get_install_changes, shortcuts_sync_status,
+    },
     install::find_binary_by_name,
     trampoline::{self, GlobalExecutable},
 };
@@ -1105,6 +1107,48 @@ impl Project {
         );
 
         state_changes |= create_executable_trampolines(&script_mapping, &prefix, env_name).await?;
+
+        Ok(state_changes)
+    }
+
+    /// Run the *client-side* post-install tail for `env_name`: register
+    /// menuinst shortcuts in the manifest (when `add_shortcuts` is
+    /// true), sync them to disk, sync shell completions, and persist
+    /// the manifest. Trampolines are deliberately *not* in this tail —
+    /// the daemon-routed install path writes them server-side, while
+    /// the local install path lays them down via
+    /// [`expose_executables_from_environment`](Self::expose_executables_from_environment)
+    /// before calling this. The split exists so the daemon path can
+    /// invoke just the local-state half without reaching into the
+    /// trampoline machinery.
+    ///
+    /// `shortcut_specs` are the user-requested top-level packages.
+    /// They drive shortcut detection: any package whose prefix record
+    /// carries a menuinst document gets a manifest entry. Pass an
+    /// empty slice (and `add_shortcuts = false`) when the caller has
+    /// no top-level packages to register, e.g. a no-op resync after
+    /// the env is already up to date.
+    pub async fn finalise_environment_no_trampolines(
+        &mut self,
+        env_name: &EnvironmentName,
+        add_shortcuts: bool,
+        shortcut_specs: &[GlobalSpec],
+    ) -> miette::Result<StateChanges> {
+        let mut state_changes = StateChanges::new_with_env(env_name.clone());
+
+        if add_shortcuts {
+            let prefix = self.environment_prefix(env_name).await?;
+            for spec in shortcut_specs {
+                let prefix_record = prefix.find_designated_package(spec.name()).await?;
+                if contains_menuinst_document(&prefix_record, prefix.root()) {
+                    self.manifest.add_shortcut(env_name, spec.name())?;
+                }
+            }
+            state_changes |= self.sync_shortcuts(env_name).await?;
+        }
+
+        state_changes |= self.sync_completions(env_name).await?;
+        self.manifest.save().await?;
 
         Ok(state_changes)
     }

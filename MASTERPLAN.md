@@ -477,21 +477,29 @@ path keeps using the existing combined function and is unaffected.
 
 **Files:**
 - `crates/pixi_global/src/project/mod.rs` — extract
-  `Project::finalise_environment_no_trampolines(&self, env_name, args,
-  specs) -> miette::Result<StateChanges>` covering `sync_completions`,
-  `sync_shortcuts`, and `manifest.save()`. Skip
-  `expose_executables_from_environment` / `create_executable_trampolines`
-  — those are the trampoline step.
+  `Project::finalise_environment_no_trampolines(&mut self, env_name,
+  add_shortcuts, shortcut_specs) -> miette::Result<StateChanges>`
+  covering `sync_shortcuts`, `sync_completions`, and `manifest.save()`.
+  Skip `expose_executables_from_environment` /
+  `create_executable_trampolines` — those are the trampoline step.
+  `&mut self` is required because the function calls
+  `manifest.add_shortcut` and `manifest.save`. The signature takes a
+  `bool` + `&[GlobalSpec]` rather than the CLI's `Args` so the
+  helper doesn't leak `pixi_cli` types into `pixi_global`.
 - `crates/pixi_cli/src/global/install.rs` — keep the existing
   `setup_environment` unchanged for the local code path; it still
-  invokes the full install + tail-with-trampolines.
+  invokes the full install + tail-with-trampolines. Step 6 will
+  rewrite it to delegate the tail to the new helper, removing the
+  ~20 lines of duplication.
 
 **Tests:**
-- Unit test against a manually staged prefix (or a symlink to one):
-  call `Project::finalise_environment_no_trampolines`. Assert manifest
-  gets a new env entry; assert NO files appear under `bin_dir`. Then
-  call the regular `setup_environment` and assert trampolines DO appear
-  — to lock in that the split is meaningful.
+- The function is direct delegation to already-tested methods
+  (`sync_shortcuts`, `sync_completions`, `manifest.save()`) and the
+  "no trampolines are written" property is read off the function body
+  (no call to `expose_executables_from_environment` /
+  `create_executable_trampolines`). Skip the unit test; existing
+  `pixi global install` integration tests will indirectly exercise it
+  once Step 6 rewires `setup_environment` to delegate.
 - Existing `pixi global install` integration tests pass unchanged
   (the local path's combined function isn't touched).
 
