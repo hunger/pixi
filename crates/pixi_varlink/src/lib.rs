@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, instrument, trace};
 use zlink::{ReplyError, Server, introspect, proxy, service, unix};
 
 /// Reverse-DNS interface name shared between the server and the client.
@@ -122,8 +123,10 @@ pub struct EchoService;
 
 #[service(interface = "dev.prefix.pixi.Echo")]
 impl EchoService {
+    #[instrument(level = "debug", skip(self), fields(len = message.len()))]
     async fn ping(&mut self, message: String) -> Result<PingReply, EchoError> {
         if message.is_empty() {
+            debug!("rejecting empty Ping message");
             Err(EchoError::EmptyMessage)
         } else {
             Ok(PingReply { message })
@@ -131,6 +134,7 @@ impl EchoService {
     }
 
     #[zlink(more)]
+    #[instrument(level = "debug", skip(self), fields(len = message.len(), more))]
     async fn long_ping(
         &self,
         more: bool,
@@ -178,6 +182,7 @@ impl EchoService {
         }
 
         let n = replies.len();
+        trace!(replies = n, "long_ping stream prepared");
         futures::stream::iter(
             replies
                 .into_iter()
@@ -192,11 +197,13 @@ impl EchoService {
 ///
 /// When binding, any pre-existing socket file at `socket_path` is removed
 /// first so that a stale file from a previous run does not block the bind.
+#[instrument(level = "info", skip_all, fields(path = %socket_path.display()))]
 pub async fn serve(socket_path: PathBuf) -> Result<(), Error> {
     let listener = match take_socket_activation_listener()? {
         Some(listener) => listener,
         None => {
             let _ = tokio::fs::remove_file(&socket_path).await;
+            info!(path = %socket_path.display(), "binding unix socket");
             unix::bind(&socket_path)?
         }
     };
@@ -204,14 +211,22 @@ pub async fn serve(socket_path: PathBuf) -> Result<(), Error> {
 }
 
 /// Serve the echo interface on a pre-built listener.
+#[instrument(level = "info", skip_all, fields(interface = INTERFACE))]
 pub async fn serve_on(listener: unix::Listener) -> Result<(), Error> {
+    info!("starting varlink server");
     let server = Server::new(listener, EchoService);
-    server.run().await?;
-    Ok(())
+    let result = server.run().await;
+    match &result {
+        Ok(()) => info!("varlink server stopped"),
+        Err(error) => debug!(?error, "varlink server stopped with error"),
+    }
+    Ok(result?)
 }
 
 /// Connect to a server previously started with [`serve`].
+#[instrument(level = "debug", skip_all, fields(path = %socket_path.display()))]
 pub async fn connect(socket_path: &Path) -> Result<unix::Connection, Error> {
+    debug!("connecting to varlink socket");
     Ok(unix::connect(socket_path).await?)
 }
 
@@ -235,10 +250,14 @@ static ACTIVATION_LISTENER_TAKEN: AtomicBool = AtomicBool::new(false);
 /// inherited file descriptor.
 ///
 /// [socket activation protocol]: https://www.freedesktop.org/software/systemd/man/sd_listen_fds.html
+#[instrument(level = "debug")]
 pub fn take_socket_activation_listener() -> Result<Option<unix::Listener>, Error> {
     let pid = match std::env::var("LISTEN_PID") {
         Ok(v) => v,
-        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotPresent) => {
+            debug!("LISTEN_PID not set, no socket activation");
+            return Ok(None);
+        }
         Err(e) => {
             return Err(Error::SocketActivation(format!(
                 "LISTEN_PID is not valid UTF-8: {e}"
@@ -261,6 +280,7 @@ pub fn take_socket_activation_listener() -> Result<Option<unix::Listener>, Error
         .map_err(|e| Error::SocketActivation(format!("LISTEN_FDS is not a number: {e}")))?;
 
     if count == 0 {
+        debug!("LISTEN_FDS=0; no socket activation");
         return Ok(None);
     }
     if count != 1 {
@@ -274,6 +294,11 @@ pub fn take_socket_activation_listener() -> Result<Option<unix::Listener>, Error
             "socket-activation listener has already been taken".into(),
         ));
     }
+
+    info!(
+        fd = SD_LISTEN_FDS_START,
+        "adopting systemd-activated socket"
+    );
 
     // SAFETY: systemd guarantees that FD `SD_LISTEN_FDS_START` is open and refers to a listening
     // socket whenever `LISTEN_PID` matches our PID and `LISTEN_FDS == 1`. The atomic guard above

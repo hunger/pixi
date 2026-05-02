@@ -50,10 +50,13 @@ fn select_mode(args: &Args, config: &Config) -> miette::Result<Mode> {
     ))
 }
 
+#[tracing::instrument(level = "info", name = "pixi.serve", skip_all)]
 pub async fn execute(args: Args) -> miette::Result<()> {
-    match select_mode(&args, &Config::load_global())? {
+    let mode = select_mode(&args, &Config::load_global())?;
+    tracing::debug!(?mode, "pixi serve resolved listening mode");
+    match mode {
         Mode::Bind(path) => {
-            tracing::info!("pixi serve: binding {}", path.display());
+            tracing::info!(path = %path.display(), "pixi serve: binding socket");
             pixi_varlink::serve(path).await.into_diagnostic()
         }
         Mode::Activation => {
