@@ -2,26 +2,51 @@
 #
 # Run a `pixi` subcommand against a freshly-spawned `pixi serve`.
 #
-#   scripts/pixi_serve_loopback <pixi args...>
+#   scripts/pixi_serve_loopback [<server-args>... --] <client-args>...
 #
-# Spawns `pixi serve --socket $tmp/pixi.sock` in the background, waits for the
-# socket to appear, then runs `pixi <args...> --socket $tmp/pixi.sock` against
-# it. Each line is prefixed with `SERVER (out): ` / `SERVER (err): ` for the
+# Spawns `pixi <server-args> serve --socket $tmp/pixi.sock` in the background,
+# waits for the socket to appear, then runs
+# `pixi <client-args> --socket $tmp/pixi.sock` against it.
+#
+# Without a `--` separator, *all* arguments go to the client and the server is
+# spawned with no extra arguments — i.e. the previous behaviour. To pass flags
+# (like `-vv`) through to the server, separate them with `--`:
+#
+#   PIXI=./target/debug/pixi scripts/pixi_serve_loopback -vv -- serve-test ping
+#
+# Each line is prefixed with `SERVER (out): ` / `SERVER (err): ` for the
 # server and `CLIENT (out): ` / `CLIENT (err): ` for the client so the two
 # processes' output channels can be told apart in interleaved output. The
 # server is killed and the tempdir removed on exit.
 #
 # Override which binary is invoked by setting `$PIXI` (default: `pixi` from
-# PATH). Useful for development:
-#
-#   PIXI=./target/debug/pixi scripts/pixi_serve_loopback ...
+# PATH).
 #
 set -euo pipefail
 
 readonly PIXI="${PIXI:-pixi}"
 
-if (($# == 0)); then
-    echo "usage: $(basename "$0") <pixi-args...>" >&2
+# Split $@ on `--`. Without the separator, everything is for the client and
+# the server gets no extra args (preserves the original calling convention).
+server_extra_args=()
+client_args=()
+seen_separator=false
+for arg in "$@"; do
+    if "$seen_separator"; then
+        client_args+=("$arg")
+    elif [[ "$arg" == "--" ]]; then
+        seen_separator=true
+    else
+        server_extra_args+=("$arg")
+    fi
+done
+if ! "$seen_separator"; then
+    client_args=("${server_extra_args[@]}")
+    server_extra_args=()
+fi
+
+if (( ${#client_args[@]} == 0 )); then
+    echo "usage: $(basename "$0") [<server-args>... --] <client-args>..." >&2
     exit 2
 fi
 
@@ -73,7 +98,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$PIXI" serve --socket "$socket" \
+# Server-extra args go *before* `serve` so global flags (e.g. `-vv`) parse
+# in their conventional position; clap accepts them later too, but this is
+# the form humans copy out of the help text.
+"$PIXI" "${server_extra_args[@]}" serve --socket "$socket" \
     > >(prefix_stream "$out_server") \
     2> >(prefix_stream "$err_server" >&2) &
 server_pid=$!
@@ -101,7 +129,7 @@ fi
 # Run the client. `set -e` would bail on a non-zero exit from the client, but
 # we want to forward the exit code through cleanup, so disarm it here.
 set +e
-"$PIXI" "$@" --socket "$socket" \
+"$PIXI" "${client_args[@]}" --socket "$socket" \
     > >(prefix_stream "$out_client") \
     2> >(prefix_stream "$err_client" >&2)
 client_status=$?
