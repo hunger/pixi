@@ -35,21 +35,33 @@ The local install path has no such guard: two concurrent
 invocations race on the manifest file. The daemon's behaviour is
 strictly more conservative.
 
-### Source-built packages are refused
+### Source-built packages are built client-side
 
 Specs that point at a path, URL, or git repository (e.g.
 `pixi global install ./mypkg`, `--with git+https://github.com/...`)
-need a build step. The daemon has no view of the client's
-filesystem (so path sources are unresolvable by design) and
-doesn't run the client's `BackendOverride` (so URL/git source
-builds can't share the test mocks the client side uses), so
-attempting to install one through `--socket` is refused upfront
-with a miette error pointing the user to drop `--socket`. The
-daemon also defends server-side, returning
-`InstallFailure::UnsupportedSourceSpec` when any source-typed
-`PixiSpec` reaches `run_install` — useful for non-conforming
-clients. Source-built packages should be installed locally for
-now; supporting them over the daemon is a future-work item.
+need a build step. The daemon doesn't have one — it has no view of
+the client's filesystem (path sources are unreachable) and doesn't
+run the client's `BackendOverride` (the in-memory build-backend
+mocks tests inject would not match across processes).
+
+The client handles this by running its local
+`pixi_command_dispatcher` over each source spec to produce a
+`.conda` artefact, then shipping the artefact path along with the
+resulting `RepoDataRecord` to the daemon as
+`InstallRequest::extra_records`. The daemon extracts each artefact
+into its package cache and splices the record into the install
+transaction; the source build's runtime deps are folded into
+`InstallRequest::specs` so the daemon's solve resolves the binary
+closure even though the source specs themselves are not on the
+wire.
+
+End-to-end this means the client pays for the source build (the
+same cost a local install would incur), and the daemon's shared
+cache still benefits multi-machine deployments for the binary
+closure. The daemon's server-side defense
+(`InstallFailure::UnsupportedSourceSpec`) stays in place to reject
+source specs from non-conforming clients that ship them through
+`request.specs` instead of building them locally.
 
 ### `--force-reinstall` clobbers the local prefix
 
