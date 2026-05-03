@@ -232,6 +232,121 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Wire request for the `Uninstall` RPC. Removes
+/// `<data>/<HASH>/` for the named env on the daemon. Client-side
+/// state (`~/.pixi/envs/<env>`, the manifest entry, trampolines,
+/// shortcuts, completions) is handled by the client before or
+/// after calling this — the daemon owns only its data dir.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct UninstallRequest {
+    /// Name of the environment whose `<data>/<HASH>/` prefix to
+    /// remove. Must match the [`pixi_global::EnvironmentName`]
+    /// shape — see [`validate_env_name`].
+    pub env_name: String,
+}
+
+/// Terminal reply from `Uninstall`. The variant naming mirrors
+/// [`InstallReply`]'s success/failed split so client error
+/// handling stays uniform.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UninstallReply {
+    /// `<data>/<HASH>/` was removed (or was already absent and the
+    /// caller didn't ask to fail in that case).
+    Success,
+    /// The daemon refused or failed the uninstall.
+    Failed {
+        /// Why the uninstall didn't proceed.
+        error: UninstallFailure,
+    },
+}
+
+/// Why an `Uninstall` RPC failed. Mirrors the shape of
+/// [`InstallFailure`] for the variants that are common to both
+/// methods (`NotAuthenticated`, `ServerNotConfigured`,
+/// `InvalidEnvName`); adds an `EnvNotFound` for "no such
+/// `<data>/<HASH>/` to remove" and a catch-all `RemoveFailed` for
+/// I/O errors.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum UninstallFailure {
+    /// The connection has not completed the `Hello` /
+    /// `Authenticate` handshake.
+    NotAuthenticated,
+    /// `pixi serve` was started without `--data` / `--cache`; the
+    /// uninstall RPC has nothing to remove.
+    ServerNotConfigured {
+        /// Operator-facing hint identical to install's.
+        hint: String,
+    },
+    /// `env_name` doesn't match the [`pixi_global::EnvironmentName`]
+    /// shape.
+    InvalidEnvName {
+        /// Echo of the offending name.
+        name: String,
+        /// Concrete reason from
+        /// [`pixi_global::EnvironmentName::from_str`].
+        reason: String,
+    },
+    /// `<data>/<HASH>/` does not exist on the daemon — either the
+    /// env was never installed via this daemon or a previous
+    /// uninstall already removed it.
+    EnvNotFound {
+        /// Echo of the env name.
+        env_name: String,
+    },
+    /// Catch-all for I/O / lock failures during removal. The
+    /// caller (and any user-facing surface) can show `reason`
+    /// verbatim.
+    RemoveFailed {
+        /// Free-form reason; safe to surface to the user.
+        reason: String,
+    },
+}
+
+/// Drive an `Uninstall` request: take the per-`(client, env)`
+/// install lock so a concurrent install can't race the removal,
+/// then `remove_dir_all` the matching `<data>/<HASH>/` directory.
+///
+/// Returns `Ok(())` on success and on
+/// [`UninstallFailure::EnvNotFound`] when the prefix was already
+/// gone — the second is communicated via the returned error so the
+/// client can decide whether to surface "no-op" or "removed";
+/// today's CLI dispatch surfaces both as success (idempotent) and
+/// only errors on I/O failures.
+pub(crate) async fn run_uninstall(
+    cfg: &ServerConfig,
+    auth_path: &Path,
+    request: &UninstallRequest,
+) -> Result<(), UninstallFailure> {
+    let hash = env_hash(&cfg.salt, auth_path, &request.env_name);
+    let prefix_path = cfg.data.join(&hash);
+
+    // Hold the same per-HASH lock the install path uses so a
+    // concurrent install can't materialise a half-removed prefix.
+    // `try_lock` rather than `lock`: if an install is running, fail
+    // loudly with `RemoveFailed` instead of silently waiting.
+    let lock = cfg.install_lock(&hash);
+    let _guard = lock
+        .try_lock_owned()
+        .map_err(|_| UninstallFailure::RemoveFailed {
+            reason: format!(
+                "install in flight for env {:?}; retry once it completes",
+                request.env_name
+            ),
+        })?;
+
+    if !prefix_path.exists() {
+        return Err(UninstallFailure::EnvNotFound {
+            env_name: request.env_name.clone(),
+        });
+    }
+    fs_err::remove_dir_all(&prefix_path).map_err(|e| UninstallFailure::RemoveFailed {
+        reason: format!("could not remove {}: {e}", prefix_path.display()),
+    })?;
+    Ok(())
+}
+
 /// One streaming reply from `Install`.
 ///
 /// `Install` is declared `#[zlink(more)]` so the body can interleave
@@ -1176,5 +1291,79 @@ mod tests {
             }
             other => panic!("expected InstallFailed, got {other:?}"),
         }
+    }
+
+    /// Every `UninstallFailure` variant survives a serde round-trip
+    /// through the wire form. Pins the variant set so a future tag
+    /// rename or field addition surfaces here before it ships.
+    #[test]
+    fn uninstall_failure_round_trips_every_variant() {
+        for original in [
+            UninstallFailure::NotAuthenticated,
+            UninstallFailure::ServerNotConfigured {
+                hint: "pass --data".to_string(),
+            },
+            UninstallFailure::InvalidEnvName {
+                name: "foo!".to_string(),
+                reason: "bad char".to_string(),
+            },
+            UninstallFailure::EnvNotFound {
+                env_name: "foo".to_string(),
+            },
+            UninstallFailure::RemoveFailed {
+                reason: "EACCES".to_string(),
+            },
+        ] {
+            let bytes = serde_json::to_vec(&original).unwrap();
+            let parsed: UninstallFailure = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(original, parsed);
+        }
+    }
+
+    /// `run_uninstall` returns `EnvNotFound` when the prefix
+    /// directory doesn't exist. Surfaced as a typed variant so
+    /// idempotent client-side handling (treat-as-success) can
+    /// pattern-match without parsing a free-form reason string.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_uninstall_reports_not_found_when_prefix_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ServerConfig::from_parts(tmp.path().join("data"), tmp.path().join("cache"), None)
+            .unwrap();
+        fs_err::create_dir_all(&cfg.data).unwrap();
+        let request = UninstallRequest {
+            env_name: "ghost".to_string(),
+        };
+        let err = run_uninstall(&cfg, Path::new("/home/alice/.pixi/envs"), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            UninstallFailure::EnvNotFound {
+                env_name: "ghost".to_string()
+            }
+        );
+    }
+
+    /// `run_uninstall` removes the per-HASH prefix when it exists,
+    /// and the data dir survives (only the prefix subtree goes).
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_uninstall_removes_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ServerConfig::from_parts(tmp.path().join("data"), tmp.path().join("cache"), None)
+            .unwrap();
+        fs_err::create_dir_all(&cfg.data).unwrap();
+        let auth_path = Path::new("/home/alice/.pixi/envs");
+        let env_name = "foo";
+        let hash = env_hash(&cfg.salt, auth_path, env_name);
+        let prefix = cfg.data.join(&hash);
+        // Plant a prefix with one file in it.
+        fs_err::create_dir_all(prefix.join("conda-meta")).unwrap();
+        fs_err::write(prefix.join("conda-meta").join("marker"), b"hi").unwrap();
+        let request = UninstallRequest {
+            env_name: env_name.to_string(),
+        };
+        run_uninstall(&cfg, auth_path, &request).await.unwrap();
+        assert!(!prefix.exists(), "prefix should be removed");
+        assert!(cfg.data.exists(), "data dir should survive");
     }
 }

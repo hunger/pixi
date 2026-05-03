@@ -31,7 +31,8 @@ mod wire_reporter;
 
 pub use install::{
     ExtraRecord, InstallChangeWire, InstallFailure, InstallReply, InstallRequest, PackageChange,
-    SALT_LEN, ServerConfig, ServerConfigError, TransactionSummary, env_hash, validate_env_name,
+    SALT_LEN, ServerConfig, ServerConfigError, TransactionSummary, UninstallFailure,
+    UninstallReply, UninstallRequest, env_hash, validate_env_name,
 };
 pub use reporter_wire::{
     CondaSolveEnvWire, InstallEnvWire, LoggingReporterClient, PixiSolveEnvWire, ReporterCall,
@@ -44,6 +45,7 @@ use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -205,6 +207,11 @@ trait AuthProxy {
         &mut self,
         request: InstallRequest,
     ) -> zlink::Result<impl futures::Stream<Item = zlink::Result<Result<InstallReply, EchoError>>>>;
+
+    async fn uninstall(
+        &mut self,
+        request: UninstallRequest,
+    ) -> zlink::Result<Result<UninstallReply, EchoError>>;
 }
 
 /// Per-connection auth state, tracked by zlink's connection id.
@@ -670,6 +677,45 @@ where
         call_stream.chain(terminal).boxed()
     }
 
+    /// Remove `<data>/<HASH>/` for the named env. Client-side state
+    /// (`~/.pixi/envs/<env>`, manifest entry, trampolines, shortcuts,
+    /// completions) is the client's responsibility — the daemon
+    /// only owns its data dir. Single non-streaming reply.
+    #[instrument(level = "debug", skip(self, conn), fields(conn_id = conn.id(), env = %request.env_name))]
+    async fn uninstall(
+        &self,
+        request: UninstallRequest,
+        #[zlink(connection)] conn: &mut zlink::Connection<Sock>,
+    ) -> Result<UninstallReply, EchoError> {
+        // `require_authenticated` returns `EchoError::NotAuthenticated`
+        // on miss; surface it as the connection-level error so the
+        // typestate stays in sync with the rest of the post-handshake
+        // methods.
+        let directory = self.require_authenticated(conn.id())?;
+        let cfg = match self.install_config.clone() {
+            Some(cfg) => cfg,
+            None => {
+                return Ok(UninstallReply::Failed {
+                    error: UninstallFailure::ServerNotConfigured {
+                        hint: SERVE_NOT_CONFIGURED_HINT.to_string(),
+                    },
+                });
+            }
+        };
+        if let Err(err) = pixi_global::EnvironmentName::from_str(&request.env_name) {
+            return Ok(UninstallReply::Failed {
+                error: UninstallFailure::InvalidEnvName {
+                    name: request.env_name.clone(),
+                    reason: err.to_string(),
+                },
+            });
+        }
+        match install::run_uninstall(&cfg, &directory, &request).await {
+            Ok(()) => Ok(UninstallReply::Success),
+            Err(error) => Ok(UninstallReply::Failed { error }),
+        }
+    }
+
     #[zlink(more)]
     #[instrument(level = "debug", skip(self, conn), fields(conn_id = conn.id(), len = message.len(), more))]
     async fn long_ping(
@@ -990,6 +1036,20 @@ impl Connection {
     {
         trace!("calling Install");
         AuthProxy::install(&mut self.inner, request).await
+    }
+
+    /// Remove `<data>/<HASH>/` for the named env on the daemon.
+    /// Returns the terminal [`UninstallReply`] (success or typed
+    /// failure). Client-side cleanup of `~/.pixi/envs/<env>`,
+    /// trampolines, manifest entries, etc. is the caller's job —
+    /// the daemon owns only its data dir.
+    #[instrument(level = "debug", skip(self), fields(directory = %self.directory.display(), env = %request.env_name))]
+    pub async fn uninstall(
+        &mut self,
+        request: UninstallRequest,
+    ) -> zlink::Result<Result<UninstallReply, EchoError>> {
+        trace!("calling Uninstall");
+        AuthProxy::uninstall(&mut self.inner, request).await
     }
 }
 

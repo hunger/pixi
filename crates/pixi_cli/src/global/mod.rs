@@ -63,17 +63,17 @@ pub struct Args {
 
 /// Maps global command enum variants to their function handlers.
 ///
-/// `global_options` is forwarded so `pixi global install` and
-/// `pixi global update` can consult the daemon-routing `--socket`
-/// flag; the remaining subcommands ignore it (the panic guard in
-/// `crate::execute_command` still rejects `--socket` against any
-/// other global subcommand).
+/// `global_options` is forwarded so `pixi global install`,
+/// `pixi global update`, and `pixi global uninstall` can consult
+/// the daemon-routing `--socket` flag; the remaining subcommands
+/// ignore it (the panic guard in `crate::execute_command` still
+/// rejects `--socket` against any other global subcommand).
 pub async fn execute(cmd: Args, global_options: &GlobalOptions) -> miette::Result<()> {
     match cmd.command {
         Command::Add(args) => add::execute(args).await?,
         Command::Edit(args) => edit::execute(args).await?,
         Command::Install(args) => install::execute(args, global_options).await?,
-        Command::Uninstall(args) => uninstall::execute(args).await?,
+        Command::Uninstall(args) => uninstall::execute(args, global_options).await?,
         Command::Remove(args) => remove::execute(args).await?,
         Command::List(args) => list::execute(args).await?,
         Command::Sync(args) => sync::execute(args).await?,

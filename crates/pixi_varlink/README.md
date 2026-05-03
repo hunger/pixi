@@ -1,9 +1,10 @@
 # pixi_varlink
 
 Varlink IPC server and client used by `pixi serve`. The server is the
-daemon-side surface behind `pixi global install --socket <PATH>` and
-`pixi global update --socket <PATH>`; clients on the same host can
-share the daemon's `data` and `cache` directories, paying the
+daemon-side surface behind `pixi global install --socket <PATH>`,
+`pixi global update --socket <PATH>`, and
+`pixi global uninstall --socket <PATH>`; clients on the same host
+can share the daemon's `data` and `cache` directories, paying the
 solve+download cost only once across machines/users.
 
 The wire protocol is built on the [`zlink`](https://crates.io/crates/zlink)
@@ -13,11 +14,26 @@ authorization is rooted in that directory.
 
 ## Daemon vs. local: behavioural differences
 
-`pixi global install` and `pixi global update` produce the same
-filesystem artefacts (manifest, exposed mappings, trampolines,
-shortcuts, completions) whether run locally or routed through
-`pixi serve`. A handful of behaviours diverge by design — they are
-listed here so users opting into `--socket` aren't surprised.
+`pixi global install`, `pixi global update`, and
+`pixi global uninstall` produce the same filesystem artefacts
+(manifest, exposed mappings, trampolines, shortcuts, completions)
+whether run locally or routed through `pixi serve`. A handful of
+behaviours diverge by design — they are listed here so users
+opting into `--socket` aren't surprised.
+
+### `pixi global uninstall` removes the daemon's prefix too
+
+When `--socket` is set, after the local cleanup (manifest entry,
+`~/.pixi/envs/<env>`, trampolines, shortcuts, completions), the
+client sends an `Uninstall` RPC so the daemon can `remove_dir_all`
+its `<data>/<HASH>/` for that env. The local cleanup is the
+authoritative outcome — if the daemon-side removal fails (e.g.
+permission error, daemon restarted) the user-visible env is still
+gone and the failure surfaces only as a `tracing::warn!`. A
+`UninstallFailure::EnvNotFound` from the daemon (the prefix was
+already absent — typical when the user installed locally and is
+now uninstalling via a daemon that has never seen this env) is
+treated as success silently.
 
 ### Concurrent same-env install rejected
 
