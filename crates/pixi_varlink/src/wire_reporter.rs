@@ -164,8 +164,13 @@ impl CondaSolveReporter for WireReporter {
 impl GitCheckoutReporter for WireReporter {
     fn on_queued(&self, env: &RepositoryReference) -> OperationId {
         let id = self.allocate_id();
+        // Match what the local `GitCheckoutProgress` reads from the
+        // ref when rendering the bar: the URL's `Display` form and
+        // `GitReference`'s `Display` form. Cheap to format
+        // server-side, lossless for rendering purposes.
         self.emit(ReporterCall::GitCheckoutOnQueued {
-            repo: format!("{env:?}"),
+            url: env.url.as_url().to_string(),
+            reference: env.reference.to_string(),
             id: id.0,
         });
         id

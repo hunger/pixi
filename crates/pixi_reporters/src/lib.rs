@@ -1,5 +1,5 @@
 pub mod download_verify_reporter;
-mod git;
+pub mod git;
 pub mod main_progress_bar;
 mod release_notes;
 pub mod repodata_reporter;

@@ -31,18 +31,23 @@
 //!   `InstallOnLinkStart` / `InstallOnUnlinkStart` /
 //!   `InstallOnTransactionOperationComplete`.
 //!
+//! `GitCheckoutOn*` events drive a one-spinner-per-checkout bar
+//! mirroring `GitCheckoutProgress`'s UX (prefix `fetching git
+//! dependencies`, message `checking out <url>@<reference>`).
+//!
 //! Reporter callbacks `TopLevelProgress` doesn't render today —
 //! `PixiInstallOn*`, `InstantiateBackendOn*`, `SourceMetadataOn*`,
-//! `SourceRecordOn*`, `BuildBackendMetadataOn*`, `UrlCheckoutOn*`,
-//! `GitCheckoutOn*` — are explicit no-ops here too, to avoid
-//! drifting from the local UX.
+//! `SourceRecordOn*`, `BuildBackendMetadataOn*`, `UrlCheckoutOn*` —
+//! are explicit no-ops here too, to avoid drifting from the local UX.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
-use indicatif::MultiProgress;
+use indicatif::{MultiProgress, ProgressBar};
 use pixi_progress::ProgressBarPlacement;
 use pixi_reporters::download_verify_reporter::BuildDownloadVerifyReporter;
+use pixi_reporters::git::GitCheckoutProgress;
 use pixi_reporters::main_progress_bar::MainProgressBar;
 use pixi_reporters::sync_reporter::PackageWithSize;
 use pixi_varlink::{ReporterCall, ReporterClient};
@@ -91,6 +96,14 @@ struct State {
     /// Wire `BackendSourceBuildOnQueued.id` → prep-bar tracker id.
     /// Source builds drive the same prep bar as cache prep.
     source_build_to_prep: HashMap<u64, usize>,
+
+    /// Wire `GitCheckoutOnQueued.id` → cached `(url, reference)`
+    /// strings, stashed at `OnQueued` and read again at `OnStarted`
+    /// to label the spinner.
+    git_pending: HashMap<u64, (String, String)>,
+    /// Wire `GitCheckoutOnQueued.id` → live spinner bar. Created on
+    /// Started, finished and removed on Finished.
+    git_bars: HashMap<u64, ProgressBar>,
 }
 
 impl WireReporterClient {
@@ -365,14 +378,38 @@ impl ReporterClient for WireReporterClient {
                 }
             }
 
+            // ── Git checkouts: one spinner per fetch, prefix
+            //    "fetching git dependencies" with a per-checkout
+            //    message naming the URL + ref. Mirrors the local
+            //    `GitCheckoutProgress` UX. ────────────────────────────
+            ReporterCall::GitCheckoutOnQueued {
+                url, reference, id, ..
+            } => {
+                self.state().git_pending.insert(id, (url, reference));
+            }
+            ReporterCall::GitCheckoutOnStarted { id } => {
+                let pending = self.state().git_pending.remove(&id);
+                if let Some((url, reference)) = pending {
+                    let pb = self.multi.add(ProgressBar::hidden());
+                    pb.set_style(GitCheckoutProgress::spinner_style());
+                    pb.set_prefix("fetching git dependencies");
+                    pb.set_message(format!("checking out {url}@{reference}"));
+                    pb.enable_steady_tick(Duration::from_millis(100));
+                    self.state().git_bars.insert(id, pb);
+                }
+            }
+            ReporterCall::GitCheckoutOnFinished { id } => {
+                if let Some(pb) = self.state().git_bars.remove(&id) {
+                    pb.finish_and_clear();
+                }
+                self.state().git_pending.remove(&id);
+            }
+
             // ── Reporter callbacks the local `TopLevelProgress`
             //    doesn't render today: mirror its no-op behaviour. ────
             ReporterCall::PixiInstallOnQueued { .. }
             | ReporterCall::PixiInstallOnStarted { .. }
             | ReporterCall::PixiInstallOnFinished { .. }
-            | ReporterCall::GitCheckoutOnQueued { .. }
-            | ReporterCall::GitCheckoutOnStarted { .. }
-            | ReporterCall::GitCheckoutOnFinished { .. }
             | ReporterCall::UrlCheckoutOnQueued { .. }
             | ReporterCall::UrlCheckoutOnStarted { .. }
             | ReporterCall::UrlCheckoutOnFinished { .. }
@@ -816,25 +853,66 @@ mod tests {
             id: 1,
         });
         client.on_call(ReporterCall::GitCheckoutOnQueued {
-            repo: "ignored-repo".into(),
+            url: "https://example.test/repo.git".into(),
+            reference: "HEAD".into(),
             id: 1,
         });
         h.dump("no-op variants");
 
         let frames = h.frames();
         for frame in &frames {
-            for needle in [
-                "ignored-env",
-                "ignored-backend-spec",
-                "ignored-source-rec",
-                "ignored-repo",
-            ] {
+            for needle in ["ignored-env", "ignored-backend-spec", "ignored-source-rec"] {
                 assert!(
                     !frame.contains(needle),
                     "no-op variant leaked {needle} into a frame: {frame:?}"
                 );
             }
         }
+    }
+
+    /// Git checkout flow: `OnQueued` stashes the (url, reference)
+    /// pair without drawing; `OnStarted` adds a spinner bar with the
+    /// `fetching git dependencies` prefix and a `checking out
+    /// <url>@<ref>` message; `OnFinished` clears it. Mirrors what
+    /// `GitCheckoutProgress` does in the local install path.
+    #[test]
+    fn git_checkout_renders_spinner_with_url_and_ref() {
+        let (client, h) = renderer_with_capture(120);
+
+        client.on_call(ReporterCall::GitCheckoutOnQueued {
+            url: "https://example.test/foo.git".into(),
+            reference: "branch:main".into(),
+            id: 7,
+        });
+        // Queue alone draws nothing — bar only appears once started.
+        let queued_frames = h.frames();
+        assert!(
+            !queued_frames.iter().any(|f| f.contains("fetching git")),
+            "queue alone shouldn't draw; frames: {queued_frames:?}"
+        );
+
+        client.on_call(ReporterCall::GitCheckoutOnStarted { id: 7 });
+        h.dump("after git checkout started");
+        let frames = h.frames();
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.contains("fetching git dependencies")),
+            "expected git bar prefix; frames: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.contains("https://example.test/foo.git") && f.contains("branch:main")),
+            "expected url@reference message; frames: {frames:?}"
+        );
+
+        client.on_call(ReporterCall::GitCheckoutOnFinished { id: 7 });
+        h.dump("after git checkout finished");
+        // No assertion on post-finish frames — `finish_and_clear`
+        // erases the bar; what matters is the call doesn't panic
+        // and removes internal state (an `OnFinished` arm relies on
+        // the bar having been removed from `git_bars`).
     }
 
     /// Out-of-order events (`InstallOnLinkStart` for a `None` slot)

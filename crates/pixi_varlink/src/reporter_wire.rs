@@ -95,9 +95,16 @@ pub enum ReporterCall {
 
     // ── GitCheckoutReporter ──
     GitCheckoutOnQueued {
-        /// `Debug` of the `RepositoryReference`. Heavy and not
-        /// natively serialisable; rendering renders the string verbatim.
-        repo: String,
+        /// Repository URL the checkout is fetching, as the client
+        /// sees it (the underlying `RepositoryUrl` rendered via its
+        /// `Url`'s `Display` — strips query/fragment per
+        /// `pixi_git::resolver::RepositoryUrl`'s contract).
+        url: String,
+        /// Branch / tag / commit / `DefaultBranch` rendered through
+        /// `GitReference`'s `Display` impl. Used together with `url`
+        /// for the bar's "checking out {url}@{reference}" message,
+        /// matching the local `GitCheckoutProgress` UX.
+        reference: String,
         id: u64,
     },
     GitCheckoutOnStarted {
