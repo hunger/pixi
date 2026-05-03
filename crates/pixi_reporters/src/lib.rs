@@ -1,8 +1,8 @@
-mod download_verify_reporter;
+pub mod download_verify_reporter;
 mod git;
 pub mod main_progress_bar;
 mod release_notes;
-mod repodata_reporter;
+pub mod repodata_reporter;
 pub mod sync_reporter;
 pub mod uv_reporter;
 

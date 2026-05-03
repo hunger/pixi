@@ -170,7 +170,12 @@ pub enum ReporterCall {
 
     // ── BackendSourceBuildReporter ──
     BackendSourceBuildOnQueued {
-        env: String,
+        /// Name of the package being source-built. Carries
+        /// `env.name.as_source()` from the server's
+        /// `BackendSourceBuildSpec`; the local install path's
+        /// `SyncReporter` reads exactly this string when queueing
+        /// the "building <pkg>" entry on the prep bar.
+        package: String,
         id: u64,
     },
     BackendSourceBuildOnStarted {

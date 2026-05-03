@@ -277,7 +277,11 @@ impl BackendSourceBuildReporter for WireReporter {
     fn on_queued(&self, env: &BackendSourceBuildSpec) -> OperationId {
         let id = self.allocate_id();
         self.emit(ReporterCall::BackendSourceBuildOnQueued {
-            env: format!("{env:?}"),
+            // Match what `SyncReporter::on_queued` reads from the
+            // spec: the package name as a source-style string. The
+            // client's prep bar uses it as the "building <pkg>"
+            // entry label.
+            package: env.name.as_source().to_string(),
             id: id.0,
         });
         id

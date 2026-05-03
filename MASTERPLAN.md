@@ -640,9 +640,25 @@ filling. The frame-sequence guard catches the three classic
 draws, bar gets stuck on the first state. Verified by deliberately
 breaking the renderer and watching the assertions fire.
 
-**Still deferred (v3+).** Cache-prep / download / source-build /
-git-checkout bars (the rest of `TopLevelProgress`'s coverage), and
-the fixture-based snapshot test described below.
+**v3 status (done).** `WireReporterClient` now drives every bar
+`TopLevelProgress` shows for a binary install — `solving`,
+`fetching repodata`, `preparing packages`, `installing`. Cache prep
+(`InstallOn{PopulateCache, Validate, Download}*`) and source builds
+(`BackendSourceBuildOn*`) share the prep bar via
+`BuildDownloadVerifyReporter`'s `on_entry_*` and `on_build_*` APIs
+(matching `SyncReporter`'s composition). Conda-solve nesting under
+pixi-solve uses `ReporterContextWire::SolvePixi` to alias bar
+trackers, mirroring the local path's id-reuse trick. 9 frame-based
+renderer tests cover every bar end-to-end including monotonic-order
+guards on the counter sequence; `cargo test -- --nocapture` shows
+the bars visibly fill.
+
+**Still deferred.** `GitCheckoutOn*` rendering (would need
+`GitCheckoutProgress` to accept a wire-friendly URL/ref pair, or
+inventing a thin client-side renderer for the few git-checkout
+events the daemon emits during source builds). Fixture-based
+snapshot test — useful for locking in exact terminal output across
+renderer changes, not blocking.
 
 **v2 sketch (original plan, parts still relevant for v3+).**
 

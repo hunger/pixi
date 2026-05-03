@@ -184,14 +184,26 @@ impl BuildDownloadVerifyReporter {
     }
 
     pub fn on_entry_start(&mut self, record: &RepoDataRecord) -> usize {
+        self.on_entry_start_with(
+            record.package_record.name.as_normalized(),
+            record.package_record.size,
+        )
+    }
+
+    /// Variant of [`on_entry_start`](Self::on_entry_start) that takes
+    /// the two fields the entry actually stores. Lets callers that
+    /// don't have a full `RepoDataRecord` (e.g. the daemon-routed
+    /// install path, which receives just `name + size` over the wire)
+    /// drive the bar without synthesising a record.
+    pub fn on_entry_start_with(&mut self, name: &str, size: Option<u64>) -> usize {
         let mut entries = self.entries.write();
         let id = self.next_entry_id;
         self.next_entry_id += 1;
         entries.insert(
             id,
             Entry {
-                name: record.package_record.name.as_normalized().to_string(),
-                size: record.package_record.size,
+                name: name.to_string(),
+                size,
                 state: EntryState::Pending,
             },
         );
@@ -331,7 +343,7 @@ impl BuildDownloadVerifyReporter {
             (None, _) => Cow::Borrowed(""),
             (Some(first), 1) => Cow::Borrowed(first.name.as_str()),
             (Some(first), running_count) => {
-                Cow::Owned(format!("{} (+{})", &first.name, running_count - 1,))
+                Cow::Owned(format!("{} (+{})", first.name, running_count - 1,))
             }
         };
         let has_pending_entries = running_count > 0;
