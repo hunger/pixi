@@ -384,7 +384,7 @@ pub async fn execute_command(
     if global_options.socket.is_some() {
         let routes_through_daemon = matches!(
             command,
-            Command::Serve(_) | Command::ServeTest(_) | Command::Global(_)
+            Command::Serve(_) | Command::ServeTest(_) | Command::Global(_) | Command::Exec(_)
         );
         let ignores_socket = matches!(
             command,
@@ -443,7 +443,7 @@ pub async fn execute_command(
         Command::Update(cmd) => update::execute(cmd).await,
         Command::Upgrade(cmd) => upgrade::execute(cmd).await,
         Command::Lock(cmd) => lock::execute(cmd).await,
-        Command::Exec(args) => exec::execute(args).await,
+        Command::Exec(args) => exec::execute(args, global_options).await,
         Command::Build(args) => build::execute(args).await,
         Command::External(args) => command_info::execute_external_command(args),
     }

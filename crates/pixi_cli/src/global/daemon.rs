@@ -191,8 +191,54 @@ pub(crate) async fn install_via_daemon(
     // Auth target is `~/.pixi/envs/`: the directory the localised
     // prefix symlink will live under.
     let env_root = EnvRoot::from_env().await?;
+    let local_prefix = env_root.path().join(env_name.as_str());
 
-    let mut conn = pixi_varlink::connect(socket, env_root.path())
+    let transaction = run_install_into(
+        socket,
+        env_root.path(),
+        request,
+        &local_prefix,
+        localise_mode,
+        params.force_reinstall,
+    )
+    .await?;
+
+    project.sync_exposed_names(env_name, expose_type).await?;
+    let mut state_changes = StateChanges::default();
+    state_changes |= project
+        .expose_executables_from_environment(env_name)
+        .await?;
+
+    Ok(DaemonInstallOutput {
+        transaction,
+        state_changes,
+    })
+}
+
+/// Lower-level daemon-routed install used by every `pixi global`
+/// caller (via [`install_via_daemon`]) and by `pixi exec`.
+///
+/// Connects to `socket`, authenticates against `auth_path`, sends the
+/// pre-built [`InstallRequest`], drives the streamed reporter
+/// callbacks and progress events through [`WireReporterClient`],
+/// then localises the daemon's `<data>/<HASH>/` prefix at
+/// `local_prefix` using `localise_mode`. When `force_reinstall` is
+/// set, anything already at `local_prefix` is removed before
+/// localising — a symlink/file is unlinked, a real directory is
+/// `remove_dir_all`'d.
+///
+/// Returns the wire [`TransactionSummary`] the daemon produced.
+/// Caller-specific post-install work (manifest save, expose-mapping
+/// sync, activation, ...) lives in the wrapping function.
+pub(crate) async fn run_install_into(
+    socket: &Path,
+    auth_path: &Path,
+    request: InstallRequest,
+    local_prefix: &Path,
+    localise_mode: LocaliseMode,
+    force_reinstall: bool,
+) -> miette::Result<TransactionSummary> {
+    let mut conn = pixi_varlink::connect(socket, auth_path)
         .await
         .into_diagnostic()
         .map_err(|e| e.wrap_err(format!("could not connect to {}", socket.display())))?;
@@ -233,8 +279,7 @@ pub(crate) async fn install_via_daemon(
     let server_prefix = server_prefix
         .ok_or_else(|| miette!("daemon ended the install stream without a terminal reply"))?;
 
-    let local_prefix = env_root.path().join(env_name.as_str());
-    if params.force_reinstall {
+    if force_reinstall {
         // Localise refuses to clobber a real directory the user
         // didn't place themselves (or didn't place via a previous
         // walk-mode install — those carry our `.pixi-localise`
@@ -245,9 +290,9 @@ pub(crate) async fn install_via_daemon(
         // `remove_dir_all`. Modern stdlib's `remove_dir_all` uses
         // `openat`/`O_NOFOLLOW` traversal so a swap-in symlink
         // mid-removal can't redirect us.
-        match tokio::fs::symlink_metadata(&local_prefix).await {
+        match tokio::fs::symlink_metadata(local_prefix).await {
             Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => {
-                tokio::fs::remove_file(&local_prefix)
+                tokio::fs::remove_file(local_prefix)
                     .await
                     .into_diagnostic()
                     .map_err(|e| {
@@ -258,7 +303,7 @@ pub(crate) async fn install_via_daemon(
                     })?;
             }
             Ok(meta) if meta.is_dir() => {
-                tokio::fs::remove_dir_all(&local_prefix)
+                tokio::fs::remove_dir_all(local_prefix)
                     .await
                     .into_diagnostic()
                     .map_err(|e| {
@@ -275,20 +320,11 @@ pub(crate) async fn install_via_daemon(
             }
         }
     }
-    pixi_global::localise_prefix(&server_prefix, &local_prefix, localise_mode)
+    pixi_global::localise_prefix(&server_prefix, local_prefix, localise_mode)
         .await
         .map_err(|e| miette!("{e}"))?;
 
-    project.sync_exposed_names(env_name, expose_type).await?;
-    let mut state_changes = StateChanges::default();
-    state_changes |= project
-        .expose_executables_from_environment(env_name)
-        .await?;
-
-    Ok(DaemonInstallOutput {
-        transaction,
-        state_changes,
-    })
+    Ok(transaction)
 }
 
 /// Run the daemon-routed install for the env's *current* manifest

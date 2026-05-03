@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, collections::HashMap, path::Path, str::FromStr, sync::LazyLock};
+use std::{
+    collections::BTreeSet,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::LazyLock,
+};
 
 use clap::{Parser, ValueHint};
 use itertools::Itertools;
@@ -8,6 +14,7 @@ use pixi_core::environment::list::{PackageToOutput, print_package_table};
 use pixi_progress::{await_in_progress, global_multi_progress, wrap_in_progress};
 use pixi_utils::prefix::Prefix;
 use pixi_utils::{AsyncPrefixGuard, EnvironmentHash, reqwest::build_reqwest_clients};
+use pixi_varlink::InstallRequest;
 use rattler::{
     install::{IndicatifReporter, Installer},
     package_cache::PackageCache,
@@ -18,6 +25,8 @@ use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
 use reqwest_middleware::ClientWithMiddleware;
 use uv_configuration::RAYON_INITIALIZE;
 
+use crate::GlobalOptions;
+use crate::global::daemon;
 use crate::{cli_config::ChannelsConfig, match_spec_or_path::MatchSpecOrPath};
 
 /// Run a command and install it in a temporary environment.
@@ -66,7 +75,7 @@ pub struct Args {
 }
 
 /// CLI entry point for `pixi exec`
-pub async fn execute(args: Args) -> miette::Result<()> {
+pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Result<()> {
     let config = Config::with_cli_config(&args.config);
     let cache_dir = pixi_config::get_cache_dir().context("failed to determine cache directory")?;
 
@@ -94,16 +103,35 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         install_specs.push(guess_package_spec(command));
     }
 
+    // Daemon-routing trigger: `--socket` (CLI) overrides
+    // `[remote] socket = "..."` (config), same as `pixi global`.
+    let socket: Option<PathBuf> = global_options
+        .socket
+        .clone()
+        .or_else(|| config.remote.socket.clone());
+
     // Create the environment to run the command in.
-    let prefix = create_exec_prefix(
-        &args,
-        &install_specs,
-        &cache_dir,
-        &config,
-        &client,
-        should_guess_package,
-    )
-    .await?;
+    let prefix = if let Some(socket) = socket.as_deref() {
+        create_exec_prefix_via_daemon(
+            &args,
+            &install_specs,
+            &cache_dir,
+            &config,
+            socket,
+            should_guess_package,
+        )
+        .await?
+    } else {
+        create_exec_prefix(
+            &args,
+            &install_specs,
+            &cache_dir,
+            &config,
+            &client,
+            should_guess_package,
+        )
+        .await?
+    };
 
     // Get environment variables from the activation
     let mut activation_env = run_activation(&prefix).await?;
@@ -157,6 +185,110 @@ pub async fn execute(args: Args) -> miette::Result<()> {
 
     // Return the exit code of the command
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Daemon-routed counterpart of [`create_exec_prefix`].
+///
+/// The cache-dir auth model: `pixi exec` doesn't operate against
+/// `~/.pixi/envs/`; it lives entirely under
+/// `<cache>/cached-envs-v0/`. That directory is the auth target —
+/// the daemon's challenge file lands there, and the per-HASH lookup
+/// uses it as `auth_path`. So a daemon-routed `pixi exec` and a
+/// daemon-routed `pixi global` from the same user land in distinct
+/// HASH spaces by construction.
+///
+/// Solving runs server-side, so the local "guess a package and
+/// retry without it on solve failure" trick is replayed on the
+/// client: if the daemon rejects an install whose spec list
+/// includes a guessed package, drop the guess and reissue.
+async fn create_exec_prefix_via_daemon(
+    args: &Args,
+    specs: &[MatchSpec],
+    cache_dir: &Path,
+    config: &Config,
+    socket: &Path,
+    has_guessed_package: bool,
+) -> miette::Result<Prefix> {
+    let command = args.command.first().expect("missing required command");
+
+    let channels = args
+        .channels
+        .resolve_from_config(config)?
+        .iter()
+        .map(|c| c.base_url.to_string())
+        .collect::<Vec<_>>();
+
+    let environment_hash = EnvironmentHash::new(
+        command.clone(),
+        specs.to_vec(),
+        channels.clone(),
+        args.platform,
+    );
+
+    let auth_path = cache_dir.join(pixi_consts::consts::CACHED_ENVS_DIR);
+    tokio::fs::create_dir_all(&auth_path)
+        .await
+        .into_diagnostic()
+        .with_context(|| {
+            format!(
+                "failed to create cached-envs directory {}",
+                auth_path.display()
+            )
+        })?;
+    let local_prefix_path = auth_path.join(environment_hash.name());
+
+    let localise_mode = daemon::resolve_localise_mode(None, config)?;
+
+    let build_request = |specs: &[MatchSpec]| InstallRequest {
+        env_name: environment_hash.name(),
+        specs: specs.iter().map(|s| s.to_string()).collect(),
+        channels: channels.clone(),
+        platform: Some(args.platform.to_string()),
+        force_reinstall: args.force_reinstall,
+        extra_records: Vec::new(),
+    };
+
+    let result = daemon::run_install_into(
+        socket,
+        &auth_path,
+        build_request(specs),
+        &local_prefix_path,
+        localise_mode,
+        args.force_reinstall,
+    )
+    .await;
+
+    let _summary = match result {
+        Ok(s) => s,
+        Err(err) if has_guessed_package && !args.with.is_empty() => {
+            // Mirror the local fallback: when --with is set we always
+            // append a guess; if the daemon's solve failed, it's
+            // probably the guess that's at fault. Drop it and retry.
+            tracing::debug!(
+                "daemon-routed solve failed with guessed package, retrying without it: {err:?}"
+            );
+            let trimmed = &specs[..specs.len() - 1];
+            daemon::run_install_into(
+                socket,
+                &auth_path,
+                build_request(trimmed),
+                &local_prefix_path,
+                localise_mode,
+                args.force_reinstall,
+            )
+            .await
+            .context("daemon-routed solve failed even without guessed package")?
+        }
+        Err(err) => return Err(err),
+    };
+
+    if args.list.is_some() {
+        tracing::warn!(
+            "--list is not yet supported for daemon-routed `pixi exec`; skipping package listing"
+        );
+    }
+
+    Ok(Prefix::new(local_prefix_path))
 }
 
 /// Creates a prefix for the `pixi exec` command.

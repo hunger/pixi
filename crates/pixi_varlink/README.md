@@ -1,8 +1,7 @@
 # pixi_varlink
 
 Varlink IPC server and client used by `pixi serve`. The server is the
-daemon-side surface behind every env-mutating `pixi global`
-subcommand:
+daemon-side surface behind these `pixi` subcommands:
 
   - `pixi global install --socket <PATH>`
   - `pixi global update --socket <PATH>`
@@ -10,6 +9,7 @@ subcommand:
   - `pixi global remove --socket <PATH>`
   - `pixi global uninstall --socket <PATH>`
   - `pixi global sync --socket <PATH>`
+  - `pixi exec --socket <PATH>`
 
 Clients on the same host can share the daemon's `data` and `cache`
 directories, paying the solve+download cost only once across
@@ -107,3 +107,20 @@ notice.
 If you need an in-place reinstall while a process is using the
 env, run `pixi global install --force-reinstall` without
 `--socket` (locally).
+
+### `pixi exec` authenticates against `<cache>/cached-envs-v0/`
+
+`pixi exec` doesn't operate against `~/.pixi/envs/`; its prefixes
+live at `<cache>/cached-envs-v0/<EnvironmentHash>/`. So the
+daemon-routed `pixi exec` authenticates against
+`<cache>/cached-envs-v0/`, not `EnvRoot::from_env()`. By
+construction this puts daemon-routed `pixi global` and daemon-routed
+`pixi exec` from the same user into disjoint server-side HASH spaces
+— each `(auth_path, env_name)` pair hashes to its own
+`<data>/<HASH>/`. The client creates the `cached-envs-v0` directory
+on first use if it doesn't already exist.
+
+`pixi exec --list` is not yet wired up for the daemon path: when
+both flags are set, the listing is skipped with a `tracing::warn!`
+and the command runs as normal. Local `pixi exec --list` is
+unchanged. This is a followup, not a permanent design choice.
