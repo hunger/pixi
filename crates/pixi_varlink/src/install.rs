@@ -28,8 +28,10 @@ use pixi_command_dispatcher::{
 use pixi_path::AbsPathBuf;
 use pixi_spec::PixiSpec;
 use pixi_spec_containers::DependencyMap;
+use rattler::install::{Transaction, TransactionOperation};
 use rattler_conda_types::{
-    ChannelConfig, ChannelUrl, MatchSpec, PackageName, ParseStrictness, Platform, prefix::Prefix,
+    ChannelConfig, ChannelUrl, HasArtifactIdentificationRefs, MatchSpec, PackageName,
+    ParseStrictness, Platform, prefix::Prefix,
 };
 use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
 use serde::{Deserialize, Serialize};
@@ -221,12 +223,135 @@ pub enum InstallReply {
         /// client takes over with the local install path's
         /// expose / trampoline / finalise machinery.
         prefix: String,
+        /// Per-package summary of the rattler transaction the daemon
+        /// just executed. Empty when the fingerprint short-circuit
+        /// fired (nothing changed). The client folds this into a
+        /// `pixi_global::common::EnvironmentUpdate` so daemon-routed
+        /// `update` (and `install` rerun) reports the same per-package
+        /// state changes a fully-local install would.
+        #[serde(default, skip_serializing_if = "TransactionSummary::is_empty")]
+        transaction: TransactionSummary,
     },
     /// Terminal failure. Final reply in the stream.
     Failed {
         /// Why the install was rejected or could not proceed.
         error: InstallFailure,
     },
+}
+
+/// Wire-serialisable mirror of `pixi_global::common::InstallChange`.
+///
+/// Lives in `pixi_varlink` rather than re-exporting the `pixi_global`
+/// type because adding a `pixi_varlink → pixi_global` (or vice versa)
+/// edge would pull the entire global-CLI surface into the daemon. The
+/// `pixi_cli` daemon helper translates between the two.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InstallChangeWire {
+    /// Package was installed fresh.
+    Installed { version: String },
+    /// Top-level upgrade (different base version).
+    Upgraded { from: String, to: String },
+    /// Build-string-only upgrade (same base version) — surfaced as a
+    /// transitive bump in the user-visible report.
+    TransitiveUpgraded { from: String, to: String },
+    /// Reinstall (same version on both sides — package metadata or
+    /// build refresh).
+    Reinstalled { from: String, to: String },
+    /// Package was removed from the prefix.
+    Removed,
+}
+
+/// Per-package change record in a [`TransactionSummary`]. The
+/// `change` payload is `#[serde(flatten)]`'d so the wire form is one
+/// flat object per package, e.g.
+/// `{"name":"xz","kind":"installed","version":"5.4.6"}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PackageChange {
+    /// Package name (normalised — matches `PackageName::as_normalized`).
+    pub name: String,
+    /// What happened to this package in the transaction.
+    #[serde(flatten)]
+    pub change: InstallChangeWire,
+}
+
+/// Wire-serialisable summary of the rattler transaction the daemon
+/// executed. Mirrors the data carried in
+/// `pixi_global::common::EnvironmentUpdate`'s `package_changes` field.
+///
+/// `current_packages` (the env's direct-dependency names) is *not*
+/// shipped: the client's manifest is the source of truth for that and
+/// the daemon doesn't have it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TransactionSummary {
+    /// Per-package change. Sorted by package name for deterministic
+    /// wire output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub package_changes: Vec<PackageChange>,
+}
+
+impl TransactionSummary {
+    /// Empty summary — the daemon's fingerprint short-circuit fired
+    /// and nothing was changed in the prefix.
+    pub fn is_empty(&self) -> bool {
+        self.package_changes.is_empty()
+    }
+
+    /// Build a summary from a rattler `Transaction`. Mirrors the
+    /// per-operation mapping in
+    /// `pixi_global::common::get_install_changes` so client-side
+    /// reporting is byte-for-byte consistent between local and daemon
+    /// installs.
+    pub fn from_transaction<Old, New>(transaction: &Transaction<Old, New>) -> Self
+    where
+        Old: HasArtifactIdentificationRefs,
+        New: HasArtifactIdentificationRefs,
+    {
+        let mut package_changes: Vec<PackageChange> = transaction
+            .operations
+            .iter()
+            .map(|op| match op {
+                TransactionOperation::Install(p) => PackageChange {
+                    name: p.name().as_normalized().to_string(),
+                    change: InstallChangeWire::Installed {
+                        version: p.version().version().to_string(),
+                    },
+                },
+                TransactionOperation::Change { old, new } => {
+                    let old_v = old.version().version();
+                    let new_v = new.version().version();
+                    let change = if old_v == new_v {
+                        InstallChangeWire::TransitiveUpgraded {
+                            from: old_v.to_string(),
+                            to: new_v.to_string(),
+                        }
+                    } else {
+                        InstallChangeWire::Upgraded {
+                            from: old_v.to_string(),
+                            to: new_v.to_string(),
+                        }
+                    };
+                    PackageChange {
+                        name: new.name().as_normalized().to_string(),
+                        change,
+                    }
+                }
+                TransactionOperation::Reinstall { old, new } => PackageChange {
+                    name: new.name().as_normalized().to_string(),
+                    change: InstallChangeWire::Reinstalled {
+                        from: old.version().version().to_string(),
+                        to: new.version().version().to_string(),
+                    },
+                },
+                TransactionOperation::Remove(p) => PackageChange {
+                    name: p.name().as_normalized().to_string(),
+                    change: InstallChangeWire::Removed,
+                },
+            })
+            .collect();
+        package_changes.sort_by(|a, b| a.name.cmp(&b.name));
+        Self { package_changes }
+    }
 }
 
 /// Why an `Install` RPC failed.
@@ -291,7 +416,7 @@ pub(crate) async fn run_install(
     auth_path: &Path,
     request: &InstallRequest,
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::ReporterCall>>,
-) -> Result<PathBuf, InstallFailure> {
+) -> Result<(PathBuf, TransactionSummary), InstallFailure> {
     let hash = env_hash(&cfg.salt, auth_path, &request.env_name);
     let prefix_path = cfg.data.join(&hash);
 
@@ -422,7 +547,8 @@ pub(crate) async fn run_install(
         );
     }
 
-    Ok(prefix_path)
+    let summary = TransactionSummary::from_transaction(&install_result.transaction);
+    Ok((prefix_path, summary))
 }
 
 fn parse_channels(channels: &[String]) -> Result<Vec<ChannelUrl>, InstallFailure> {
@@ -697,5 +823,77 @@ mod tests {
         .unwrap_err();
         let ServerConfigError::InvalidSalt { reason } = err;
         assert!(reason.contains("not valid hex"), "{reason}");
+    }
+
+    /// `InstallReply::Success` round-trips through serde with a
+    /// populated transaction summary covering every variant of
+    /// [`InstallChangeWire`]. Pins the JSON-on-the-wire shape so a
+    /// future client/server skew doesn't silently drop change kinds.
+    #[test]
+    fn install_reply_success_round_trips_transaction() {
+        let summary = TransactionSummary {
+            package_changes: vec![
+                PackageChange {
+                    name: "foo".into(),
+                    change: InstallChangeWire::Installed {
+                        version: "1.2.3".into(),
+                    },
+                },
+                PackageChange {
+                    name: "bar".into(),
+                    change: InstallChangeWire::Upgraded {
+                        from: "1.0".into(),
+                        to: "2.0".into(),
+                    },
+                },
+                PackageChange {
+                    name: "baz".into(),
+                    change: InstallChangeWire::TransitiveUpgraded {
+                        from: "1.0".into(),
+                        to: "1.0".into(),
+                    },
+                },
+                PackageChange {
+                    name: "qux".into(),
+                    change: InstallChangeWire::Reinstalled {
+                        from: "1.0".into(),
+                        to: "1.0".into(),
+                    },
+                },
+                PackageChange {
+                    name: "removed".into(),
+                    change: InstallChangeWire::Removed,
+                },
+            ],
+        };
+        let original = crate::InstallReply::Success {
+            prefix: "/srv/data/abcdef".into(),
+            transaction: summary,
+        };
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let parsed: crate::InstallReply = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(original, parsed, "every variant must round-trip");
+    }
+
+    /// `InstallReply::Success` with an empty `TransactionSummary`
+    /// elides the field on the wire entirely, so older clients (or
+    /// the streaming path's daemon-side fingerprint short-circuit)
+    /// don't pay the bytes for "nothing changed."
+    #[test]
+    fn install_reply_success_omits_empty_transaction() {
+        let original = crate::InstallReply::Success {
+            prefix: "/srv/data/abcdef".into(),
+            transaction: TransactionSummary::default(),
+        };
+        let json: serde_json::Value = serde_json::to_value(&original).unwrap();
+        let obj = json.as_object().expect("expected JSON object");
+        assert!(
+            !obj.contains_key("transaction"),
+            "empty transaction should be skipped, got {obj:?}"
+        );
+        // And it still parses back as the canonical default.
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let parsed: crate::InstallReply = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(original, parsed);
     }
 }

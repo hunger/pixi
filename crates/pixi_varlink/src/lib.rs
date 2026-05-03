@@ -25,8 +25,8 @@ mod reporter_wire;
 mod wire_reporter;
 
 pub use install::{
-    InstallFailure, InstallReply, InstallRequest, SALT_LEN, ServerConfig, ServerConfigError,
-    env_hash, validate_env_name,
+    InstallChangeWire, InstallFailure, InstallReply, InstallRequest, PackageChange, SALT_LEN,
+    ServerConfig, ServerConfigError, TransactionSummary, env_hash, validate_env_name,
 };
 pub use reporter_wire::{
     CondaSolveEnvWire, InstallEnvWire, LoggingReporterClient, PixiSolveEnvWire, ReporterCall,
@@ -376,8 +376,9 @@ async fn compute_install_reply(
         return InstallReply::Failed { error };
     }
     match install::run_install(&cfg, &directory, &request, None).await {
-        Ok(prefix) => InstallReply::Success {
+        Ok((prefix, transaction)) => InstallReply::Success {
             prefix: prefix.display().to_string(),
+            transaction,
         },
         Err(error) => InstallReply::Failed { error },
     }
@@ -636,8 +637,9 @@ where
         let install_task = tokio::spawn(async move {
             let result = install::run_install(&cfg, &directory, &request_for_task, Some(tx)).await;
             match result {
-                Ok(prefix) => InstallReply::Success {
+                Ok((prefix, transaction)) => InstallReply::Success {
                     prefix: prefix.display().to_string(),
+                    transaction,
                 },
                 Err(error) => InstallReply::Failed { error },
             }

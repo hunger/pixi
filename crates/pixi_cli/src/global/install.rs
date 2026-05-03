@@ -485,7 +485,10 @@ async fn setup_environment_via_daemon(
                 // schema growth surfaces in -vv runs.
                 tracing::trace!(target: "pixi::install::reporter", ?event, "install progress");
             }
-            InstallReply::Success { prefix } => {
+            InstallReply::Success {
+                prefix,
+                transaction: _,
+            } => {
                 server_prefix = Some(PathBuf::from(prefix));
                 break;
             }

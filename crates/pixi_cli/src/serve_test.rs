@@ -147,7 +147,10 @@ async fn install(socket: &Path, args: InstallArgs) -> miette::Result<()> {
                 // so a misconfigured client doesn't lose data silently.
                 tracing::info!(?call, "unexpected reporter call on non-streaming path");
             }
-            pixi_varlink::InstallReply::Success { prefix: p } => {
+            pixi_varlink::InstallReply::Success {
+                prefix: p,
+                transaction: _,
+            } => {
                 prefix = Some(p);
                 break;
             }
