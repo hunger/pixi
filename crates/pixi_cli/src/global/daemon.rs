@@ -23,45 +23,74 @@ use pixi_config::Config;
 use pixi_global::{
     EnvRoot, EnvironmentName, LocaliseMode, Project, StateChanges,
     common::{EnvironmentUpdate, InstallChange},
-    project::ExposedType,
+    project::{ExposedType, GlobalSpec},
 };
-use pixi_spec::PixiSpec;
 use pixi_varlink::{
-    InstallChangeWire, InstallReply, InstallRequest, ReporterClient, TransactionSummary,
+    ExtraRecord, InstallChangeWire, InstallReply, InstallRequest, ReporterClient,
+    TransactionSummary,
 };
 use rattler_conda_types::{PackageName, Platform, Version};
 
 use super::wire_reporter_client::WireReporterClient;
 
-/// Refuse source-typed (`PixiSpec::Path` / `Url` / `Git`) entries
-/// from the supplied iterator, with a `miette` error that points the
-/// user at the workaround (drop `--socket`).
+/// Build any source-typed `GlobalSpec`s in `packages` locally and
+/// shape them for the wire: produce the
+/// [`pixi_varlink::ExtraRecord`]s the daemon will splice into its
+/// install transaction, plus the runtime-dep MatchSpec strings the
+/// caller should append to `InstallRequest::specs` so the daemon's
+/// solve covers the source build's binary closure.
 ///
-/// Both `install` and `update` call this before any wire activity:
-/// the daemon has no view of the client's filesystem and doesn't run
-/// the client's `BackendOverride`, so a source spec routed through
-/// `--socket` cannot produce the same on-disk artefact a local
-/// install would. The daemon ships its own
-/// [`pixi_varlink::InstallFailure::UnsupportedSourceSpec`] as a
-/// defense against non-conforming clients; this helper surfaces a
-/// nicer message before we ever hit the wire.
-pub(crate) fn assert_no_source_specs<'a, I>(specs: I) -> miette::Result<()>
-where
-    I: IntoIterator<Item = (&'a PackageName, &'a PixiSpec)>,
-{
-    let bad: Vec<&str> = specs
-        .into_iter()
-        .filter(|(_, spec)| spec.is_source())
-        .map(|(name, _)| name.as_normalized())
+/// Source specs are pre-built on the client because the daemon has
+/// no view of the client's filesystem (path sources) and doesn't
+/// run the client's `BackendOverride` (url/git source builds).
+/// Building locally hands those constraints to the dispatcher the
+/// user already configured for local installs.
+///
+/// Returns `(extra_records, runtime_dep_strings)`. Both are empty
+/// when `packages` contains no source specs — callers can call
+/// this unconditionally.
+pub(crate) async fn build_source_specs_via_local_dispatcher(
+    project: &Project,
+    env_name: &EnvironmentName,
+    packages: &[GlobalSpec],
+) -> miette::Result<(Vec<ExtraRecord>, Vec<String>)> {
+    let source_specs: Vec<GlobalSpec> = packages
+        .iter()
+        .filter(|spec| spec.spec().is_source())
+        .cloned()
         .collect();
-    if bad.is_empty() {
-        return Ok(());
+    if source_specs.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
     }
-    Err(miette!(
-        help = "drop `--socket` to install source-built packages locally; the daemon can't see the client's filesystem (path sources) and doesn't run client-supplied build backends (url/git sources)",
-        "source-built packages aren't supported with `--socket`: {}",
-        bad.join(", ")
-    ))
+    let built = project
+        .build_source_specs_for_daemon(env_name, &source_specs)
+        .await?;
+
+    let mut extras = Vec::with_capacity(built.len());
+    let mut runtime_deps = Vec::new();
+    for (record, artifact_path) in built {
+        let path_str = artifact_path
+            .to_str()
+            .ok_or_else(|| {
+                miette!(
+                    "non-utf8 source-build artifact path: {}",
+                    artifact_path.display()
+                )
+            })?
+            .to_string();
+        // Synthesise the binary closure the daemon's solve needs to
+        // resolve so the source-built record's runtime deps end up
+        // in the install. These come straight off the built
+        // record's `package_record.depends` (already MatchSpec
+        // strings).
+        runtime_deps.extend(record.package_record.depends.iter().cloned());
+        let record_json = serde_json::to_string(&record).into_diagnostic()?;
+        extras.push(ExtraRecord {
+            artifact_path: path_str,
+            record_json,
+        });
+    }
+    Ok((extras, runtime_deps))
 }
 
 /// Pick a [`LocaliseMode`] for a daemon-routed install/update from
@@ -97,6 +126,11 @@ pub(crate) struct DaemonRequestParams {
     /// MatchSpec strings for every dep that should be solved.
     /// `--with` packages are pre-merged in by the caller, since the
     /// expose policy that distinguishes them is decided client-side.
+    /// When `extra_records` carries source-built packages, this list
+    /// also includes their runtime deps (extracted from the built
+    /// `RepoDataRecord.package_record.depends`) so the daemon's
+    /// solve resolves the binary closure even though the source
+    /// specs themselves are not on the wire.
     pub specs: Vec<String>,
     /// Channel URLs (resolved through the project's channel config).
     pub channels: Vec<String>,
@@ -106,6 +140,9 @@ pub(crate) struct DaemonRequestParams {
     /// Force the rattler installer to clobber every record, ignoring
     /// the daemon's fingerprint short-circuit.
     pub force_reinstall: bool,
+    /// Pre-built records the client wants spliced into the daemon's
+    /// install. Currently used to ship locally-built source packages.
+    pub extra_records: Vec<ExtraRecord>,
 }
 
 /// What [`install_via_daemon`] returns to the caller. The transaction
@@ -142,7 +179,7 @@ pub(crate) async fn install_via_daemon(
         channels: params.channels.clone(),
         platform: params.platform.map(|p| p.to_string()),
         force_reinstall: params.force_reinstall,
-        extra_records: Vec::new(),
+        extra_records: params.extra_records.clone(),
     };
 
     // Auth target is `~/.pixi/envs/`: the directory the localised
@@ -275,10 +312,16 @@ pub(crate) fn manifest_snapshot_for_env(
         .map(|url| url.to_string())
         .collect();
 
+    // Only ship binary specs over the wire — source-typed deps are
+    // built locally and surface through `extra_records`. The caller
+    // appends the source runtime deps it gets back from
+    // [`build_source_specs_via_local_dispatcher`] to the returned
+    // `specs`.
     let specs: Vec<String> = environment
         .dependencies
         .specs
         .iter()
+        .filter(|(_, spec)| !spec.is_source())
         .map(|(name, spec)| {
             spec.clone()
                 .to_match_spec(name, &channel_config)
@@ -292,6 +335,7 @@ pub(crate) fn manifest_snapshot_for_env(
         channels,
         platform: environment.platform,
         force_reinstall,
+        extra_records: Vec::new(),
     })
 }
 
@@ -465,36 +509,5 @@ mod tests {
         }
         let mode = resolve_localise_mode(None, &config).unwrap();
         assert_eq!(mode, LocaliseMode::default());
-    }
-
-    /// Binary specs flow through `assert_no_source_specs` cleanly,
-    /// while a single source spec causes the helper to bail with an
-    /// actionable miette error pointing at `--socket`. This is the
-    /// last user-visible defense before we spend any time on the
-    /// wire.
-    #[test]
-    fn assert_no_source_specs_accepts_binary_only() {
-        let foo = pkg("foo");
-        let spec = PixiSpec::Version(rattler_conda_types::VersionSpec::Any);
-        assert!(assert_no_source_specs([(&foo, &spec)]).is_ok());
-    }
-
-    #[test]
-    fn assert_no_source_specs_rejects_url_source() {
-        use pixi_spec::UrlSpec;
-        let foo = pkg("foo");
-        let spec = PixiSpec::Url(UrlSpec {
-            url: url::Url::parse("https://example.com/foo.tar.gz").unwrap(),
-            md5: None,
-            sha256: None,
-            subdirectory: Default::default(),
-        });
-        let err = assert_no_source_specs([(&foo, &spec)]).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("source-built packages aren't supported with `--socket`")
-                && msg.contains("foo"),
-            "expected source-spec rejection naming the package, got {msg:?}"
-        );
     }
 }

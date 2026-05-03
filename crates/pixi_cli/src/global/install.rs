@@ -392,26 +392,6 @@ async fn setup_environment_via_daemon(
     socket: &Path,
     localise_mode: LocaliseMode,
 ) -> miette::Result<StateChanges> {
-    // Reject source-built packages before mutating the manifest:
-    // the daemon has no view of the client's filesystem (path
-    // sources) and doesn't run the client's `BackendOverride` (url
-    // / git source builds), so a source spec routed through
-    // `--socket` can't produce the same artefact a local install
-    // would. Catch it here with an actionable error pointing the
-    // user at the workaround (drop `--socket`).
-    let channel_config = project.config().global_channel_config().clone();
-    let with_for_check: Vec<GlobalSpec> = args
-        .with
-        .iter()
-        .map(|spec| GlobalSpec::try_from_matchspec_with_name(spec.clone(), &channel_config))
-        .collect::<Result<Vec<_>, _>>()?;
-    super::daemon::assert_no_source_specs(
-        specs
-            .iter()
-            .chain(with_for_check.iter())
-            .map(|gs| (gs.name(), gs.spec())),
-    )?;
-
     let PreparedInstall {
         mut state_changes,
         packages_to_add,
@@ -426,8 +406,19 @@ async fn setup_environment_via_daemon(
         .filter_map(|c| c.clone().into_base_url(&channel_config).ok())
         .map(|url| url.to_string())
         .collect();
-    let spec_strings: Vec<String> = packages_to_add
+    // Source-typed packages (path/url/git) can't be solved or fetched
+    // by the daemon directly. Build them via the local dispatcher
+    // instead: the daemon receives the resulting `.conda` artefacts
+    // as `ExtraRecord`s and extracts them into its package cache,
+    // and the runtime deps from each built record's
+    // `package_record.depends` get folded into the wire `specs` so
+    // the daemon's solve covers their binary closure.
+    let (extra_records, source_runtime_deps) =
+        super::daemon::build_source_specs_via_local_dispatcher(project, env_name, &packages_to_add)
+            .await?;
+    let mut spec_strings: Vec<String> = packages_to_add
         .iter()
+        .filter(|spec| !spec.spec().is_source())
         .map(|spec| {
             spec.spec()
                 .clone()
@@ -436,11 +427,13 @@ async fn setup_environment_via_daemon(
                 .into_diagnostic()
         })
         .collect::<miette::Result<Vec<_>>>()?;
+    spec_strings.extend(source_runtime_deps);
     let params = super::daemon::DaemonRequestParams {
         specs: spec_strings,
         channels: channel_urls,
         platform: args.platform,
         force_reinstall: args.force_reinstall,
+        extra_records,
     };
 
     let expose_type = expose_type_for_install_args(args)?;

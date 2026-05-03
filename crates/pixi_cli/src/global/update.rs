@@ -172,16 +172,6 @@ async fn apply_changes_via_daemon(
     localise_mode: LocaliseMode,
     force_reinstall: bool,
 ) -> miette::Result<StateChanges> {
-    // Refuse upfront if the manifest's deps include any source
-    // specs: the daemon can't resolve them (filesystem-invisible
-    // paths, no client-side `BackendOverride`).
-    {
-        let env = project
-            .environment(env_name)
-            .ok_or_else(|| miette!("Environment {} not found", env_name.fancy_display()))?;
-        super::daemon::assert_no_source_specs(env.dependencies.specs.iter())?;
-    }
-
     // Capture pre-update expose policy from the manifest's existing
     // exposed list against the on-disk env's binaries — *if* the env
     // is already materialised locally. If it isn't (first daemon
@@ -217,7 +207,28 @@ async fn apply_changes_via_daemon(
         .cloned()
         .collect();
 
-    let params = super::daemon::manifest_snapshot_for_env(project, env_name, force_reinstall)?;
+    // Pre-build any source-typed deps via the local dispatcher.
+    // `manifest_snapshot_for_env` already strips source specs from
+    // the wire `specs`; this fills the gap by shipping their
+    // built-record JSON in `extra_records` and the runtime deps as
+    // synthetic MatchSpec strings on `specs` so the daemon's solve
+    // covers their binary closure.
+    let source_globals: Vec<pixi_global::project::GlobalSpec> = project
+        .environment(env_name)
+        .ok_or_else(|| miette!("Environment {} not found", env_name.fancy_display()))?
+        .dependencies
+        .specs
+        .iter()
+        .filter(|(_, spec)| spec.is_source())
+        .map(|(name, spec)| pixi_global::project::GlobalSpec::new(name.clone(), spec.clone()))
+        .collect();
+    let (extra_records, source_runtime_deps) =
+        super::daemon::build_source_specs_via_local_dispatcher(project, env_name, &source_globals)
+            .await?;
+
+    let mut params = super::daemon::manifest_snapshot_for_env(project, env_name, force_reinstall)?;
+    params.specs.extend(source_runtime_deps);
+    params.extra_records = extra_records;
 
     let output = super::daemon::install_via_daemon(
         project,

@@ -1,3 +1,7 @@
+// `pixi_cli::execute()` is a deep async closure: every CLI subcommand
+// branches to its own async path and the source-build pipeline added
+// for daemon-routed `global install`/`update` tipped the rustc layout
+// computation past its default depth.
 #![recursion_limit = "256"]
 
 // This forces the crate to be compiled even though the crate is not used in the

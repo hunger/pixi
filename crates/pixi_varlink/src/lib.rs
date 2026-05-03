@@ -30,8 +30,8 @@ mod reporter_wire;
 mod wire_reporter;
 
 pub use install::{
-    InstallChangeWire, InstallFailure, InstallReply, InstallRequest, PackageChange, SALT_LEN,
-    ServerConfig, ServerConfigError, TransactionSummary, env_hash, validate_env_name,
+    ExtraRecord, InstallChangeWire, InstallFailure, InstallReply, InstallRequest, PackageChange,
+    SALT_LEN, ServerConfig, ServerConfigError, TransactionSummary, env_hash, validate_env_name,
 };
 pub use reporter_wire::{
     CondaSolveEnvWire, InstallEnvWire, LoggingReporterClient, PixiSolveEnvWire, ReporterCall,

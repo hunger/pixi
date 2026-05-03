@@ -698,6 +698,118 @@ impl Project {
         Ok(EnvironmentUpdate::new(install_changes, dependencies_names))
     }
 
+    /// Build the given source `GlobalSpec`s through the local
+    /// command dispatcher and return the resulting
+    /// `RepoDataRecord`s paired with absolute paths to the `.conda`
+    /// artefacts in this project's source-build cache.
+    ///
+    /// Used by the daemon-routed install path to materialise source
+    /// packages on the client (where the user's `BackendOverride`
+    /// and filesystem live) before sending them to the daemon as
+    /// `extra_records`. The daemon then splices each record into
+    /// its install transaction without ever doing a source build of
+    /// its own.
+    ///
+    /// `source_specs` should be pre-filtered to source-typed specs
+    /// (`PixiSpec::is_source()`); binary specs are ignored. Returns
+    /// an empty `Vec` when no source specs are supplied.
+    pub async fn build_source_specs_for_daemon(
+        &self,
+        env_name: &EnvironmentName,
+        source_specs: &[crate::project::GlobalSpec],
+    ) -> miette::Result<Vec<(rattler_conda_types::RepoDataRecord, std::path::PathBuf)>> {
+        use pixi_command_dispatcher::keys::{SourceBuildKey, SourceBuildSpec};
+        use pixi_record::UnresolvedPixiRecord;
+        if source_specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let environment = self
+            .environment(env_name)
+            .ok_or_else(|| miette::miette!("Environment {} not found", env_name.fancy_display()))?;
+        let channels = environment
+            .channels()
+            .into_iter()
+            .map(|channel| {
+                channel
+                    .clone()
+                    .into_channel(self.config.global_channel_config())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .into_diagnostic()?;
+        let platform = environment.platform.unwrap_or_else(Platform::current);
+
+        let mut pixi_specs = DependencyMap::default();
+        for spec in source_specs {
+            pixi_specs.insert(spec.name().clone(), spec.spec().clone());
+        }
+
+        let command_dispatcher = self.command_dispatcher()?;
+
+        let channels = channels
+            .into_iter()
+            .map(|channel| channel.base_url.clone())
+            .collect::<Vec<_>>();
+
+        let build_environment = BuildEnvironment::simple(
+            platform,
+            Self::virtual_packages_for(&platform).into_diagnostic()?,
+        );
+
+        let solve_spec = SolvePixiEnvironmentSpec {
+            dependencies: pixi_specs,
+            constraints: DependencyMap::default(),
+            dev_sources: ordermap::OrderMap::new(),
+            installed: Arc::from([]),
+            installed_source_hints: Default::default(),
+            strategy: Default::default(),
+            preferred_build_source: Arc::new(BTreeMap::new()),
+            env_ref: EnvironmentRef::Ephemeral(EphemeralEnv::new(
+                env_name.to_string(),
+                EnvironmentSpec {
+                    channels: channels.clone(),
+                    build_environment: build_environment.clone(),
+                    variants: VariantConfig::default(),
+                    exclude_newer: None,
+                    channel_priority: Default::default(),
+                },
+            )),
+        };
+
+        let records_arc = command_dispatcher
+            .engine()
+            .compute(&SolvePixiEnvironmentKey::new(solve_spec))
+            .await
+            .map_err_into_dispatcher(std::convert::identity)?;
+
+        let mut results = Vec::new();
+        for pixi_record in records_arc.iter() {
+            // Convert PixiRecord (FullSourceRecord under Source) →
+            // UnresolvedPixiRecord (UnresolvedSourceRecord under Source),
+            // which is what `SourceBuildKey` consumes.
+            let unresolved: UnresolvedPixiRecord = pixi_record.clone().into();
+            let UnresolvedPixiRecord::Source(source_record) = unresolved else {
+                continue;
+            };
+            let build_spec = SourceBuildSpec {
+                record: source_record,
+                channels: channels.clone(),
+                exclude_newer: None,
+                build_environment: build_environment.clone(),
+                build_profile: pixi_command_dispatcher::BuildProfile::Development,
+                variant_configuration: None,
+                variant_files: None,
+            };
+            let build_result = command_dispatcher
+                .engine()
+                .compute(&SourceBuildKey::new(build_spec))
+                .await
+                .map_err_into_dispatcher(std::convert::identity)?;
+            results.push((build_result.record.clone(), build_result.artifact.clone()));
+        }
+        Ok(results)
+    }
+
     /// Remove an environment from the manifest and the global installation.
     pub async fn remove_environment(
         &mut self,

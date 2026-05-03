@@ -30,6 +30,10 @@ pixi_core = { workspace = true }
 pixi_manifest = { workspace = true }
 pixi_path = { workspace = true }
 pixi_progress = { workspace = true }
+# `UnresolvedPixiRecord` / `PixiRecord` for the daemon-routed source-build
+# helper (`build_source_specs_for_daemon`), which converts solved source
+# records into the shape `SourceBuildKey` expects.
+pixi_record = { workspace = true }
 pixi_reporters = { workspace = true }
 pixi_spec = { workspace = true }
 pixi_spec_containers = { workspace = true }
