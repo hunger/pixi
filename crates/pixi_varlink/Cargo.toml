@@ -59,6 +59,10 @@ pixi_build_discovery = { workspace = true }
 pixi_command_dispatcher = { workspace = true }
 pixi_compute_reporters = { workspace = true }
 pixi_git = { workspace = true }
+# `pixi_global::EnvironmentName::from_str` is the source of truth for
+# env-name validation; `validate_env_name` delegates to it so the daemon
+# accepts exactly the names the local CLI does.
+pixi_global = { workspace = true }
 pixi_path = { workspace = true }
 pixi_spec = { workspace = true }
 pixi_spec_containers = { workspace = true }

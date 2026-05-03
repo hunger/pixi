@@ -7171,6 +7171,7 @@ dependencies = [
  "pixi_command_dispatcher",
  "pixi_compute_reporters",
  "pixi_git",
+ "pixi_global",
  "pixi_path",
  "pixi_spec",
  "pixi_spec_containers",

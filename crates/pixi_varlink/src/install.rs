@@ -607,38 +607,19 @@ fn default_channel_config() -> ChannelConfig {
 
 /// Validate a candidate environment name.
 ///
-/// Mirrors the conservative subset `pixi_global::EnvironmentName`
-/// accepts: ASCII alphanumeric plus `-` and `_`, non-empty, length
-/// capped to keep generated paths well below `PATH_MAX`. Any deviation
-/// from this shape is `InvalidEnvName`.
+/// Delegates to `pixi_global::EnvironmentName::from_str` so any name
+/// the local CLI accepts also flows through the daemon. Failures are
+/// re-wrapped as [`InstallFailure::InvalidEnvName`] with the parse
+/// error's text as `reason`, so the wire surface stays self-contained.
 pub fn validate_env_name(name: &str) -> Result<(), InstallFailure> {
-    /// Cap kept conservative; `EnvironmentName` upstream is untyped
-    /// `String`, and 64 bytes leaves room for the `<HASH>/` parent
-    /// without bumping into Windows' `MAX_PATH` for paths a localising
-    /// client may eventually concatenate.
-    const MAX_LEN: usize = 64;
-    if name.is_empty() {
-        return Err(InstallFailure::InvalidEnvName {
+    use std::str::FromStr;
+
+    pixi_global::EnvironmentName::from_str(name)
+        .map(|_| ())
+        .map_err(|err| InstallFailure::InvalidEnvName {
             name: name.to_string(),
-            reason: "empty".to_string(),
-        });
-    }
-    if name.len() > MAX_LEN {
-        return Err(InstallFailure::InvalidEnvName {
-            name: name.to_string(),
-            reason: format!("longer than {MAX_LEN} bytes"),
-        });
-    }
-    if let Some(bad) = name
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
-    {
-        return Err(InstallFailure::InvalidEnvName {
-            name: name.to_string(),
-            reason: format!("contains invalid character {bad:?}"),
-        });
-    }
-    Ok(())
+            reason: err.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -710,9 +691,25 @@ mod tests {
         );
     }
 
+    /// Names accepted by `EnvironmentName::from_str` must also be
+    /// accepted by `validate_env_name`. The two implementations are
+    /// kept in sync by hand because the daemon crate doesn't depend
+    /// on `pixi_global`; this test pins parity for the shapes users
+    /// actually type.
     #[test]
     fn validate_env_name_accepts_typical_names() {
-        for ok in ["foo", "foo-bar", "foo_bar", "Foo", "f00", "a"] {
+        for ok in [
+            "foo",
+            "foo-bar",
+            "foo_bar",
+            "f00",
+            "a",
+            // Dot is part of the EnvironmentName regex (e.g. version-suffixed
+            // env names like `python3.11`). Earlier versions of the daemon
+            // validator rejected it; we now match local behaviour.
+            "python3.11",
+            "my.env",
+        ] {
             assert!(
                 validate_env_name(ok).is_ok(),
                 "expected {ok:?} to be accepted"
@@ -726,9 +723,19 @@ mod tests {
         assert!(matches!(err, InstallFailure::InvalidEnvName { .. }));
     }
 
+    /// Names that contain bytes outside the `[a-z0-9-_.]+` character
+    /// class — same set `EnvironmentName::from_str` rejects — must
+    /// fail the daemon validator too.
     #[test]
-    fn validate_env_name_rejects_path_separators() {
-        for bad in ["foo/bar", "../etc", ".", "..", "with space", "tab\t"] {
+    fn validate_env_name_rejects_invalid_chars() {
+        for bad in [
+            "foo/bar",    // path separator
+            "../etc",     // path traversal (the `/` makes it bad)
+            "with space", // whitespace
+            "tab\t",      // control char
+            "Foo",        // uppercase — local regex is lowercase-only
+            "name@host",  // out-of-class punctuation
+        ] {
             let err = validate_env_name(bad).unwrap_err();
             assert!(
                 matches!(err, InstallFailure::InvalidEnvName { .. }),
