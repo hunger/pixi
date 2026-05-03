@@ -30,6 +30,9 @@ libc = { workspace = true }
 ordermap = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+# Used in `ingest_extra_records` to deserialize the wire-shipped
+# `record_json` field back into a `rattler_conda_types::RepoDataRecord`.
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
@@ -58,15 +61,27 @@ zlink = { workspace = true }
 pixi_build_discovery = { workspace = true }
 pixi_command_dispatcher = { workspace = true }
 pixi_compute_reporters = { workspace = true }
+# Used for the `CACHED_PACKAGES` ("pkgs") subdir name when the
+# install handler ingests `extra_records` into the package cache.
+pixi_consts = { workspace = true }
 pixi_git = { workspace = true }
 # `pixi_global::EnvironmentName::from_str` is the source of truth for
 # env-name validation; `validate_env_name` delegates to it so the daemon
 # accepts exactly the names the local CLI does.
 pixi_global = { workspace = true }
 pixi_path = { workspace = true }
+# `UnresolvedPixiRecord::Binary(Arc<RepoDataRecord>)` is the shape
+# `InstallPixiEnvironmentSpec.records` takes; `extra_records`
+# splicing constructs these directly from client-supplied records.
+pixi_record = { workspace = true }
 pixi_spec = { workspace = true }
 pixi_spec_containers = { workspace = true }
 rattler = { workspace = true }
+# Used to extract client-supplied `.conda` artefacts (carried in
+# `InstallRequest::extra_records`) into the daemon's package cache so
+# the rattler installer finds them by name+version+build during the
+# install transaction.
+rattler_cache = { workspace = true }
 rattler_conda_types = { workspace = true }
 rattler_virtual_packages = { workspace = true }
 

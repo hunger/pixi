@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 // This forces the crate to be compiled even though the crate is not used in the
 // project. https://github.com/rust-lang/rust/issues/64402
 #[cfg(feature = "pixi_allocator")]

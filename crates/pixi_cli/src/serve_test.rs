@@ -128,6 +128,7 @@ async fn install(socket: &Path, args: InstallArgs) -> miette::Result<()> {
         channels,
         platform: args.platform,
         force_reinstall: false,
+        extra_records: Vec::new(),
     };
 
     let stream = conn.install(request).await.into_diagnostic()?;

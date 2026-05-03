@@ -1,3 +1,8 @@
+// `run_against_server` (in tests) wires several deeply-nested
+// async closures together; bumping the recursion limit keeps
+// rustc's layout computation happy as we add more `extra_records`-
+// related plumbing into the install pipeline.
+#![recursion_limit = "256"]
 //! Varlink IPC server/client for pixi, built on top of the [`zlink`] crate.
 //!
 //! This crate defines a `dev.prefix.pixi.Echo` Varlink interface and

@@ -142,6 +142,7 @@ pub(crate) async fn install_via_daemon(
         channels: params.channels.clone(),
         platform: params.platform.map(|p| p.to_string()),
         force_reinstall: params.force_reinstall,
+        extra_records: Vec::new(),
     };
 
     // Auth target is `~/.pixi/envs/`: the directory the localised

@@ -26,12 +26,14 @@ use pixi_command_dispatcher::{
     keys::{SolvePixiEnvironmentKey, SolvePixiEnvironmentSpec},
 };
 use pixi_path::AbsPathBuf;
+use pixi_record::UnresolvedPixiRecord;
 use pixi_spec::PixiSpec;
 use pixi_spec_containers::DependencyMap;
 use rattler::install::{Transaction, TransactionOperation};
+use rattler_cache::package_cache::PackageCache;
 use rattler_conda_types::{
     ChannelConfig, ChannelUrl, HasArtifactIdentificationRefs, MatchSpec, PackageName,
-    ParseStrictness, Platform, prefix::Prefix,
+    ParseStrictness, Platform, RepoDataRecord, prefix::Prefix,
 };
 use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
 use serde::{Deserialize, Serialize};
@@ -187,6 +189,43 @@ pub struct InstallRequest {
     /// fingerprint short-circuit.
     #[serde(default, skip_serializing_if = "is_false")]
     pub force_reinstall: bool,
+
+    /// Pre-built records the client wants spliced into the daemon's
+    /// install. Each entry names a `.conda` file path the daemon
+    /// can read off the local filesystem (the client and daemon are
+    /// colocated by the daemon's deployment model) plus the
+    /// `RepoDataRecord` describing the package. The daemon extracts
+    /// the artefact into its package cache, then includes the
+    /// carried record in the rattler transaction, exactly as if it
+    /// had solved and fetched the package itself.
+    ///
+    /// Currently used by `pixi global install` / `update` to ship
+    /// locally-built source packages — the client builds source
+    /// specs against its own dispatcher, then routes the resulting
+    /// records (with binary deps still solved server-side) through
+    /// here. Empty for installs with no source packages, in which
+    /// case the field is elided on the wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_records: Vec<ExtraRecord>,
+}
+
+/// One package the client built locally, ready to be spliced into
+/// the daemon's install pipeline. See [`InstallRequest::extra_records`].
+///
+/// `record_json` is a serde-encoded
+/// `rattler_conda_types::RepoDataRecord`. It rides on the wire as an
+/// opaque string so this crate doesn't have to reproduce the full
+/// RepoDataRecord type with `zlink::Type` derived; the daemon parses
+/// it via `serde_json::from_str` before splicing.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct ExtraRecord {
+    /// Absolute path to a `.conda` file the daemon process can read.
+    /// On rejection, the daemon raises [`InstallFailure::InstallFailed`].
+    pub artifact_path: String,
+    /// Serde-JSON-encoded `rattler_conda_types::RepoDataRecord`. The
+    /// `url` field is informational at this point; the daemon resolves
+    /// the artefact via `artifact_path`.
+    pub record_json: String,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -518,6 +557,14 @@ pub(crate) async fn run_install(
             reason: format!("solve failed: {e}"),
         })?;
 
+    // Splice client-built records (typically locally-built source
+    // packages) into the install. The daemon reads each `.conda`
+    // file off the local filesystem and extracts it into its own
+    // package cache so the rattler installer finds the package by
+    // name+version+build during the transaction below — without
+    // ever fetching from the URL on the carried `RepoDataRecord`.
+    let extra_unresolved = ingest_extra_records(&request.extra_records, &cfg.cache).await?;
+
     fs_err::create_dir_all(&prefix_path).map_err(|e| InstallFailure::InstallFailed {
         reason: format!("could not create prefix {}: {e}", prefix_path.display()),
     })?;
@@ -527,13 +574,22 @@ pub(crate) async fn run_install(
 
     let install_spec = InstallPixiEnvironmentSpec {
         name: request.env_name.clone(),
-        records: records_arc.iter().cloned().map(Into::into).collect(),
+        records: records_arc
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .chain(extra_unresolved.iter().cloned())
+            .collect(),
         prefix,
         installed: None,
         ignore_packages: None,
         build_environment,
         force_reinstall: if request.force_reinstall {
-            records_arc.iter().map(|r| r.name().clone()).collect()
+            records_arc
+                .iter()
+                .map(|r| r.name().clone())
+                .chain(extra_unresolved.iter().map(|r| r.name().clone()))
+                .collect()
         } else {
             Default::default()
         },
@@ -564,6 +620,56 @@ pub(crate) async fn run_install(
 
     let summary = TransactionSummary::from_transaction(&install_result.transaction);
     Ok((prefix_path, summary))
+}
+
+/// Extract each `extra_records` artefact into the daemon's package
+/// cache and return the parsed `RepoDataRecord`s wrapped as
+/// [`UnresolvedPixiRecord::Binary`]s ready to splice into
+/// [`InstallPixiEnvironmentSpec::records`].
+///
+/// The daemon's package cache lives at `<cache>/pkgs/`; once a
+/// `.conda` is extracted there by `name-version-build`, the rattler
+/// installer's cache lookup hits before any URL fetch fires. That's
+/// what makes the carried record's `url` field informational here:
+/// the artefact is already in cache by the time the install
+/// transaction runs.
+async fn ingest_extra_records(
+    extras: &[ExtraRecord],
+    cache_root: &Path,
+) -> Result<Vec<UnresolvedPixiRecord>, InstallFailure> {
+    if extras.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pkgs_dir = cache_root.join(pixi_consts::consts::CACHED_PACKAGES);
+    let pkg_cache = PackageCache::new(&pkgs_dir);
+    let mut out = Vec::with_capacity(extras.len());
+    for extra in extras {
+        let artifact = Path::new(&extra.artifact_path);
+        if !artifact.is_absolute() {
+            return Err(InstallFailure::InstallFailed {
+                reason: format!(
+                    "extra-record artifact path must be absolute, got {:?}",
+                    extra.artifact_path
+                ),
+            });
+        }
+        pkg_cache
+            .get_or_fetch_from_path(artifact, None)
+            .await
+            .map_err(|e| InstallFailure::InstallFailed {
+                reason: format!(
+                    "could not extract {:?} into the daemon's package cache: {e}",
+                    extra.artifact_path
+                ),
+            })?;
+        let record: RepoDataRecord = serde_json::from_str(&extra.record_json).map_err(|e| {
+            InstallFailure::InstallFailed {
+                reason: format!("invalid record_json on extra record: {e}"),
+            }
+        })?;
+        out.push(UnresolvedPixiRecord::Binary(Arc::new(record)));
+    }
+    Ok(out)
 }
 
 /// Reject any source-typed (`PixiSpec::Path` / `Url` / `Git`)
@@ -993,5 +1099,82 @@ mod tests {
         let bytes = serde_json::to_vec(&original).unwrap();
         let parsed: InstallFailure = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(original, parsed);
+    }
+
+    /// `ExtraRecord` and the `extra_records` field on `InstallRequest`
+    /// round-trip through serde without losing any bytes. The
+    /// daemon parses `record_json` back into a real
+    /// `RepoDataRecord`; this test pins the wire shape itself.
+    #[test]
+    fn install_request_extra_records_round_trip() {
+        let original = InstallRequest {
+            env_name: "foo".to_string(),
+            specs: vec!["bar".to_string()],
+            channels: vec!["https://example.com/conda-forge".to_string()],
+            platform: None,
+            force_reinstall: false,
+            extra_records: vec![ExtraRecord {
+                artifact_path: "/cache/source-build/foo-1.0-h0_0.conda".to_string(),
+                record_json: r#"{"name":"foo","version":"1.0"}"#.to_string(),
+            }],
+        };
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let parsed: InstallRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.extra_records.len(), 1);
+        assert_eq!(
+            parsed.extra_records[0].artifact_path,
+            original.extra_records[0].artifact_path
+        );
+        assert_eq!(
+            parsed.extra_records[0].record_json,
+            original.extra_records[0].record_json
+        );
+    }
+
+    /// An empty `extra_records` is elided on the wire so existing
+    /// callers that don't ship source builds pay no extra bytes.
+    #[test]
+    fn install_request_omits_empty_extra_records() {
+        let original = InstallRequest {
+            env_name: "foo".to_string(),
+            specs: vec![],
+            channels: vec![],
+            platform: None,
+            force_reinstall: false,
+            extra_records: vec![],
+        };
+        let json: serde_json::Value = serde_json::to_value(&original).unwrap();
+        let obj = json.as_object().expect("expected JSON object");
+        assert!(
+            !obj.contains_key("extra_records"),
+            "empty extra_records should be skipped, got {obj:?}"
+        );
+    }
+
+    /// `ingest_extra_records` rejects relative artefact paths
+    /// upfront. The daemon resolves the path verbatim against its
+    /// own filesystem, so an attacker-controllable relative path
+    /// would resolve against the daemon's cwd — refuse with a
+    /// structured error rather than silently picking up an
+    /// unintended file.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_extra_records_rejects_relative_paths() {
+        let extras = vec![ExtraRecord {
+            artifact_path: "relative/path.conda".to_string(),
+            record_json: r#"{"name":"foo","version":"1.0"}"#.to_string(),
+        }];
+        let cache_root = std::env::temp_dir();
+        let err = ingest_extra_records(&extras, &cache_root)
+            .await
+            .unwrap_err();
+        match err {
+            InstallFailure::InstallFailed { reason } => {
+                assert!(
+                    reason.contains("absolute"),
+                    "error should mention 'absolute', got {reason:?}"
+                );
+            }
+            other => panic!("expected InstallFailed, got {other:?}"),
+        }
     }
 }
