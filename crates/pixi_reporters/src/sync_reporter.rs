@@ -163,7 +163,7 @@ pub struct CombinedInstallReporterInner {
     build_output_receiver: Option<UnboundedReceiver<String>>,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PackageWithSize {
     pub name: String,
     pub size: u64,

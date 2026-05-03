@@ -1,9 +1,9 @@
 mod download_verify_reporter;
 mod git;
-mod main_progress_bar;
+pub mod main_progress_bar;
 mod release_notes;
 mod repodata_reporter;
-mod sync_reporter;
+pub mod sync_reporter;
 pub mod uv_reporter;
 
 use std::{

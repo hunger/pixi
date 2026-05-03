@@ -23,7 +23,9 @@ use pixi_global::{
     list::list_all_global_environments,
     project::{ExposedType, GlobalSpec},
 };
-use pixi_varlink::{ExposeMapping, InstallReply, InstallRequest};
+use pixi_varlink::{ExposeMapping, InstallReply, InstallRequest, ReporterClient};
+
+use super::wire_reporter_client::WireReporterClient;
 
 /// Installs the defined packages in a globally accessible location and exposes their command line applications.
 ///
@@ -473,13 +475,33 @@ async fn setup_environment_via_daemon(
         .map_err(|e| e.wrap_err(format!("could not connect to {}", socket.display())))?;
     let stream = conn.install(request).await.into_diagnostic()?;
     let mut stream = std::pin::pin!(stream);
+    // Drive indicatif from the daemon's marshalled reporter stream
+    // using the same `MainProgressBar` primitives the local install
+    // path uses. The renderer is anchored to the global multi-progress
+    // so logging interleaves cleanly with the bars.
+    let reporter_client = WireReporterClient::new(pixi_progress::global_multi_progress());
     let mut server_prefix: Option<PathBuf> = None;
     while let Some(item) = stream.next().await {
         let reply = item
             .into_diagnostic()?
             .map_err(|err| miette!("daemon rejected install: {err:?}"))?;
         match reply {
-            InstallReply::Progress { event } => tracing::debug!(?event, "install progress"),
+            InstallReply::ReporterCall { call } => {
+                // The daemon's `WireReporter` marshals every reporter
+                // callback into a structured [`ReporterCall`]; we
+                // hand each one to the local [`ReporterClient`].
+                // Default impl logs at INFO under target
+                // `pixi::install::reporter`; future indicatif
+                // renderers plug in here without touching the wire
+                // shape.
+                reporter_client.on_call(call);
+            }
+            InstallReply::Progress { event } => {
+                // Reserved for non-reporter progress events. None are
+                // emitted by the daemon today; trace the payload so
+                // schema growth surfaces in -vv runs.
+                tracing::trace!(target: "pixi::install::reporter", ?event, "install progress");
+            }
             InstallReply::Success { prefix } => {
                 server_prefix = Some(PathBuf::from(prefix));
                 break;

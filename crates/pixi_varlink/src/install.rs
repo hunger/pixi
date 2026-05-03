@@ -7,10 +7,12 @@
 //! configured `cache` root, solves the requested specs, lays down the
 //! resulting records under `<data>/<HASH>/`, and persists the
 //! environment fingerprint so subsequent identical requests
-//! short-circuit. The terminal reply is a single [`InstallReply::Success`]
-//! carrying the absolute prefix path or [`InstallReply::Failed`].
-//! Step 7 will interleave [`InstallReply::Progress`] events ahead of
-//! the terminal reply.
+//! short-circuit. When the streaming RPC is invoked with `more=true`,
+//! [`run_install`] is given an `mpsc::UnboundedSender<ProgressEvent>`
+//! that the [`crate::wire_reporter::WireReporter`] funnels every
+//! dispatcher- and rattler-side reporter callback into; the RPC body
+//! interleaves those as [`InstallReply::Progress`] events ahead of
+//! the terminal [`InstallReply::Success`] / [`InstallReply::Failed`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -225,17 +227,26 @@ pub struct ExposeMapping {
 
 /// One streaming reply from `Install`.
 ///
-/// `Install` is declared `#[zlink(more)]` so step 7 can interleave
-/// [`Progress`](Self::Progress) events without a wire-incompatible
-/// schema change. Today the stream contains exactly one terminal
-/// reply, either [`Success`](Self::Success) or [`Failed`](Self::Failed).
+/// `Install` is declared `#[zlink(more)]` so the body can interleave
+/// any number of progress / reporter events ahead of the terminal
+/// reply. The terminal reply is exactly one of [`Success`](Self::Success)
+/// or [`Failed`](Self::Failed).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InstallReply {
-    /// Streaming progress event. Not emitted yet; reserved for step 7.
+    /// Free-form progress event reserved for future progress-bar
+    /// rendering paths. Currently unused for daemon-routed installs.
     Progress {
         /// The notification.
         event: crate::ProgressEvent,
+    },
+    /// One marshalled reporter callback the dispatcher (or its
+    /// rattler subsystems) made on the server during the install.
+    /// Streamed in order; the client unmarshals each into the
+    /// corresponding call on its [`crate::ReporterClient`].
+    ReporterCall {
+        /// The marshalled call.
+        call: crate::ReporterCall,
     },
     /// Terminal success. Final reply in the stream.
     Success {
@@ -312,6 +323,7 @@ pub(crate) async fn run_install(
     cfg: &ServerConfig,
     auth_path: &Path,
     request: &InstallRequest,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::ReporterCall>>,
 ) -> Result<PathBuf, InstallFailure> {
     let hash = env_hash(&cfg.salt, auth_path, &request.env_name);
     let prefix_path = cfg.data.join(&hash);
@@ -350,10 +362,24 @@ pub(crate) async fn run_install(
         })?
         .into_assume_dir();
 
-    let dispatcher = CommandDispatcher::builder()
+    let mut dispatcher_builder = CommandDispatcher::builder()
         .with_cache_dirs(CacheDirs::new(cache_root))
-        .with_channel_config(channel_config)
-        .finish();
+        .with_channel_config(channel_config);
+    if let Some(tx) = progress_tx {
+        let reporter = std::sync::Arc::new(crate::wire_reporter::WireReporter::new(tx));
+        dispatcher_builder = dispatcher_builder
+            .with_pixi_install_reporter(reporter.clone())
+            .with_pixi_solve_reporter(reporter.clone())
+            .with_conda_solve_reporter(reporter.clone())
+            .with_git_checkout_reporter(reporter.clone())
+            .with_url_checkout_reporter(reporter.clone())
+            .with_instantiate_backend_reporter(reporter.clone())
+            .with_build_backend_metadata_reporter(reporter.clone())
+            .with_source_metadata_reporter(reporter.clone())
+            .with_source_record_reporter(reporter.clone())
+            .with_backend_source_build_reporter(reporter);
+    }
+    let dispatcher = dispatcher_builder.finish();
 
     let solve_spec = SolvePixiEnvironmentSpec {
         dependencies,

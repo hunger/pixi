@@ -20,10 +20,17 @@
 //!   connection at compile time.
 
 mod install;
+mod reporter_wire;
+#[cfg(unix)]
+mod wire_reporter;
 
 pub use install::{
     ExposeMapping, InstallFailure, InstallReply, InstallRequest, SALT_LEN, ServerConfig,
     ServerConfigError, env_hash, validate_env_name,
+};
+pub use reporter_wire::{
+    CondaSolveEnvWire, InstallEnvWire, LoggingReporterClient, PixiSolveEnvWire, ReporterCall,
+    ReporterClient, TransactionOpWire,
 };
 
 use std::collections::HashMap;
@@ -38,6 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_fd_lock::LockWrite;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
+use futures::StreamExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, trace, warn};
@@ -381,12 +389,33 @@ async fn compute_install_reply(
             };
         }
     };
-    match install::run_install(cfg, &directory, &request).await {
+    match install::run_install(cfg, &directory, &request, None).await {
         Ok(prefix) => InstallReply::Success {
             prefix: prefix.display().to_string(),
         },
         Err(error) => InstallReply::Failed { error },
     }
+}
+
+/// Streaming `install` shares the same auth/config gates as
+/// [`compute_install_reply`] but needs them as a separate fail-fast
+/// step before the install task is spawned. Returns the terminal
+/// failure reply on rejection so the caller can yield it as a
+/// single-element stream.
+fn preflight_install(service: &EchoService, conn_id: usize) -> Result<(), InstallReply> {
+    if service.require_authenticated(conn_id).is_err() {
+        return Err(InstallReply::Failed {
+            error: install::InstallFailure::NotAuthenticated,
+        });
+    }
+    if service.install_config.is_none() {
+        return Err(InstallReply::Failed {
+            error: install::InstallFailure::ServerNotConfigured {
+                hint: "start `pixi serve` with `--data <PATH>` and `--cache <PATH>` (or the matching `[serve]` config keys)".to_string(),
+            },
+        });
+    }
+    Ok(())
 }
 
 impl EchoService {
@@ -569,9 +598,13 @@ where
     }
 
     /// Solve the requested specs and lay down the resulting binary
-    /// records under `<data>/<HASH>/`. Returns a single terminal reply
-    /// (Success / Failed). Step 7 will interleave Progress events ahead
-    /// of the terminal reply.
+    /// records under `<data>/<HASH>/`. With `more=true` (the daemon
+    /// path always sets this), every reporter callback the dispatcher
+    /// and rattler subsystems make during the install is forwarded as
+    /// an [`InstallReply::Progress`] event ahead of the terminal
+    /// [`InstallReply::Success`] / [`InstallReply::Failed`]. With
+    /// `more=false` (a non-streaming caller, e.g. `serve-test
+    /// install`) the body emits only the terminal reply.
     #[zlink(more)]
     #[instrument(level = "debug", skip(self, conn), fields(conn_id = conn.id(), env = %request.env_name, more))]
     async fn install(
@@ -580,13 +613,70 @@ where
         request: InstallRequest,
         #[zlink(connection)] conn: &mut zlink::Connection<Sock>,
     ) -> impl futures::Stream<Item = zlink::Reply<InstallReply>> + Unpin {
-        // `more=false` means a non-streaming caller; we still emit the
-        // single terminal reply unchanged. The flag matters for steps that
-        // emit Progress events.
-        let _ = more;
-        let reply = compute_install_reply(self, conn.id(), request).await;
-        let item = zlink::Reply::new(Some(reply)).set_continues(Some(false));
-        futures::stream::iter(vec![item])
+        if !more {
+            // Non-streaming caller: keep the original "single terminal
+            // reply, no reporter" path. Cheap, used by `serve-test`.
+            let reply = compute_install_reply(self, conn.id(), request).await;
+            let item = zlink::Reply::new(Some(reply)).set_continues(Some(false));
+            return futures::stream::iter(vec![item]).boxed();
+        }
+
+        // Streaming path. Auth/config preflight stays synchronous so a
+        // bad request fails fast with a single terminal reply, no
+        // spawned task.
+        if let Err(reply) = preflight_install(self, conn.id()) {
+            let item = zlink::Reply::new(Some(reply)).set_continues(Some(false));
+            return futures::stream::iter(vec![item]).boxed();
+        }
+        if let Err(failure) = install::validate_env_name(&request.env_name) {
+            let reply = InstallReply::Failed { error: failure };
+            let item = zlink::Reply::new(Some(reply)).set_continues(Some(false));
+            return futures::stream::iter(vec![item]).boxed();
+        }
+
+        let directory = self
+            .require_authenticated(conn.id())
+            .expect("preflight verified auth");
+        let cfg = self
+            .install_config
+            .clone()
+            .expect("preflight verified install config is set");
+
+        // Channel: WireReporter pushes events from the dispatcher's
+        // many reporter callbacks; the stream below forwards them
+        // verbatim. Unbounded because dropping events would silently
+        // misrepresent install state, and the dispatcher's reporter
+        // calls are non-async and cheap.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReporterCall>();
+        let request_for_task = request.clone();
+        let install_task = tokio::spawn(async move {
+            let result = install::run_install(&cfg, &directory, &request_for_task, Some(tx)).await;
+            match result {
+                Ok(prefix) => InstallReply::Success {
+                    prefix: prefix.display().to_string(),
+                },
+                Err(error) => InstallReply::Failed { error },
+            }
+        });
+
+        // Pump reporter calls while the install task runs; once `tx`
+        // drops the call stream ends, then chain a single terminal
+        // item resolved from the join handle.
+        let call_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|call| {
+            zlink::Reply::new(Some(InstallReply::ReporterCall { call })).set_continues(Some(true))
+        });
+        let terminal = futures::stream::once(async move {
+            let reply = match install_task.await {
+                Ok(r) => r,
+                Err(e) => InstallReply::Failed {
+                    error: install::InstallFailure::InstallFailed {
+                        reason: format!("install task panicked or was cancelled: {e}"),
+                    },
+                },
+            };
+            zlink::Reply::new(Some(reply)).set_continues(Some(false))
+        });
+        call_stream.chain(terminal).boxed()
     }
 
     #[zlink(more)]

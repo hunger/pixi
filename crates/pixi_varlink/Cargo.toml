@@ -39,6 +39,10 @@ tokio = { workspace = true, features = [
   "rt",
   "sync",
 ] }
+# `UnboundedReceiverStream` adapts the install-side progress channel
+# into a `futures::Stream` so the streaming `Install` RPC can chain
+# events with the terminal reply.
+tokio-stream = "0.1"
 tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
@@ -52,17 +56,28 @@ zlink = { workspace = true }
 # constructs its own dispatcher per install call against the server's
 # `data` / `cache` roots.
 itertools = { workspace = true }
+# WireReporter needs to name JsonRpcBackendSpec / RepositoryReference
+# in trait method signatures so the dispatcher's `Reporter` and its
+# git-checkout sub-trait can be implemented for it. Rattler's install
+# Reporter and the gateway/run-exports reporters round out the
+# coverage so every callback the local install path would have made
+# is also fired on the daemon path.
+pixi_build_discovery = { workspace = true }
 pixi_command_dispatcher = { workspace = true }
+pixi_compute_reporters = { workspace = true }
+pixi_git = { workspace = true }
 pixi_global = { workspace = true }
 pixi_path = { workspace = true }
 pixi_spec = { workspace = true }
 pixi_spec_containers = { workspace = true }
 pixi_utils = { workspace = true }
+rattler = { workspace = true }
 rattler_conda_types = { workspace = true }
 rattler_shell = { workspace = true }
 rattler_virtual_packages = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [
   "fs",

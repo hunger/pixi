@@ -169,6 +169,12 @@ async fn install(socket: &Path, args: InstallArgs) -> miette::Result<()> {
             pixi_varlink::InstallReply::Progress { event } => {
                 tracing::info!(?event, "install progress");
             }
+            pixi_varlink::InstallReply::ReporterCall { call } => {
+                // serve-test invokes the streaming RPC with `more=false`,
+                // so the daemon never emits these — log if one shows up
+                // so a misconfigured client doesn't lose data silently.
+                tracing::info!(?call, "unexpected reporter call on non-streaming path");
+            }
             pixi_varlink::InstallReply::Success { prefix: p } => {
                 prefix = Some(p);
                 break;

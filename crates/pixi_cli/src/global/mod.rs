@@ -19,6 +19,7 @@ mod uninstall;
 mod update;
 mod upgrade;
 mod upgrade_all;
+mod wire_reporter_client;
 
 #[derive(Debug, Parser)]
 pub enum Command {

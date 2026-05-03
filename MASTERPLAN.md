@@ -595,13 +595,56 @@ is `reflink` (with per-file copy fallback for non-CoW filesystems);
   env var that exercises `du`-based extent sharing on a real CoW
   filesystem.
 
-#### Step 8. Streaming progress on `Install` — with rendering parity
+#### Step 8. Streaming progress on `Install`
 
-**Goal.** Wire `pixi_compute_engine`'s progress callbacks (post-Phase
-0) into `ProgressEvent`s on the streaming `Install` RPC, **and**
-route the client-side rendering through the *same* indicatif renderer
-as a local install — so the user sees byte-for-byte equivalent
-progress output whether the install ran locally or via the daemon.
+**v1 status (done).** Server-side `WireReporter`
+(`crates/pixi_varlink/src/wire_reporter.rs`) implements every
+reporter trait the dispatcher and rattler subsystems consume
+(`pixi_command_dispatcher::Reporter` plus all 10+ sub-traits, plus
+`rattler::install::Reporter`, `rattler_repodata_gateway::Reporter`,
+`DownloadReporter`, `RunExportsReporter`) and marshals each
+callback into a structured [`ReporterCall`](crates/pixi_varlink/src/reporter_wire.rs)
+variant (one per trait method, with wire-friendly mirror types
+where the original arg shapes weren't natively (de)serialisable).
+The streaming `Install` RPC body spawns the install task with a
+`WireReporter` attached, pumps `ReporterCall`s through an mpsc
+channel into `InstallReply::ReporterCall { call }` items, and
+chains a terminal `Success` / `Failed`. Client side has a
+`ReporterClient` trait (default impl `LoggingReporterClient`
+logs each call at `INFO` under target `pixi::install::reporter`);
+the daemon-routed install path constructs one and dispatches each
+incoming `ReporterCall` to it. A loopback `pixi global install
+--expose lzcat xz` produces ~390 calls round-tripped end-to-end.
+The non-streaming `serve-test install` path is unchanged.
+
+**v2 status (done).** Indicatif-driving `ReporterClient` lives in
+`crates/pixi_cli/src/global/wire_reporter_client.rs`. It composes
+the same primitives (`pixi_reporters::main_progress_bar::MainProgressBar`,
+`pixi_reporters::sync_reporter::PackageWithSize`) the local install
+path uses through `TopLevelProgress`, so daemon-routed installs draw
+the *same* solving / installing bars without round-tripping through
+fake `Transaction` / `RepoDataRecord` values. The wire format grew
+one field for this: `ReporterCall::InstallOnTransactionStart` now
+ships `Vec<Option<TransactionOpWire>>` (per-op package name + size)
+so the install bar can be pre-populated to its final length before
+work begins, matching the local UX.
+
+**Test infra for renderer correctness.** A `Capture` `TermLike` in
+the renderer's test module splits indicatif's draw stream into
+distinct frames at every `flush()` call — each frame is one bar
+redraw. Tests assert on the frame *sequence* (every counter value
+must appear, in monotonic order) and dump the captured frames via
+`eprintln!` so `cargo test -- --nocapture` shows the bar visibly
+filling. The frame-sequence guard catches the three classic
+"silent UX rot" modes: bar pops up only when finished, bar never
+draws, bar gets stuck on the first state. Verified by deliberately
+breaking the renderer and watching the assertions fire.
+
+**Still deferred (v3+).** Cache-prep / download / source-build /
+git-checkout bars (the rest of `TopLevelProgress`'s coverage), and
+the fixture-based snapshot test described below.
+
+**v2 sketch (original plan, parts still relevant for v3+).**
 
 The key design constraint is that the renderer is unified, not
 duplicated. Concretely:
