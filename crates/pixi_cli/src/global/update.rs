@@ -6,9 +6,8 @@ use miette::miette;
 use pixi_config::{Config, ConfigCli};
 use pixi_global::common::check_all_exposed;
 use pixi_global::project::ExposedType;
-use pixi_global::{EnvRoot, EnvironmentName, LocaliseMode, Project};
+use pixi_global::{EnvironmentName, LocaliseMode, Project};
 use pixi_global::{StateChange, StateChanges};
-use rattler_conda_types::PackageName;
 
 use crate::GlobalOptions;
 use crate::global::revert_environment_after_error;
@@ -173,83 +172,31 @@ async fn apply_changes_via_daemon(
     force_reinstall: bool,
 ) -> miette::Result<StateChanges> {
     // Capture pre-update expose policy from the manifest's existing
-    // exposed list against the on-disk env's binaries — *if* the env
-    // is already materialised locally. If it isn't (first daemon
-    // update for this env), default to `ExposedType::All` so a fresh
-    // env auto-exposes everything, matching local update's behaviour
-    // when the env has just been materialised by `install_environment`.
-    let env_root = EnvRoot::from_env().await?;
-    let local_prefix = env_root.path().join(env_name.as_str());
-    let expose_type = if local_prefix.exists() {
-        let env_binaries = project.executables_of_direct_dependencies(env_name).await?;
-        let exposed_mapping_binaries = &project
-            .environment(env_name)
-            .ok_or_else(|| miette!("Environment {} not found", env_name.fancy_display()))?
-            .exposed;
-        if check_all_exposed(&env_binaries, exposed_mapping_binaries) {
-            ExposedType::All
-        } else {
-            ExposedType::Nothing
-        }
-    } else {
-        ExposedType::All
-    };
+    // `exposed` list against the on-disk env's binaries — *if* the
+    // env is materialised locally. The helper then re-applies the
+    // same policy after the install so a "use all binaries"
+    // configuration keeps auto-exposing newly-installed binaries
+    // and a manually-curated subset stays exactly that.
+    let expose_type = super::daemon::detect_existing_expose_policy(project, env_name).await?;
 
-    // Capture the env's direct-dependency names *before* the RPC, so
-    // we can fold them into the wire-shipped `EnvironmentUpdate` for
-    // user-facing reporting.
-    let direct_dependencies: Vec<PackageName> = project
-        .environment(env_name)
-        .ok_or_else(|| miette!("Environment {} not found", env_name.fancy_display()))?
-        .dependencies
-        .specs
-        .keys()
-        .cloned()
-        .collect();
-
-    // Pre-build any source-typed deps via the local dispatcher.
-    // `manifest_snapshot_for_env` already strips source specs from
-    // the wire `specs`; this fills the gap by shipping their
-    // built-record JSON in `extra_records` and the runtime deps as
-    // synthetic MatchSpec strings on `specs` so the daemon's solve
-    // covers their binary closure.
-    let source_globals: Vec<pixi_global::project::GlobalSpec> = project
-        .environment(env_name)
-        .ok_or_else(|| miette!("Environment {} not found", env_name.fancy_display()))?
-        .dependencies
-        .specs
-        .iter()
-        .filter(|(_, spec)| spec.is_source())
-        .map(|(name, spec)| pixi_global::project::GlobalSpec::new(name.clone(), spec.clone()))
-        .collect();
-    let (extra_records, source_runtime_deps) =
-        super::daemon::build_source_specs_via_local_dispatcher(project, env_name, &source_globals)
-            .await?;
-
-    let mut params = super::daemon::manifest_snapshot_for_env(project, env_name, force_reinstall)?;
-    params.specs.extend(source_runtime_deps);
-    params.extra_records = extra_records;
-
-    let output = super::daemon::install_via_daemon(
+    let (mut state_changes, environment_update) = super::daemon::run_install_for_env(
         project,
         env_name,
-        &params,
         socket,
         localise_mode,
+        force_reinstall,
         expose_type,
+        Vec::new(),
     )
     .await?;
 
-    let mut state_changes = StateChanges::default();
-    let environment_update = super::daemon::wire_transaction_to_environment_update(
-        &output.transaction,
-        direct_dependencies,
-    )?;
-    state_changes.insert_change(
+    let mut wrapped = StateChanges::default();
+    wrapped.insert_change(
         env_name,
         StateChange::UpdatedEnvironment(environment_update),
     );
-    state_changes |= output.state_changes;
+    wrapped |= state_changes;
+    state_changes = wrapped;
 
     // Update doesn't add new shortcut entries to the manifest (the
     // manifest's existing list is authoritative). It does re-sync

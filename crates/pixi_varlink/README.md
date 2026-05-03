@@ -1,11 +1,18 @@
 # pixi_varlink
 
 Varlink IPC server and client used by `pixi serve`. The server is the
-daemon-side surface behind `pixi global install --socket <PATH>`,
-`pixi global update --socket <PATH>`, and
-`pixi global uninstall --socket <PATH>`; clients on the same host
-can share the daemon's `data` and `cache` directories, paying the
-solve+download cost only once across machines/users.
+daemon-side surface behind every env-mutating `pixi global`
+subcommand:
+
+  - `pixi global install --socket <PATH>`
+  - `pixi global update --socket <PATH>`
+  - `pixi global add --socket <PATH>`
+  - `pixi global remove --socket <PATH>`
+  - `pixi global uninstall --socket <PATH>`
+
+Clients on the same host can share the daemon's `data` and `cache`
+directories, paying the solve+download cost only once across
+machines/users.
 
 The wire protocol is built on the [`zlink`](https://crates.io/crates/zlink)
 crate (Rust varlink). The handshake (`Hello` / `Authenticate`) binds
@@ -14,12 +21,12 @@ authorization is rooted in that directory.
 
 ## Daemon vs. local: behavioural differences
 
-`pixi global install`, `pixi global update`, and
-`pixi global uninstall` produce the same filesystem artefacts
-(manifest, exposed mappings, trampolines, shortcuts, completions)
-whether run locally or routed through `pixi serve`. A handful of
-behaviours diverge by design — they are listed here so users
-opting into `--socket` aren't surprised.
+The env-mutating `pixi global` subcommands listed above produce
+the same filesystem artefacts (manifest, exposed mappings,
+trampolines, shortcuts, completions) whether run locally or routed
+through `pixi serve`. A handful of behaviours diverge by design —
+they are listed here so users opting into `--socket` aren't
+surprised.
 
 ### `pixi global uninstall` removes the daemon's prefix too
 

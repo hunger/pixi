@@ -1,10 +1,13 @@
-use crate::global::global_specs::GlobalSpecs;
-use crate::global::revert_environment_after_error;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use pixi_config::{Config, ConfigCli};
-use pixi_global::project::GlobalSpec;
-use pixi_global::{EnvironmentName, Mapping, Project, StateChange, StateChanges};
+use pixi_global::project::{ExposedType, GlobalSpec};
+use pixi_global::{EnvironmentName, LocaliseMode, Mapping, Project, StateChange, StateChanges};
+
+use crate::GlobalOptions;
+use crate::global::global_specs::GlobalSpecs;
+use crate::global::revert_environment_after_error;
 
 /// Adds dependencies to an environment
 ///
@@ -29,11 +32,17 @@ pub struct Args {
     #[arg(long)]
     expose: Vec<Mapping>,
 
+    /// How a daemon-routed add materialises the prefix at
+    /// `~/.pixi/envs/<env>`. See `pixi global install --help` for
+    /// the mode list. Ignored when running without `--socket`.
+    #[arg(long, value_name = "MODE")]
+    localise_mode: Option<String>,
+
     #[clap(flatten)]
     config: ConfigCli,
 }
 
-pub async fn execute(args: Args) -> miette::Result<()> {
+pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Result<()> {
     let config = Config::with_cli_config(&args.config);
     let project_original = Project::discover_or_create()
         .await?
@@ -46,60 +55,12 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         );
     }
 
-    async fn apply_changes(
-        env_name: &EnvironmentName,
-        specs: &[GlobalSpec],
-        expose: &[Mapping],
-        project: &mut Project,
-    ) -> miette::Result<StateChanges> {
-        let mut state_changes = StateChanges::new_with_env(env_name.clone());
-
-        // Add specs to the manifest
-        for spec in specs {
-            project.manifest.add_dependency(env_name, spec)?;
-        }
-
-        // Add expose mappings to the manifest
-        for mapping in expose {
-            project.manifest.add_exposed_mapping(env_name, mapping)?;
-        }
-
-        // Sync environment
-        let sync_changes = project.sync_environment(env_name, None).await?;
-
-        // Figure out added packages and their corresponding versions from EnvironmentUpdate
-        let requested_package_names: Vec<_> =
-            specs.iter().map(|spec| spec.name().clone()).collect();
-
-        // Extract EnvironmentUpdate from sync changes if present
-        if let Some(changes_for_env) = sync_changes.changes_for_env(env_name) {
-            for change in changes_for_env {
-                if let StateChange::UpdatedEnvironment(environment_update) = change {
-                    let user_requested_changes =
-                        environment_update.user_requested_changes(&requested_package_names);
-
-                    // Convert to StateChange::AddedPackage for packages that were installed or upgraded
-                    state_changes
-                        .add_packages_from_install_changes(
-                            env_name,
-                            user_requested_changes,
-                            project,
-                        )
-                        .await?;
-                    break;
-                }
-            }
-        }
-
-        // Add the sync changes
-        state_changes |= sync_changes;
-
-        state_changes |= project.sync_completions(env_name).await?;
-
-        project.manifest.save().await?;
-
-        Ok(state_changes)
-    }
+    let socket: Option<PathBuf> = global_options
+        .socket
+        .clone()
+        .or_else(|| config.remote.socket.clone());
+    let localise_mode =
+        super::daemon::resolve_localise_mode(args.localise_mode.as_deref(), &config)?;
 
     let specs = args
         .packages
@@ -112,14 +73,30 @@ pub async fn execute(args: Args) -> miette::Result<()> {
 
     let mut project_modified = project_original.clone();
 
-    match apply_changes(
-        &args.environment,
-        &specs,
-        args.expose.as_slice(),
-        &mut project_modified,
-    )
-    .await
-    {
+    let result = match socket.as_deref() {
+        Some(socket) => {
+            apply_changes_via_daemon(
+                &args.environment,
+                &specs,
+                args.expose.as_slice(),
+                &mut project_modified,
+                socket,
+                localise_mode,
+            )
+            .await
+        }
+        None => {
+            apply_changes_local(
+                &args.environment,
+                &specs,
+                args.expose.as_slice(),
+                &mut project_modified,
+            )
+            .await
+        }
+    };
+
+    match result {
         Ok(state_changes) => {
             state_changes.report();
             Ok(())
@@ -134,4 +111,103 @@ pub async fn execute(args: Args) -> miette::Result<()> {
             Err(err)
         }
     }
+}
+
+/// Local-path add: mutate manifest, then defer to
+/// [`Project::sync_environment`] which solves+installs locally and
+/// runs the expose/shortcuts/completions tail.
+async fn apply_changes_local(
+    env_name: &EnvironmentName,
+    specs: &[GlobalSpec],
+    expose: &[Mapping],
+    project: &mut Project,
+) -> miette::Result<StateChanges> {
+    let mut state_changes = StateChanges::new_with_env(env_name.clone());
+
+    for spec in specs {
+        project.manifest.add_dependency(env_name, spec)?;
+    }
+    for mapping in expose {
+        project.manifest.add_exposed_mapping(env_name, mapping)?;
+    }
+
+    let sync_changes = project.sync_environment(env_name, None).await?;
+
+    let requested_package_names: Vec<_> = specs.iter().map(|spec| spec.name().clone()).collect();
+    if let Some(changes_for_env) = sync_changes.changes_for_env(env_name) {
+        for change in changes_for_env {
+            if let StateChange::UpdatedEnvironment(environment_update) = change {
+                let user_requested_changes =
+                    environment_update.user_requested_changes(&requested_package_names);
+                state_changes
+                    .add_packages_from_install_changes(env_name, user_requested_changes, project)
+                    .await?;
+                break;
+            }
+        }
+    }
+
+    state_changes |= sync_changes;
+    state_changes |= project.sync_completions(env_name).await?;
+    project.manifest.save().await?;
+    Ok(state_changes)
+}
+
+/// Daemon-routed add: mutate manifest, then drive the install
+/// through the shared [`super::daemon::run_install_for_env`]
+/// helper. The user-facing report mirrors the local path —
+/// `UpdatedEnvironment` plus per-package `AddedPackage` entries
+/// for the names the user passed on the CLI.
+async fn apply_changes_via_daemon(
+    env_name: &EnvironmentName,
+    specs: &[GlobalSpec],
+    expose: &[Mapping],
+    project: &mut Project,
+    socket: &Path,
+    localise_mode: LocaliseMode,
+) -> miette::Result<StateChanges> {
+    for spec in specs {
+        project.manifest.add_dependency(env_name, spec)?;
+    }
+    for mapping in expose {
+        project.manifest.add_exposed_mapping(env_name, mapping)?;
+    }
+
+    // `add` doesn't run `sync_exposed_names` against an
+    // [`ExposedType`]: the manifest's `exposed` list already reflects
+    // the user's intent (the entries we just `add_exposed_mapping`'d
+    // plus whatever was there before). [`ExposedType::Nothing`] tells
+    // the helper "don't touch the manifest's exposed list" — the
+    // subsequent `expose_executables_from_environment` walk picks up
+    // the entries verbatim.
+    let (helper_changes, environment_update) = super::daemon::run_install_for_env(
+        project,
+        env_name,
+        socket,
+        localise_mode,
+        false,
+        ExposedType::Nothing,
+        Vec::new(),
+    )
+    .await?;
+
+    let mut state_changes = StateChanges::default();
+    let requested_package_names: Vec<_> = specs.iter().map(|spec| spec.name().clone()).collect();
+    let user_requested_changes =
+        environment_update.user_requested_changes(&requested_package_names);
+    state_changes.insert_change(
+        env_name,
+        StateChange::UpdatedEnvironment(environment_update),
+    );
+    state_changes
+        .add_packages_from_install_changes(env_name, user_requested_changes, project)
+        .await?;
+    state_changes |= helper_changes;
+
+    // sync_environment (local path) does these inside; daemon path
+    // calls them explicitly because the helper stops after expose.
+    state_changes |= project.sync_shortcuts(env_name).await?;
+    state_changes |= project.sync_completions(env_name).await?;
+    project.manifest.save().await?;
+    Ok(state_changes)
 }

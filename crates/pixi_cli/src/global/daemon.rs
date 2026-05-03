@@ -1,15 +1,18 @@
-//! Shared daemon-routed install flow used by `pixi global install`
-//! and `pixi global update`.
+//! Shared daemon-routed install flow used by every env-mutating
+//! `pixi global` subcommand: `install`, `update`, `add`, `remove`.
+//! (Uninstall has its own much smaller path — see
+//! `crates/pixi_cli/src/global/uninstall.rs`.)
 //!
-//! Both subcommands send the exact same `Install` RPC; what differs
-//! is the prologue (install mutates the manifest, update reads it
-//! as-is) and the post-install reporting (install emits per-package
-//! `AddedPackage` state changes, update emits a single
-//! `UpdatedEnvironment` carrying a rich `EnvironmentUpdate`). This
-//! module owns the shared body — wire request, stream pump,
-//! localisation, expose-mapping sync — and exposes helpers for the
-//! call sites to render the wire transaction summary into the
-//! domain-shaped types each path needs.
+//! All four subcommands send the same `Install` RPC; what differs
+//! is the prologue (install / add / remove mutate the manifest;
+//! update reads it as-is) and the post-install reporting (install
+//! and add emit per-package `AddedPackage` state changes; update
+//! and remove emit a single `UpdatedEnvironment` carrying a rich
+//! `EnvironmentUpdate`). This module owns the shared body — wire
+//! request, stream pump, localisation, expose-mapping sync — and
+//! exposes helpers for the call sites to render the wire
+//! transaction summary into the domain-shaped types each path
+//! needs.
 //!
 //! Nothing here mutates the manifest or persists it; the per-call
 //! site decides when (and whether) to call `manifest.save()`.
@@ -161,10 +164,12 @@ pub(crate) struct DaemonInstallOutput {
 
 /// Drive a daemon-routed install end-to-end up to (and including)
 /// expose-mapping sync. The caller supplies the `expose_type` —
-/// install computes it from `args.expose` / `args.with`, update
-/// computes it by inspecting the localised prefix's binaries against
-/// the manifest's exposed list (or defaults to
-/// [`ExposedType::All`]).
+/// `install` computes it from `args.expose` / `args.with`,
+/// `update` derives it from the localised prefix's binaries via
+/// [`detect_existing_expose_policy`], and `add` / `remove` pass
+/// [`ExposedType::Nothing`] because the manifest's `exposed` list
+/// is already authoritative after their explicit
+/// `add_exposed_mapping` / `remove_exposed_name` mutations.
 pub(crate) async fn install_via_daemon(
     project: &mut Project,
     env_name: &EnvironmentName,
@@ -283,6 +288,112 @@ pub(crate) async fn install_via_daemon(
         transaction,
         state_changes,
     })
+}
+
+/// Run the daemon-routed install for the env's *current* manifest
+/// state. Used by `update`, `add`, and `remove` after they've made
+/// whatever manifest mutations they need; the helper picks up the
+/// resulting deps, builds any source-typed entries locally, and
+/// drives [`install_via_daemon`].
+///
+/// `expose_type` is the caller's choice — `update` derives it from
+/// the pre-update prefix (auto-expose-all vs subset); `add` /
+/// `remove` pass [`ExposedType::Nothing`] because the manifest's
+/// existing `exposed` list is already authoritative once they've
+/// added or removed mappings.
+///
+/// `extra_current_packages` lets callers (specifically `remove`)
+/// fold names of packages that were just dropped from the manifest
+/// into the returned [`EnvironmentUpdate`]'s `current_packages` set,
+/// matching what the local
+/// [`pixi_global::common::EnvironmentUpdate::add_removed_packages`]
+/// step does — so the `report_update_changes` formatter still
+/// classifies them as top-level changes.
+///
+/// Returns the helper's accumulated [`StateChanges`] (from
+/// expose-mapping sync) and the rich [`EnvironmentUpdate`] the
+/// caller wraps in a [`StateChange::UpdatedEnvironment`].
+pub(crate) async fn run_install_for_env(
+    project: &mut Project,
+    env_name: &EnvironmentName,
+    socket: &Path,
+    localise_mode: LocaliseMode,
+    force_reinstall: bool,
+    expose_type: ExposedType,
+    extra_current_packages: Vec<PackageName>,
+) -> miette::Result<(StateChanges, EnvironmentUpdate)> {
+    // Build any source-typed deps via the local dispatcher.
+    let source_globals: Vec<GlobalSpec> = project
+        .environment(env_name)
+        .ok_or_else(|| miette!("Environment {} not found", env_name.as_str()))?
+        .dependencies
+        .specs
+        .iter()
+        .filter(|(_, spec)| spec.is_source())
+        .map(|(name, spec)| GlobalSpec::new(name.clone(), spec.clone()))
+        .collect();
+    let (extra_records, source_runtime_deps) =
+        build_source_specs_via_local_dispatcher(project, env_name, &source_globals).await?;
+
+    // Build the wire-shipped EnvironmentUpdate's current_packages set:
+    // the env's manifest deps post-mutation, plus any caller-supplied
+    // extras (used by `remove` to keep removed names visible to the
+    // formatter).
+    let mut direct_dependencies: Vec<PackageName> = project
+        .environment(env_name)
+        .ok_or_else(|| miette!("Environment {} not found", env_name.as_str()))?
+        .dependencies
+        .specs
+        .keys()
+        .cloned()
+        .collect();
+    direct_dependencies.extend(extra_current_packages);
+
+    let mut params = manifest_snapshot_for_env(project, env_name, force_reinstall)?;
+    params.specs.extend(source_runtime_deps);
+    params.extra_records = extra_records;
+
+    let output = install_via_daemon(
+        project,
+        env_name,
+        &params,
+        socket,
+        localise_mode,
+        expose_type,
+    )
+    .await?;
+    let environment_update =
+        wire_transaction_to_environment_update(&output.transaction, direct_dependencies)?;
+
+    Ok((output.state_changes, environment_update))
+}
+
+/// Capture the pre-update auto-expose policy from the local prefix's
+/// binaries against the manifest's exposed list. Used by `update` (and
+/// later by `sync`) to preserve the user's "expose all" vs "expose a
+/// subset" intent across a re-install. Returns
+/// [`ExposedType::All`] when the env isn't materialised locally yet.
+pub(crate) async fn detect_existing_expose_policy(
+    project: &Project,
+    env_name: &EnvironmentName,
+) -> miette::Result<ExposedType> {
+    let env_root = EnvRoot::from_env().await?;
+    let local_prefix = env_root.path().join(env_name.as_str());
+    if !local_prefix.exists() {
+        return Ok(ExposedType::All);
+    }
+    let env_binaries = project.executables_of_direct_dependencies(env_name).await?;
+    let exposed_mapping_binaries = &project
+        .environment(env_name)
+        .ok_or_else(|| miette!("Environment {} not found", env_name.as_str()))?
+        .exposed;
+    Ok(
+        if pixi_global::common::check_all_exposed(&env_binaries, exposed_mapping_binaries) {
+            ExposedType::All
+        } else {
+            ExposedType::Nothing
+        },
+    )
 }
 
 /// Read channels, platform, and dependency specs from the manifest's
