@@ -368,24 +368,45 @@ pub async fn execute_command(
     command: Command,
     global_options: &GlobalOptions,
 ) -> miette::Result<()> {
-    // `--socket` is parseable on every subcommand (it's a global flag) but
-    // only `pixi serve`, `pixi serve-test`, and the `pixi global`
-    // subcommands actually accept it. The env-mutating ones
-    // (`install` / `update` / `uninstall` / `add` / `remove` / `sync`)
-    // route work through the daemon when the socket is set; the rest
-    // accept it for CLI uniformity but ignore it. Refuse it loudly on
-    // any other top-level subcommand so silent behaviour drift is
-    // impossible.
+    // `--socket` is parseable on every subcommand (it's a global flag).
+    // Three buckets:
+    //   - `pixi serve` / `pixi serve-test` / `pixi global` actually
+    //     consume the socket (run the daemon, or route work through
+    //     it).
+    //   - Read-only / admin / local-only commands accept the socket
+    //     and ignore it, so a global `[remote] socket = "..."` in
+    //     config doesn't trip a panic on every harmless invocation.
+    //   - Workspace solve/install/build commands (`install`, `run`,
+    //     `update`, `add`, `remove`, `exec`, `build`, ...) panic
+    //     until daemon routing is implemented for them, so silent
+    //     behaviour drift is impossible.
     #[cfg(unix)]
-    if global_options.socket.is_some()
-        && !matches!(
+    if global_options.socket.is_some() {
+        let routes_through_daemon = matches!(
             command,
             Command::Serve(_) | Command::ServeTest(_) | Command::Global(_)
-        )
-    {
-        panic!(
-            "--socket is only consumed by `pixi serve`, `pixi serve-test`, and the `pixi global` subcommands"
         );
+        let ignores_socket = matches!(
+            command,
+            Command::Auth(_)
+                | Command::Clean(_)
+                | Command::Completion(_)
+                | Command::Config(_)
+                | Command::External(_)
+                | Command::Info(_)
+                | Command::Init(_)
+                | Command::List(_)
+                | Command::Search(_)
+                | Command::SelfUpdate(_)
+                | Command::Task(_)
+                | Command::Tree(_)
+                | Command::Workspace(_)
+        );
+        if !routes_through_daemon && !ignores_socket {
+            panic!(
+                "--socket is set, but daemon routing is not yet implemented for this subcommand"
+            );
+        }
     }
 
     match command {
