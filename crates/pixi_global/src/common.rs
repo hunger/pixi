@@ -423,6 +423,15 @@ impl StateChanges {
         self.changes.get(env_name)
     }
 
+    /// Borrow every `(env, [changes])` entry. Used by callers that
+    /// need to scan the change set for a specific variant — e.g.
+    /// `pixi global sync` walks the prune-step's
+    /// [`StateChanges`] for [`StateChange::RemovedEnvironment`]
+    /// entries so it can free the matching daemon-side prefixes.
+    pub fn iter(&self) -> impl Iterator<Item = (&EnvironmentName, &Vec<StateChange>)> {
+        self.changes.iter()
+    }
+
     /// Convert user-requested install changes to AddedPackage state changes
     pub async fn add_packages_from_install_changes(
         &mut self,

@@ -1,14 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+use clap::Parser;
+use fancy_display::FancyDisplay;
+use miette::Report;
+use pixi_config::{Config, ConfigCli};
+use pixi_global::StateChanges;
+use pixi_global::{EnvironmentName, Project};
 
 use crate::GlobalOptions;
 use crate::global::revert_environment_after_error;
-use clap::Parser;
-use fancy_display::FancyDisplay;
-use miette::{IntoDiagnostic, Report, miette};
-use pixi_config::{Config, ConfigCli};
-use pixi_global::StateChanges;
-use pixi_global::{EnvRoot, EnvironmentName, Project};
-use pixi_varlink::{UninstallFailure, UninstallReply, UninstallRequest};
 
 /// Uninstalls environments from the global environment.
 ///
@@ -63,7 +63,7 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
                 // the user-visible env is already gone, and the
                 // daemon-side prefix is just cache.
                 if let Some(socket) = socket.as_deref()
-                    && let Err(err) = uninstall_via_daemon(socket, env_name).await
+                    && let Err(err) = super::daemon::uninstall_via_daemon(socket, env_name).await
                 {
                     tracing::warn!(
                         "Local uninstall of {} succeeded but the daemon-side prefix could \
@@ -94,43 +94,5 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
             tracing::warn!("Couldn't remove {}\n{err:?}", env_name.fancy_display());
         }
         Err(miette::miette!("Some environments couldn't be removed."))
-    }
-}
-
-/// Send `Uninstall` to the daemon at `socket` to free its
-/// `<data>/<HASH>/` for `env_name`. Idempotent at the user level:
-/// `EnvNotFound` is treated as success because the user-visible
-/// outcome (no daemon-side prefix for this env) matches.
-async fn uninstall_via_daemon(socket: &Path, env_name: &EnvironmentName) -> miette::Result<()> {
-    let env_root = EnvRoot::from_env().await?;
-    let mut conn = pixi_varlink::connect(socket, env_root.path())
-        .await
-        .into_diagnostic()
-        .map_err(|e| e.wrap_err(format!("could not connect to {}", socket.display())))?;
-    let reply = conn
-        .uninstall(UninstallRequest {
-            env_name: env_name.as_str().to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .map_err(|err| miette!("daemon rejected uninstall: {err:?}"))?;
-    match reply {
-        UninstallReply::Success => Ok(()),
-        UninstallReply::Failed {
-            error: UninstallFailure::EnvNotFound { .. },
-        } => {
-            // No `<data>/<HASH>/` to remove — user's intent is
-            // already satisfied. Trace it for `-vv` runs and
-            // continue silently.
-            tracing::debug!(
-                env = %env_name.fancy_display(),
-                "daemon reported no prefix for env; treating as already-removed"
-            );
-            Ok(())
-        }
-        UninstallReply::Failed { error } => Err(miette!(
-            "daemon refused uninstall of {}: {error:?}",
-            env_name.as_str()
-        )),
     }
 }

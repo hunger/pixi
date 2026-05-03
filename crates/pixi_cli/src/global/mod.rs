@@ -76,7 +76,7 @@ pub async fn execute(cmd: Args, global_options: &GlobalOptions) -> miette::Resul
         Command::Uninstall(args) => uninstall::execute(args, global_options).await?,
         Command::Remove(args) => remove::execute(args, global_options).await?,
         Command::List(args) => list::execute(args).await?,
-        Command::Sync(args) => sync::execute(args).await?,
+        Command::Sync(args) => sync::execute(args, global_options).await?,
         Command::Expose(subcommand) => expose::execute(subcommand).await?,
         Command::Shortcut(subcommand) => shortcut::execute(subcommand).await?,
         Command::Update(args) => update::execute(args, global_options).await?,

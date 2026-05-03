@@ -9,6 +9,7 @@ subcommand:
   - `pixi global add --socket <PATH>`
   - `pixi global remove --socket <PATH>`
   - `pixi global uninstall --socket <PATH>`
+  - `pixi global sync --socket <PATH>`
 
 Clients on the same host can share the daemon's `data` and `cache`
 directories, paying the solve+download cost only once across

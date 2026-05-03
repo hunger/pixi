@@ -20,6 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use fancy_display::FancyDisplay;
 use futures::StreamExt;
 use miette::{IntoDiagnostic, miette};
 use pixi_config::Config;
@@ -30,7 +31,7 @@ use pixi_global::{
 };
 use pixi_varlink::{
     ExtraRecord, InstallChangeWire, InstallReply, InstallRequest, ReporterClient,
-    TransactionSummary,
+    TransactionSummary, UninstallFailure, UninstallReply, UninstallRequest,
 };
 use rattler_conda_types::{PackageName, Platform, Version};
 
@@ -366,6 +367,48 @@ pub(crate) async fn run_install_for_env(
         wire_transaction_to_environment_update(&output.transaction, direct_dependencies)?;
 
     Ok((output.state_changes, environment_update))
+}
+
+/// Send `Uninstall` to the daemon at `socket` to free its
+/// `<data>/<HASH>/` for `env_name`. Idempotent at the user level:
+/// [`UninstallFailure::EnvNotFound`] is treated as success because
+/// the user-visible outcome (no daemon-side prefix for this env)
+/// matches.
+///
+/// Used by `pixi global uninstall` and `pixi global sync` (the
+/// latter for envs pruned by `prune_old_environments`).
+pub(crate) async fn uninstall_via_daemon(
+    socket: &Path,
+    env_name: &EnvironmentName,
+) -> miette::Result<()> {
+    let env_root = EnvRoot::from_env().await?;
+    let mut conn = pixi_varlink::connect(socket, env_root.path())
+        .await
+        .into_diagnostic()
+        .map_err(|e| e.wrap_err(format!("could not connect to {}", socket.display())))?;
+    let reply = conn
+        .uninstall(UninstallRequest {
+            env_name: env_name.as_str().to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .map_err(|err| miette!("daemon rejected uninstall: {err:?}"))?;
+    match reply {
+        UninstallReply::Success => Ok(()),
+        UninstallReply::Failed {
+            error: UninstallFailure::EnvNotFound { .. },
+        } => {
+            tracing::debug!(
+                env = %env_name.fancy_display(),
+                "daemon reported no prefix for env; treating as already-removed"
+            );
+            Ok(())
+        }
+        UninstallReply::Failed { error } => Err(miette!(
+            "daemon refused uninstall of {}: {error:?}",
+            env_name.as_str()
+        )),
+    }
 }
 
 /// Capture the pre-update auto-expose policy from the local prefix's
