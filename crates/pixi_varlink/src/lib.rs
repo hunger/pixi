@@ -368,28 +368,14 @@ async fn compute_install_reply(
     conn_id: usize,
     request: InstallRequest,
 ) -> InstallReply {
-    let directory = match service.require_authenticated(conn_id) {
-        Ok(d) => d,
-        Err(_) => {
-            return InstallReply::Failed {
-                error: InstallFailure::NotAuthenticated,
-            };
-        }
+    let (directory, cfg) = match preflight_install(service, conn_id) {
+        Ok(x) => x,
+        Err(error) => return InstallReply::Failed { error },
     };
-    if let Err(failure) = validate_env_name(&request.env_name) {
-        return InstallReply::Failed { error: failure };
+    if let Err(error) = validate_env_name(&request.env_name) {
+        return InstallReply::Failed { error };
     }
-    let cfg = match service.install_config.as_deref() {
-        Some(c) => c,
-        None => {
-            return InstallReply::Failed {
-                error: InstallFailure::ServerNotConfigured {
-                    hint: "start `pixi serve` with `--data <PATH>` and `--cache <PATH>` (or the matching `[serve]` config keys)".to_string(),
-                },
-            };
-        }
-    };
-    match install::run_install(cfg, &directory, &request, None).await {
+    match install::run_install(&cfg, &directory, &request, None).await {
         Ok(prefix) => InstallReply::Success {
             prefix: prefix.display().to_string(),
         },
@@ -397,25 +383,29 @@ async fn compute_install_reply(
     }
 }
 
-/// Streaming `install` shares the same auth/config gates as
-/// [`compute_install_reply`] but needs them as a separate fail-fast
-/// step before the install task is spawned. Returns the terminal
-/// failure reply on rejection so the caller can yield it as a
-/// single-element stream.
-fn preflight_install(service: &EchoService, conn_id: usize) -> Result<(), InstallReply> {
-    if service.require_authenticated(conn_id).is_err() {
-        return Err(InstallReply::Failed {
-            error: install::InstallFailure::NotAuthenticated,
-        });
-    }
-    if service.install_config.is_none() {
-        return Err(InstallReply::Failed {
-            error: install::InstallFailure::ServerNotConfigured {
-                hint: "start `pixi serve` with `--data <PATH>` and `--cache <PATH>` (or the matching `[serve]` config keys)".to_string(),
-            },
-        });
-    }
-    Ok(())
+/// User-facing hint emitted by [`InstallFailure::ServerNotConfigured`].
+/// Spelled out once so streaming and non-streaming install paths
+/// agree on the wording.
+const SERVE_NOT_CONFIGURED_HINT: &str = "start `pixi serve` with `--data <PATH>` and `--cache <PATH>` (or the matching `[serve]` config keys)";
+
+/// Auth + install-config gate shared by the streaming and
+/// non-streaming `install` paths. Returns the authenticated client
+/// directory and the configured [`install::ServerConfig`] on
+/// success; the caller turns the [`InstallFailure`] into whichever
+/// terminal reply shape it needs.
+fn preflight_install(
+    service: &EchoService,
+    conn_id: usize,
+) -> Result<(PathBuf, Arc<install::ServerConfig>), install::InstallFailure> {
+    let directory = service
+        .require_authenticated(conn_id)
+        .map_err(|_| install::InstallFailure::NotAuthenticated)?;
+    let cfg = service.install_config.clone().ok_or_else(|| {
+        install::InstallFailure::ServerNotConfigured {
+            hint: SERVE_NOT_CONFIGURED_HINT.to_string(),
+        }
+    })?;
+    Ok((directory, cfg))
 }
 
 impl EchoService {
@@ -624,23 +614,17 @@ where
         // Streaming path. Auth/config preflight stays synchronous so a
         // bad request fails fast with a single terminal reply, no
         // spawned task.
-        if let Err(reply) = preflight_install(self, conn.id()) {
-            let item = zlink::Reply::new(Some(reply)).set_continues(Some(false));
-            return futures::stream::iter(vec![item]).boxed();
-        }
-        if let Err(failure) = install::validate_env_name(&request.env_name) {
-            let reply = InstallReply::Failed { error: failure };
-            let item = zlink::Reply::new(Some(reply)).set_continues(Some(false));
-            return futures::stream::iter(vec![item]).boxed();
-        }
-
-        let directory = self
-            .require_authenticated(conn.id())
-            .expect("preflight verified auth");
-        let cfg = self
-            .install_config
-            .clone()
-            .expect("preflight verified install config is set");
+        let preflight = preflight_install(self, conn.id()).and_then(|(dir, cfg)| {
+            install::validate_env_name(&request.env_name).map(|_| (dir, cfg))
+        });
+        let (directory, cfg) = match preflight {
+            Ok(x) => x,
+            Err(error) => {
+                let reply = InstallReply::Failed { error };
+                let item = zlink::Reply::new(Some(reply)).set_continues(Some(false));
+                return futures::stream::iter(vec![item]).boxed();
+            }
+        };
 
         // Channel: WireReporter pushes events from the dispatcher's
         // many reporter callbacks; the stream below forwards them

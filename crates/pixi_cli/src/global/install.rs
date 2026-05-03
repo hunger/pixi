@@ -9,7 +9,6 @@ use indexmap::IndexMap;
 use clap::Parser;
 use fancy_display::FancyDisplay;
 use futures::StreamExt;
-use itertools::Itertools;
 use miette::{IntoDiagnostic, Report, miette};
 use rattler_conda_types::{MatchSpec, NamedChannelOrUrl, Platform};
 
@@ -240,12 +239,37 @@ fn resolve_localise_mode(cli: Option<&str>, config: &Config) -> miette::Result<L
     }
 }
 
-async fn setup_environment(
+/// Output of [`prepare_install_manifest`]: the manifest prologue's
+/// side effects that both the local and the daemon-routed install
+/// paths need afterwards.
+struct PreparedInstall {
+    /// Accumulated state changes (force-reinstall removal,
+    /// added-environment marker).
+    state_changes: StateChanges,
+    /// Packages to install: `args.packages` plus the
+    /// `--with` inclusions converted to [`GlobalSpec`]s. Both paths
+    /// derive their downstream artefacts (manifest entries,
+    /// match-spec strings, requested-package names) from this.
+    packages_to_add: Vec<GlobalSpec>,
+    /// Channels resolved from CLI arg or project default. The
+    /// daemon path forwards this verbatim on the wire; the local
+    /// path doesn't read it after the prologue.
+    channels: Vec<NamedChannelOrUrl>,
+}
+
+/// Mutate `project.manifest` to reflect a fresh install: honour
+/// `--force-reinstall`, register the environment with its channels,
+/// set the platform if requested, add every dependency (including
+/// `--with` inclusions), and replace expose mappings with the
+/// explicit `args.expose` list. Identical for the local and
+/// daemon-routed install paths — this helper is the shared prologue
+/// that runs before each path's distinct "actually install" tail.
+async fn prepare_install_manifest(
     env_name: &EnvironmentName,
     args: &Args,
     specs: &[GlobalSpec],
     project: &mut Project,
-) -> miette::Result<StateChanges> {
+) -> miette::Result<PreparedInstall> {
     let mut state_changes = StateChanges::new_with_env(env_name.clone());
 
     if args.force_reinstall && project.environment(env_name).is_some() {
@@ -258,9 +282,10 @@ async fn setup_environment(
         args.channels.clone()
     };
 
-    // Modify the project to include the new environment
     if !project.manifest.parsed.envs.contains_key(env_name) {
-        project.manifest.add_environment(env_name, Some(channels))?;
+        project
+            .manifest
+            .add_environment(env_name, Some(channels.clone()))?;
         state_changes.insert_change(env_name, StateChange::AddedEnvironment);
     }
 
@@ -279,11 +304,11 @@ async fn setup_environment(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Add the dependencies to the environment
-    let packages_to_add = specs
+    let packages_to_add: Vec<GlobalSpec> = specs
         .iter()
-        .chain(converted_with_inclusions.iter())
-        .collect_vec();
+        .cloned()
+        .chain(converted_with_inclusions)
+        .collect();
 
     for spec in &packages_to_add {
         project.manifest.add_dependency(env_name, spec)?;
@@ -291,11 +316,29 @@ async fn setup_environment(
 
     if !args.expose.is_empty() {
         project.manifest.remove_all_exposed_mappings(env_name)?;
-        // Only add the exposed mappings that were requested
         for mapping in &args.expose {
             project.manifest.add_exposed_mapping(env_name, mapping)?;
         }
     }
+
+    Ok(PreparedInstall {
+        state_changes,
+        packages_to_add,
+        channels,
+    })
+}
+
+async fn setup_environment(
+    env_name: &EnvironmentName,
+    args: &Args,
+    specs: &[GlobalSpec],
+    project: &mut Project,
+) -> miette::Result<StateChanges> {
+    let PreparedInstall {
+        mut state_changes,
+        packages_to_add,
+        channels: _,
+    } = prepare_install_manifest(env_name, args, specs, project).await?;
 
     if project.environment_in_sync_internal(env_name, true).await? {
         return Ok(StateChanges::new_with_env(env_name.clone()));
@@ -377,55 +420,11 @@ async fn setup_environment_via_daemon(
     socket: &Path,
     localise_mode: LocaliseMode,
 ) -> miette::Result<StateChanges> {
-    let mut state_changes = StateChanges::new_with_env(env_name.clone());
-
-    if args.force_reinstall && project.environment(env_name).is_some() {
-        state_changes |= project.remove_environment(env_name).await?;
-    }
-
-    let channels = if args.channels.is_empty() {
-        project.config().default_channels()
-    } else {
-        args.channels.clone()
-    };
-
-    if !project.manifest.parsed.envs.contains_key(env_name) {
-        project
-            .manifest
-            .add_environment(env_name, Some(channels.clone()))?;
-        state_changes.insert_change(env_name, StateChange::AddedEnvironment);
-    }
-
-    if let Some(platform) = args.platform {
-        project.manifest.set_platform(env_name, platform)?;
-    }
-
-    let converted_with_inclusions = args
-        .with
-        .iter()
-        .map(|spec| {
-            GlobalSpec::try_from_matchspec_with_name(
-                spec.clone(),
-                project.config().global_channel_config(),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let packages_to_add = specs
-        .iter()
-        .chain(converted_with_inclusions.iter())
-        .collect_vec();
-
-    for spec in &packages_to_add {
-        project.manifest.add_dependency(env_name, spec)?;
-    }
-
-    if !args.expose.is_empty() {
-        project.manifest.remove_all_exposed_mappings(env_name)?;
-        for mapping in &args.expose {
-            project.manifest.add_exposed_mapping(env_name, mapping)?;
-        }
-    }
+    let PreparedInstall {
+        mut state_changes,
+        packages_to_add,
+        channels,
+    } = prepare_install_manifest(env_name, args, specs, project).await?;
 
     // Build the wire request: resolve channel URLs via the project's
     // channel config, render specs as match-spec strings, convert
