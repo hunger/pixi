@@ -215,6 +215,53 @@ pub(crate) async fn install_via_daemon(
     })
 }
 
+/// Read channels, platform, and dependency specs from the manifest's
+/// existing entry for `env_name`, render to wire strings, and emit a
+/// [`DaemonRequestParams`] suitable for `update`'s daemon path.
+pub(crate) fn manifest_snapshot_for_env(
+    project: &Project,
+    env_name: &EnvironmentName,
+    force_reinstall: bool,
+) -> miette::Result<DaemonRequestParams> {
+    let environment = project
+        .environment(env_name)
+        .ok_or_else(|| miette!("Environment {} not found", env_name.as_str()))?;
+
+    let channel_config = project.config().global_channel_config().clone();
+
+    let mut prioritised: Vec<_> = environment.channels.iter().collect();
+    prioritised.sort_by(|a, b| {
+        b.priority
+            .unwrap_or(0)
+            .cmp(&a.priority.unwrap_or(0))
+            .then_with(|| a.channel.to_string().cmp(&b.channel.to_string()))
+    });
+    let channels: Vec<String> = prioritised
+        .iter()
+        .filter_map(|pc| pc.channel.clone().into_base_url(&channel_config).ok())
+        .map(|url| url.to_string())
+        .collect();
+
+    let specs: Vec<String> = environment
+        .dependencies
+        .specs
+        .iter()
+        .map(|(name, spec)| {
+            spec.clone()
+                .to_match_spec(name, &channel_config)
+                .map(|ms| ms.to_string())
+                .into_diagnostic()
+        })
+        .collect::<miette::Result<Vec<_>>>()?;
+
+    Ok(DaemonRequestParams {
+        specs,
+        channels,
+        platform: environment.platform,
+        force_reinstall,
+    })
+}
+
 /// Convert the daemon's wire transaction summary into the domain
 /// [`EnvironmentUpdate`] the local install/update paths carry. The
 /// caller supplies `direct_dependencies` (the env's manifest specs)
