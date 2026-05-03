@@ -8,23 +8,19 @@ use indexmap::IndexMap;
 
 use clap::Parser;
 use fancy_display::FancyDisplay;
-use futures::StreamExt;
-use miette::{IntoDiagnostic, Report, miette};
+use miette::{IntoDiagnostic, Report};
 use rattler_conda_types::{MatchSpec, NamedChannelOrUrl, Platform};
 
 use crate::GlobalOptions;
 use crate::global::{global_specs::GlobalSpecs, revert_environment_after_error};
 use pixi_config::{self, Config, ConfigCli};
 use pixi_global::{
-    self, EnvChanges, EnvRoot, EnvState, EnvironmentName, LocaliseMode, Mapping, Project,
-    StateChange, StateChanges,
+    self, EnvChanges, EnvState, EnvironmentName, LocaliseMode, Mapping, Project, StateChange,
+    StateChanges,
     common::{NotChangedReason, contains_menuinst_document},
     list::list_all_global_environments,
     project::{ExposedType, GlobalSpec},
 };
-use pixi_varlink::{InstallReply, InstallRequest, ReporterClient};
-
-use super::wire_reporter_client::WireReporterClient;
 
 /// Installs the defined packages in a globally accessible location and exposes their command line applications.
 ///
@@ -115,7 +111,8 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
 
     // Localise-mode resolution: CLI flag > env var > config > default.
     // Only consulted on the daemon path; ignored otherwise.
-    let localise_mode = resolve_localise_mode(args.localise_mode.as_deref(), &config)?;
+    let localise_mode =
+        super::daemon::resolve_localise_mode(args.localise_mode.as_deref(), &config)?;
 
     // Load the global config and ensure
     // that the root_dir is relative to the manifest directory
@@ -220,22 +217,6 @@ pub async fn execute(args: Args, global_options: &GlobalOptions) -> miette::Resu
             tracing::warn!("Couldn't install {}\n{err:?}", env_name.fancy_display());
         }
         Err(miette::miette!("Some environments couldn't be installed."))
-    }
-}
-
-/// Pick a [`LocaliseMode`] from (in priority order) the
-/// `--localise-mode` CLI flag, the `PIXI_GLOBAL_LOCALISE` env var,
-/// the `[remote] localise = "..."` config key, falling back to
-/// [`LocaliseMode::default`] (`Reflink`) when none is set. Each
-/// layer takes a string, parsed via the mode's `FromStr`.
-fn resolve_localise_mode(cli: Option<&str>, config: &Config) -> miette::Result<LocaliseMode> {
-    let raw = cli
-        .map(str::to_owned)
-        .or_else(|| std::env::var("PIXI_GLOBAL_LOCALISE").ok())
-        .or_else(|| config.remote.localise.clone());
-    match raw {
-        Some(s) => s.parse().map_err(|e: String| miette!("{e}")),
-        None => Ok(LocaliseMode::default()),
     }
 }
 
@@ -350,7 +331,8 @@ async fn setup_environment(
         .await?;
 
     // Sync exposed name
-    sync_exposed_names(env_name, project, args).await?;
+    let expose_type = expose_type_for_install_args(args)?;
+    project.sync_exposed_names(env_name, expose_type).await?;
 
     // Add shortcuts
     if !args.no_shortcuts {
@@ -395,15 +377,13 @@ async fn setup_environment(
 /// run the install, localise the prefix, sync the expose mappings,
 /// write trampolines, finalise (shortcuts + completions + save).
 /// The only difference is *who* runs the install — the daemon at
-/// `socket` instead of an in-process dispatcher. After
-/// [`pixi_global::localise_prefix`] makes the prefix readable at
-/// `~/.pixi/envs/<env_name>`, the rest of the tail uses the same
-/// [`Project::sync_exposed_names`] +
-/// [`Project::expose_executables_from_environment`] +
-/// [`Project::finalise_environment_no_trampolines`] machinery the
-/// local path does, so default-expose-all, multi-component
-/// `executable_relname`, and per-package `AddedPackage` state
-/// changes all behave the same way on either path.
+/// `socket` instead of an in-process dispatcher. The shared body
+/// (wire RPC + reporter pump + localise + expose) lives in
+/// [`super::daemon::install_via_daemon`]; this function does the
+/// install-specific prologue + post-install per-package state-change
+/// rendering by walking the daemon's wire-shipped `TransactionSummary`
+/// the same way the local install path walks its dispatcher-emitted
+/// `EnvironmentUpdate`.
 async fn setup_environment_via_daemon(
     env_name: &EnvironmentName,
     args: &Args,
@@ -419,9 +399,7 @@ async fn setup_environment_via_daemon(
     } = prepare_install_manifest(env_name, args, specs, project).await?;
 
     // Build the wire request: resolve channel URLs via the project's
-    // channel config and render specs as match-spec strings. Expose
-    // mappings stay client-side — the daemon doesn't deal with
-    // trampolines anymore.
+    // channel config and render specs as match-spec strings.
     let channel_config = project.config().global_channel_config().clone();
     let channel_urls: Vec<String> = channels
         .iter()
@@ -438,145 +416,43 @@ async fn setup_environment_via_daemon(
                 .into_diagnostic()
         })
         .collect::<miette::Result<Vec<_>>>()?;
-    // Ship `executable_relname` (the path under the prefix's
-    // `bin/`), not `executable_name` (just the basename) — packages
-    let request = InstallRequest {
-        env_name: env_name.as_str().to_string(),
+    let params = super::daemon::DaemonRequestParams {
         specs: spec_strings,
         channels: channel_urls,
-        platform: args.platform.map(|p| p.to_string()),
+        platform: args.platform,
         force_reinstall: args.force_reinstall,
     };
 
-    // Auth target is `~/.pixi/envs/`: the directory the localised
-    // prefix symlink will live under.
-    let env_root = EnvRoot::from_env().await?;
+    let expose_type = expose_type_for_install_args(args)?;
 
-    let mut conn = pixi_varlink::connect(socket, env_root.path())
-        .await
-        .into_diagnostic()
-        .map_err(|e| e.wrap_err(format!("could not connect to {}", socket.display())))?;
-    let stream = conn.install(request).await.into_diagnostic()?;
-    let mut stream = std::pin::pin!(stream);
-    // Drive indicatif from the daemon's marshalled reporter stream
-    // using the same `MainProgressBar` primitives the local install
-    // path uses. The renderer is anchored to the global multi-progress
-    // so logging interleaves cleanly with the bars.
-    let reporter_client = WireReporterClient::new(pixi_progress::global_multi_progress());
-    let mut server_prefix: Option<PathBuf> = None;
-    while let Some(item) = stream.next().await {
-        let reply = item
-            .into_diagnostic()?
-            .map_err(|err| miette!("daemon rejected install: {err:?}"))?;
-        match reply {
-            InstallReply::ReporterCall { call } => {
-                // The daemon's `WireReporter` marshals every reporter
-                // callback into a structured [`ReporterCall`]; we
-                // hand each one to the local [`ReporterClient`].
-                // Default impl logs at INFO under target
-                // `pixi::install::reporter`; future indicatif
-                // renderers plug in here without touching the wire
-                // shape.
-                reporter_client.on_call(call);
-            }
-            InstallReply::Progress { event } => {
-                // Reserved for non-reporter progress events. None are
-                // emitted by the daemon today; trace the payload so
-                // schema growth surfaces in -vv runs.
-                tracing::trace!(target: "pixi::install::reporter", ?event, "install progress");
-            }
-            InstallReply::Success {
-                prefix,
-                transaction: _,
-            } => {
-                server_prefix = Some(PathBuf::from(prefix));
-                break;
-            }
-            InstallReply::Failed { error } => {
-                return Err(miette!("daemon install failed: {error:?}"));
-            }
-        }
-    }
-    let server_prefix = server_prefix
-        .ok_or_else(|| miette!("daemon ended the install stream without a terminal reply"))?;
+    let output = super::daemon::install_via_daemon(
+        project,
+        env_name,
+        &params,
+        socket,
+        localise_mode,
+        expose_type,
+    )
+    .await?;
+    state_changes |= output.state_changes;
 
-    let local_prefix = env_root.path().join(env_name.as_str());
-    if args.force_reinstall {
-        // Localise refuses to clobber a real directory the user
-        // didn't place themselves (or didn't place via a previous
-        // walk-mode install — those carry our `.pixi-localise`
-        // marker). With `--force-reinstall` the user has asked for
-        // a clean slate, so remove whatever's at `local_prefix`
-        // before localising. Symlinks are removed with `remove_file`
-        // (unlinks the link, never the target); directories with
-        // `remove_dir_all`. Modern stdlib's `remove_dir_all` uses
-        // `openat`/`O_NOFOLLOW` traversal so a swap-in symlink
-        // mid-removal can't redirect us.
-        match tokio::fs::symlink_metadata(&local_prefix).await {
-            Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => {
-                tokio::fs::remove_file(&local_prefix)
-                    .await
-                    .into_diagnostic()
-                    .map_err(|e| {
-                        e.wrap_err(format!(
-                            "could not remove existing {} for --force-reinstall",
-                            local_prefix.display()
-                        ))
-                    })?;
-            }
-            Ok(meta) if meta.is_dir() => {
-                tokio::fs::remove_dir_all(&local_prefix)
-                    .await
-                    .into_diagnostic()
-                    .map_err(|e| {
-                        e.wrap_err(format!(
-                            "could not remove existing {} for --force-reinstall",
-                            local_prefix.display()
-                        ))
-                    })?;
-            }
-            Ok(_) | Err(_) => {
-                // Nothing there or stat failed for an unrelated
-                // reason. Let `localise_prefix` produce the
-                // canonical error if applicable.
-            }
-        }
-    }
-    pixi_global::localise_prefix(&server_prefix, &local_prefix, localise_mode)
-        .await
-        .map_err(|e| miette!("{e}"))?;
-
-    // Reuse the local install path's expose-name + trampoline
-    // machinery now that the prefix is on the local filesystem.
-    // `sync_exposed_names` resolves the `--expose` / `--with` flags
-    // into manifest mappings (default-expose-all when neither is
-    // given), and `expose_executables_from_environment` walks those
-    // mappings to write a trampoline per binary into the bin dir —
-    // identical to what `setup_environment` does for a local
-    // install.
-    sync_exposed_names(env_name, project, args).await?;
-    state_changes |= project
-        .expose_executables_from_environment(env_name)
+    // Replay the daemon's transaction summary as per-package
+    // `AddedPackage` state changes — the same shape the local install
+    // path produces from its dispatcher-emitted `EnvironmentUpdate`.
+    // Filtered to the user-requested package names (specs +
+    // `--with`), so transitive deps stay quiet (matching local).
+    let direct_dependencies: Vec<rattler_conda_types::PackageName> = packages_to_add
+        .iter()
+        .map(|spec| spec.name().clone())
+        .collect();
+    let environment_update = super::daemon::wire_transaction_to_environment_update(
+        &output.transaction,
+        direct_dependencies.clone(),
+    )?;
+    let user_requested = environment_update.user_requested_changes(&direct_dependencies);
+    state_changes
+        .add_packages_from_install_changes(env_name, user_requested, project)
         .await?;
-
-    // Synthesise per-package state changes from the localised
-    // prefix's `conda-meta/`. Local install path computes these
-    // from the dispatcher's `EnvironmentUpdate`; the daemon path
-    // doesn't have one, but the records are on disk after
-    // localisation. For each requested-or-included package
-    // (`packages_to_add`), find its `PrefixRecord` and emit an
-    // `AddedPackage` — local path emits the same variant for
-    // Installed / Upgraded / Reinstalled, so we don't lose
-    // fidelity by collapsing those distinctions here.
-    let prefix = project.environment_prefix(env_name).await?;
-    for spec in &packages_to_add {
-        if let Ok(record) = prefix.find_designated_package(spec.name()).await {
-            state_changes.insert_change(
-                env_name,
-                StateChange::AddedPackage(Box::new(record.repodata_record.package_record)),
-            );
-        }
-    }
 
     state_changes |= project
         .finalise_environment_no_trampolines(env_name, !args.no_shortcuts, specs)
@@ -585,11 +461,10 @@ async fn setup_environment_via_daemon(
     Ok(state_changes)
 }
 
-async fn sync_exposed_names(
-    env_name: &EnvironmentName,
-    project: &mut Project,
-    args: &Args,
-) -> Result<(), miette::Error> {
+/// Compute the [`ExposedType`] from `pixi global install` arguments.
+/// Mirrors the original [`sync_exposed_names`] helper, but as a pure
+/// derivation step the daemon helper can pass to `Project::sync_exposed_names`.
+fn expose_type_for_install_args(args: &Args) -> miette::Result<ExposedType> {
     let with_package_names = args
         .with
         .iter()
@@ -599,13 +474,11 @@ async fn sync_exposed_names(
             })
         })
         .collect::<miette::Result<Vec<_>>>()?;
-    let expose_type = if args.expose.is_empty().not() {
+    Ok(if args.expose.is_empty().not() {
         ExposedType::Mappings(args.expose.clone())
     } else if with_package_names.is_empty() {
         ExposedType::All
     } else {
         ExposedType::Ignore(with_package_names)
-    };
-    project.sync_exposed_names(env_name, expose_type).await?;
-    Ok(())
+    })
 }

@@ -6,6 +6,7 @@ use crate::GlobalOptions;
 use pixi_global::EnvironmentName;
 
 mod add;
+mod daemon;
 mod edit;
 mod expose;
 mod global_specs;
