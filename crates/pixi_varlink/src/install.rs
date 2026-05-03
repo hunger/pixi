@@ -392,6 +392,20 @@ pub enum InstallFailure {
         /// is already in flight when displaying the error.
         env_name: String,
     },
+    /// The request carried one or more source specs (path / URL /
+    /// git) that the daemon cannot resolve. Path-based source specs
+    /// reference filesystem locations on the *client* and the daemon
+    /// has no view of them by design; URL/git source specs are
+    /// rejected for now too because the daemon doesn't run
+    /// client-supplied build backends. The official client
+    /// (`pixi global install` / `pixi global update --socket`)
+    /// catches these locally with a more actionable message; this
+    /// variant is the daemon's defense against non-conforming
+    /// clients.
+    UnsupportedSourceSpec {
+        /// Names of the packages whose specs were source-typed.
+        packages: Vec<String>,
+    },
     /// Catch-all for install failures: solve errors, malformed
     /// match-specs, dispatcher errors, prefix I/O failures.
     InstallFailed {
@@ -447,6 +461,7 @@ pub(crate) async fn run_install(
 
     let channel_config = default_channel_config();
     let dependencies = parse_specs(&request.specs, &channel_config)?;
+    refuse_source_dependencies(&dependencies)?;
 
     let cache_root = AbsPathBuf::new(cfg.cache.clone())
         .map_err(|err| InstallFailure::InstallFailed {
@@ -549,6 +564,33 @@ pub(crate) async fn run_install(
 
     let summary = TransactionSummary::from_transaction(&install_result.transaction);
     Ok((prefix_path, summary))
+}
+
+/// Reject any source-typed (`PixiSpec::Path` / `Url` / `Git`)
+/// entries in the parsed dependency map.
+///
+/// Path-typed source specs reference filesystem locations on the
+/// client and the daemon by design has no view of them. URL- and
+/// git-typed source specs are also rejected for now: the daemon
+/// doesn't run the client's `BackendOverride`, and without the
+/// build-backend mock that tests inject, a source build server-side
+/// has no realistic chance of matching what the local path produces.
+/// The official client catches these locally before sending; this
+/// check is the daemon's defense against a non-conforming or
+/// older-version client.
+fn refuse_source_dependencies(
+    dependencies: &DependencyMap<PackageName, PixiSpec>,
+) -> Result<(), InstallFailure> {
+    let bad: Vec<String> = dependencies
+        .iter_specs()
+        .filter(|(_, spec)| spec.is_source())
+        .map(|(name, _)| name.as_normalized().to_string())
+        .collect();
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(InstallFailure::UnsupportedSourceSpec { packages: bad })
+    }
 }
 
 fn parse_channels(channels: &[String]) -> Result<Vec<ChannelUrl>, InstallFailure> {
@@ -901,6 +943,55 @@ mod tests {
         // And it still parses back as the canonical default.
         let bytes = serde_json::to_vec(&original).unwrap();
         let parsed: crate::InstallReply = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    /// `refuse_source_dependencies` accepts a binary-only dep map
+    /// and rejects any source-typed entry. The daemon never has the
+    /// build infrastructure to honour source specs, so this is the
+    /// last line of defense against a non-conforming client.
+    #[test]
+    fn refuse_source_dependencies_accepts_binary_only() {
+        let mut deps: DependencyMap<PackageName, PixiSpec> = DependencyMap::default();
+        deps.insert(
+            PackageName::new_unchecked("foo"),
+            PixiSpec::Version(rattler_conda_types::VersionSpec::Any),
+        );
+        assert!(refuse_source_dependencies(&deps).is_ok());
+    }
+
+    #[test]
+    fn refuse_source_dependencies_rejects_url_source() {
+        use pixi_spec::UrlSpec;
+        let mut deps: DependencyMap<PackageName, PixiSpec> = DependencyMap::default();
+        deps.insert(
+            PackageName::new_unchecked("foo"),
+            PixiSpec::Url(UrlSpec {
+                url: url::Url::parse("https://example.com/foo.tar.gz").unwrap(),
+                md5: None,
+                sha256: None,
+                subdirectory: Default::default(),
+            }),
+        );
+        let err = refuse_source_dependencies(&deps).unwrap_err();
+        match err {
+            InstallFailure::UnsupportedSourceSpec { packages } => {
+                assert_eq!(packages, vec!["foo".to_string()]);
+            }
+            other => panic!("expected UnsupportedSourceSpec, got {other:?}"),
+        }
+    }
+
+    /// `InstallFailure::UnsupportedSourceSpec` round-trips through
+    /// serde so the client can match on the typed variant rather
+    /// than parsing a free-form `InstallFailed` string.
+    #[test]
+    fn unsupported_source_spec_round_trips() {
+        let original = InstallFailure::UnsupportedSourceSpec {
+            packages: vec!["foo".to_string(), "bar".to_string()],
+        };
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let parsed: InstallFailure = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(original, parsed);
     }
 }

@@ -172,6 +172,16 @@ async fn apply_changes_via_daemon(
     localise_mode: LocaliseMode,
     force_reinstall: bool,
 ) -> miette::Result<StateChanges> {
+    // Refuse upfront if the manifest's deps include any source
+    // specs: the daemon can't resolve them (filesystem-invisible
+    // paths, no client-side `BackendOverride`).
+    {
+        let env = project
+            .environment(env_name)
+            .ok_or_else(|| miette!("Environment {} not found", env_name.fancy_display()))?;
+        super::daemon::assert_no_source_specs(env.dependencies.specs.iter())?;
+    }
+
     // Capture pre-update expose policy from the manifest's existing
     // exposed list against the on-disk env's binaries — *if* the env
     // is already materialised locally. If it isn't (first daemon

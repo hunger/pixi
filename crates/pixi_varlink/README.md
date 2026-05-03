@@ -35,6 +35,22 @@ The local install path has no such guard: two concurrent
 invocations race on the manifest file. The daemon's behaviour is
 strictly more conservative.
 
+### Source-built packages are refused
+
+Specs that point at a path, URL, or git repository (e.g.
+`pixi global install ./mypkg`, `--with git+https://github.com/...`)
+need a build step. The daemon has no view of the client's
+filesystem (so path sources are unresolvable by design) and
+doesn't run the client's `BackendOverride` (so URL/git source
+builds can't share the test mocks the client side uses), so
+attempting to install one through `--socket` is refused upfront
+with a miette error pointing the user to drop `--socket`. The
+daemon also defends server-side, returning
+`InstallFailure::UnsupportedSourceSpec` when any source-typed
+`PixiSpec` reaches `run_install` — useful for non-conforming
+clients. Source-built packages should be installed locally for
+now; supporting them over the daemon is a future-work item.
+
 ### `--force-reinstall` clobbers the local prefix
 
 The end state of `--force-reinstall` is the same on both paths,

@@ -25,12 +25,44 @@ use pixi_global::{
     common::{EnvironmentUpdate, InstallChange},
     project::ExposedType,
 };
+use pixi_spec::PixiSpec;
 use pixi_varlink::{
     InstallChangeWire, InstallReply, InstallRequest, ReporterClient, TransactionSummary,
 };
 use rattler_conda_types::{PackageName, Platform, Version};
 
 use super::wire_reporter_client::WireReporterClient;
+
+/// Refuse source-typed (`PixiSpec::Path` / `Url` / `Git`) entries
+/// from the supplied iterator, with a `miette` error that points the
+/// user at the workaround (drop `--socket`).
+///
+/// Both `install` and `update` call this before any wire activity:
+/// the daemon has no view of the client's filesystem and doesn't run
+/// the client's `BackendOverride`, so a source spec routed through
+/// `--socket` cannot produce the same on-disk artefact a local
+/// install would. The daemon ships its own
+/// [`pixi_varlink::InstallFailure::UnsupportedSourceSpec`] as a
+/// defense against non-conforming clients; this helper surfaces a
+/// nicer message before we ever hit the wire.
+pub(crate) fn assert_no_source_specs<'a, I>(specs: I) -> miette::Result<()>
+where
+    I: IntoIterator<Item = (&'a PackageName, &'a PixiSpec)>,
+{
+    let bad: Vec<&str> = specs
+        .into_iter()
+        .filter(|(_, spec)| spec.is_source())
+        .map(|(name, _)| name.as_normalized())
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(miette!(
+        help = "drop `--socket` to install source-built packages locally; the daemon can't see the client's filesystem (path sources) and doesn't run client-supplied build backends (url/git sources)",
+        "source-built packages aren't supported with `--socket`: {}",
+        bad.join(", ")
+    ))
+}
 
 /// Pick a [`LocaliseMode`] for a daemon-routed install/update from
 /// (in priority order) the `--localise-mode` CLI flag, the
@@ -432,5 +464,36 @@ mod tests {
         }
         let mode = resolve_localise_mode(None, &config).unwrap();
         assert_eq!(mode, LocaliseMode::default());
+    }
+
+    /// Binary specs flow through `assert_no_source_specs` cleanly,
+    /// while a single source spec causes the helper to bail with an
+    /// actionable miette error pointing at `--socket`. This is the
+    /// last user-visible defense before we spend any time on the
+    /// wire.
+    #[test]
+    fn assert_no_source_specs_accepts_binary_only() {
+        let foo = pkg("foo");
+        let spec = PixiSpec::Version(rattler_conda_types::VersionSpec::Any);
+        assert!(assert_no_source_specs([(&foo, &spec)]).is_ok());
+    }
+
+    #[test]
+    fn assert_no_source_specs_rejects_url_source() {
+        use pixi_spec::UrlSpec;
+        let foo = pkg("foo");
+        let spec = PixiSpec::Url(UrlSpec {
+            url: url::Url::parse("https://example.com/foo.tar.gz").unwrap(),
+            md5: None,
+            sha256: None,
+            subdirectory: Default::default(),
+        });
+        let err = assert_no_source_specs([(&foo, &spec)]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("source-built packages aren't supported with `--socket`")
+                && msg.contains("foo"),
+            "expected source-spec rejection naming the package, got {msg:?}"
+        );
     }
 }

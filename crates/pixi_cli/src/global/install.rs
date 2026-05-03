@@ -392,6 +392,26 @@ async fn setup_environment_via_daemon(
     socket: &Path,
     localise_mode: LocaliseMode,
 ) -> miette::Result<StateChanges> {
+    // Reject source-built packages before mutating the manifest:
+    // the daemon has no view of the client's filesystem (path
+    // sources) and doesn't run the client's `BackendOverride` (url
+    // / git source builds), so a source spec routed through
+    // `--socket` can't produce the same artefact a local install
+    // would. Catch it here with an actionable error pointing the
+    // user at the workaround (drop `--socket`).
+    let channel_config = project.config().global_channel_config().clone();
+    let with_for_check: Vec<GlobalSpec> = args
+        .with
+        .iter()
+        .map(|spec| GlobalSpec::try_from_matchspec_with_name(spec.clone(), &channel_config))
+        .collect::<Result<Vec<_>, _>>()?;
+    super::daemon::assert_no_source_specs(
+        specs
+            .iter()
+            .chain(with_for_check.iter())
+            .map(|gs| (gs.name(), gs.spec())),
+    )?;
+
     let PreparedInstall {
         mut state_changes,
         packages_to_add,
