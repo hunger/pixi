@@ -445,12 +445,17 @@ async fn setup_environment_via_daemon(
                 .into_diagnostic()
         })
         .collect::<miette::Result<Vec<_>>>()?;
+    // Ship `executable_relname` (the path under the prefix's
+    // `bin/`), not `executable_name` (just the basename) — packages
+    // like `dotnet` ship a binary at `bin/dotnet/dotnet`, and the
+    // server needs the full relative path to point the trampoline
+    // at the right file.
     let expose_for_wire: Vec<ExposeMapping> = args
         .expose
         .iter()
         .map(|m| ExposeMapping {
             exe_name: m.exposed_name().to_string(),
-            source: m.executable_name().to_string(),
+            source: m.executable_relname().to_string(),
         })
         .collect();
 
@@ -514,6 +519,47 @@ async fn setup_environment_via_daemon(
         .ok_or_else(|| miette!("daemon ended the install stream without a terminal reply"))?;
 
     let local_prefix = env_root.path().join(env_name.as_str());
+    if args.force_reinstall {
+        // Localise refuses to clobber a real directory the user
+        // didn't place themselves (or didn't place via a previous
+        // walk-mode install — those carry our `.pixi-localise`
+        // marker). With `--force-reinstall` the user has asked for
+        // a clean slate, so remove whatever's at `local_prefix`
+        // before localising. Symlinks are removed with `remove_file`
+        // (unlinks the link, never the target); directories with
+        // `remove_dir_all`. Modern stdlib's `remove_dir_all` uses
+        // `openat`/`O_NOFOLLOW` traversal so a swap-in symlink
+        // mid-removal can't redirect us.
+        match tokio::fs::symlink_metadata(&local_prefix).await {
+            Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => {
+                tokio::fs::remove_file(&local_prefix)
+                    .await
+                    .into_diagnostic()
+                    .map_err(|e| {
+                        e.wrap_err(format!(
+                            "could not remove existing {} for --force-reinstall",
+                            local_prefix.display()
+                        ))
+                    })?;
+            }
+            Ok(meta) if meta.is_dir() => {
+                tokio::fs::remove_dir_all(&local_prefix)
+                    .await
+                    .into_diagnostic()
+                    .map_err(|e| {
+                        e.wrap_err(format!(
+                            "could not remove existing {} for --force-reinstall",
+                            local_prefix.display()
+                        ))
+                    })?;
+            }
+            Ok(_) | Err(_) => {
+                // Nothing there or stat failed for an unrelated
+                // reason. Let `localise_prefix` produce the
+                // canonical error if applicable.
+            }
+        }
+    }
     pixi_global::localise_prefix(&server_prefix, &local_prefix, localise_mode)
         .await
         .map_err(|e| miette!("{e}"))?;
@@ -541,6 +587,25 @@ async fn setup_environment_via_daemon(
         pixi_global::localise_trampoline(&trampoline, &local_path)
             .await
             .map_err(|e| miette!("{e}"))?;
+    }
+
+    // Synthesise per-package state changes from the localised
+    // prefix's `conda-meta/`. Local install path computes these
+    // from the dispatcher's `EnvironmentUpdate`; the daemon path
+    // doesn't have one, but the records are on disk after
+    // localisation. For each requested-or-included package
+    // (`packages_to_add`), find its `PrefixRecord` and emit an
+    // `AddedPackage` — local path emits the same variant for
+    // Installed / Upgraded / Reinstalled, so we don't lose
+    // fidelity by collapsing those distinctions here.
+    let prefix = project.environment_prefix(env_name).await?;
+    for spec in &packages_to_add {
+        if let Ok(record) = prefix.find_designated_package(spec.name()).await {
+            state_changes.insert_change(
+                env_name,
+                StateChange::AddedPackage(Box::new(record.repodata_record.package_record)),
+            );
+        }
     }
 
     state_changes |= project

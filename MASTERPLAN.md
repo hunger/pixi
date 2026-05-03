@@ -463,8 +463,10 @@ correct auth target.
   the helper rewrites it to the new target.
 - Conflict: if `local_path` already exists as a *real directory*
   (e.g. user has run a non-daemon install previously), refuse with a
-  clear error rather than silently overwriting. Add a follow-up TODO
-  for "migrate dir → symlink" once we have a need.
+  clear error rather than silently overwriting. With
+  `--force-reinstall` the daemon CLI path now wipes the existing
+  directory before localising; without the flag, the conflict still
+  surfaces.
 
 #### Step 5. Extract the client-side post-install tail (no trampolines)
 

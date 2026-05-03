@@ -556,21 +556,33 @@ async fn build_trampolines(
     Ok(())
 }
 
-/// Parse the [`ExposeMapping::source`] format and return the binary
-/// name. Accepts both `<package>/<binary>` (the package half is
-/// informational, kept for compatibility) and a bare `<binary>`. The
-/// last `/`-separated segment is taken as the binary name; deeper
-/// relative paths (`dotnet/dotnet/dotnet`-style multi-component
-/// layouts) aren't supported by the daemon path yet — users with that
-/// need run the local install instead.
+/// Validate an [`ExposeMapping::source`] (a relative path under a
+/// prefix's `bin/`) and return it as-is on success.
+///
+/// Accepts multi-component paths so `bin/dotnet/dotnet`-style
+/// layouts work. Rejects anything that could escape `bin/`:
+/// absolute paths, empty components, parent-directory components
+/// (`..`), and Windows-style backslashes (which would slip past
+/// the `/`-tokenisation).
 fn parse_expose_source(source: &str) -> Result<String, InstallFailure> {
-    let binary = source.rsplit('/').next().unwrap_or(source);
-    if binary.is_empty() {
+    if source.is_empty() {
         return Err(InstallFailure::InstallFailed {
-            reason: format!("expose source {source:?} doesn't name a binary"),
+            reason: "expose source must not be empty".to_string(),
         });
     }
-    Ok(binary.to_string())
+    if source.starts_with('/') || source.contains('\\') {
+        return Err(InstallFailure::InstallFailed {
+            reason: format!("expose source {source:?} must be a relative POSIX path under `bin/`"),
+        });
+    }
+    for component in source.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(InstallFailure::InstallFailed {
+                reason: format!("expose source {source:?} contains an empty or `.`/`..` component"),
+            });
+        }
+    }
+    Ok(source.to_string())
 }
 
 /// Replicates `pixi_global::install::path_diff` (which is
@@ -778,6 +790,38 @@ mod tests {
             assert!(
                 matches!(err, InstallFailure::InvalidEnvName { .. }),
                 "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    /// Multi-component sources (`dotnet/dotnet`, `nested/bin/foo`)
+    /// are accepted verbatim; absolute paths, parent components,
+    /// and backslashes are rejected so the trampoline path can't
+    /// escape the prefix's `bin/`.
+    #[test]
+    fn parse_expose_source_accepts_multi_component_relpaths() {
+        for ok in ["foo", "dotnet/dotnet", "nested/bin/foo", "py-3.11"] {
+            assert_eq!(parse_expose_source(ok).unwrap(), ok);
+        }
+    }
+
+    #[test]
+    fn parse_expose_source_rejects_traversal() {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../etc/passwd",
+            "foo/../bar",
+            "subdir/",
+            "/subdir/foo",
+            "subdir\\bin",
+            ".",
+            "./foo",
+        ] {
+            let err = parse_expose_source(bad).unwrap_err();
+            assert!(
+                matches!(err, InstallFailure::InstallFailed { .. }),
+                "expected {bad:?} to be rejected, got {err:?}"
             );
         }
     }

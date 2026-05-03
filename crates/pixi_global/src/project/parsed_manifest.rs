@@ -385,17 +385,38 @@ pub enum ExposedNameError {
         pixi_utils::executable_name()
     )]
     PixiBinParseError,
+    /// Exposed names sit directly under `~/.pixi/bin/`; they must
+    /// be a single filename component, never a path. Reject `/`
+    /// and `\\`, parent-directory components (`..`), absolute
+    /// paths, and the empty string. Without this guard, a manifest
+    /// (or `--expose foo=bar` arg) could escape the bin directory
+    /// — e.g. `--expose '../../etc/baz=foo'` would land a symlink
+    /// at `~/.pixi/etc/baz`.
+    #[error("exposed name {0:?} must be a single filename component (no path separators, no `..`)")]
+    InvalidPath(String),
+    #[error("exposed name must not be empty")]
+    Empty,
 }
 
 impl FromStr for ExposedName {
     type Err = ExposedNameError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value == pixi_utils::executable_name() {
-            Err(ExposedNameError::PixiBinParseError)
-        } else {
-            Ok(ExposedName(value.to_string()))
+        if value.is_empty() {
+            return Err(ExposedNameError::Empty);
         }
+        if value == pixi_utils::executable_name() {
+            return Err(ExposedNameError::PixiBinParseError);
+        }
+        if value.contains('/')
+            || value.contains('\\')
+            || value == ".."
+            || value == "."
+            || std::path::Path::new(value).is_absolute()
+        {
+            return Err(ExposedNameError::InvalidPath(value.to_string()));
+        }
+        Ok(ExposedName(value.to_string()))
     }
 }
 
@@ -415,7 +436,8 @@ impl AsRef<str> for ExposedName {
 mod tests {
     use insta::assert_snapshot;
 
-    use super::ParsedManifest;
+    use super::{ExposedName, ParsedManifest};
+    use std::str::FromStr;
 
     #[test]
     fn test_invalid_key() {
@@ -486,6 +508,35 @@ mod tests {
 
         assert!(manifest.is_err());
         assert_snapshot!(manifest.unwrap_err());
+    }
+
+    /// `ExposedName::from_str` is the only sanitiser between user
+    /// input and a path under `~/.pixi/bin/`. Each rejection arm is
+    /// pinned so an accidental relaxation would surface the
+    /// regression here.
+    #[test]
+    fn exposed_name_rejects_path_traversal() {
+        for bad in [
+            "../etc/passwd",
+            "../../escape",
+            "subdir/binary",
+            "/absolute/path",
+            "..",
+            ".",
+            "",
+        ] {
+            assert!(
+                ExposedName::from_str(bad).is_err(),
+                "expected rejection of {bad:?}"
+            );
+        }
+        // Backslash is banned alongside forward-slash so manifests
+        // shipping Windows-style paths can't sneak past on Unix.
+        assert!(ExposedName::from_str("subdir\\bin").is_err());
+        // Sanity: ordinary names still parse.
+        for ok in ["foo", "foo.exe", "my-binary", "py-3.11"] {
+            ExposedName::from_str(ok).unwrap_or_else(|_| panic!("expected {ok:?} to parse"));
+        }
     }
 
     #[test]
