@@ -369,11 +369,13 @@ pub async fn execute_command(
     global_options: &GlobalOptions,
 ) -> miette::Result<()> {
     // `--socket` is parseable on every subcommand (it's a global flag) but
-    // only `pixi serve`, `pixi serve-test`, and the env-mutating
-    // `pixi global` subcommands (`install` / `update` / `uninstall` /
-    // `add` / `remove` / `sync`) actually do anything with it today.
-    // Refuse it loudly on other subcommands so silent behaviour drift
-    // is impossible.
+    // only `pixi serve`, `pixi serve-test`, and the `pixi global`
+    // subcommands actually accept it. The env-mutating ones
+    // (`install` / `update` / `uninstall` / `add` / `remove` / `sync`)
+    // route work through the daemon when the socket is set; the rest
+    // accept it for CLI uniformity but ignore it. Refuse it loudly on
+    // any other top-level subcommand so silent behaviour drift is
+    // impossible.
     #[cfg(unix)]
     if global_options.socket.is_some()
         && !matches!(
@@ -382,7 +384,7 @@ pub async fn execute_command(
         )
     {
         panic!(
-            "--socket is only consumed by `pixi serve`, `pixi serve-test`, and the env-mutating `pixi global` subcommands (`install` / `update` / `uninstall` / `add` / `remove` / `sync`); routing it through other subcommands is not implemented yet"
+            "--socket is only consumed by `pixi serve`, `pixi serve-test`, and the `pixi global` subcommands"
         );
     }
 

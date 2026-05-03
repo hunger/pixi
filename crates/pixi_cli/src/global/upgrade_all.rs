@@ -2,6 +2,7 @@ use clap::Parser;
 use pixi_config::ConfigCli;
 use rattler_conda_types::Platform;
 
+use crate::GlobalOptions;
 use crate::cli_config::ChannelsConfig;
 
 /// Upgrade all globally installed packages
@@ -19,7 +20,7 @@ pub struct Args {
     platform: Platform,
 }
 
-pub async fn execute(_args: Args) -> miette::Result<()> {
+pub async fn execute(_args: Args, _global_options: &GlobalOptions) -> miette::Result<()> {
     Err(
         miette::miette!("You can call `pixi global update` for most use cases")
             .wrap_err("`pixi global upgrade-all` has been removed"),

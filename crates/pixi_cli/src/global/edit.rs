@@ -3,6 +3,8 @@ use fs_err as fs;
 use miette::IntoDiagnostic;
 use pixi_global::Project;
 
+use crate::GlobalOptions;
+
 /// Edit the global manifest file
 ///
 /// Opens your editor to edit the global manifest file.
@@ -14,7 +16,7 @@ pub struct Args {
     pub editor: Option<String>,
 }
 
-pub async fn execute(args: Args) -> miette::Result<()> {
+pub async fn execute(args: Args, _global_options: &GlobalOptions) -> miette::Result<()> {
     let manifest_path = Project::default_manifest_path()?;
 
     // Make sure directory exists to avoid errors when opening the file

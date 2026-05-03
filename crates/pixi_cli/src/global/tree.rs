@@ -1,3 +1,4 @@
+use crate::GlobalOptions;
 use crate::shared::tree::{
     Package, PackageSource, build_reverse_dependency_map, print_dependency_tree,
     print_inverted_dependency_tree,
@@ -37,7 +38,7 @@ pub struct Args {
     pub invert: bool,
 }
 
-pub async fn execute(args: Args) -> miette::Result<()> {
+pub async fn execute(args: Args, _global_options: &GlobalOptions) -> miette::Result<()> {
     let project = Project::discover_or_create().await?;
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();

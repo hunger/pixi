@@ -63,26 +63,26 @@ pub struct Args {
 
 /// Maps global command enum variants to their function handlers.
 ///
-/// `global_options` is forwarded so the env-mutating subcommands
-/// (`install`, `update`, `uninstall`, `add`, `remove`) can consult
-/// the daemon-routing `--socket` flag; the remaining subcommands
-/// ignore it (the panic guard in `crate::execute_command` still
-/// rejects `--socket` against any other global subcommand).
+/// Every subcommand takes `&GlobalOptions` so the dispatch is
+/// uniform. The env-mutating subcommands (`install`, `update`,
+/// `uninstall`, `add`, `remove`, `sync`) consult the daemon-routing
+/// `--socket` flag; the remaining subcommands accept it but ignore
+/// it.
 pub async fn execute(cmd: Args, global_options: &GlobalOptions) -> miette::Result<()> {
     match cmd.command {
         Command::Add(args) => add::execute(args, global_options).await?,
-        Command::Edit(args) => edit::execute(args).await?,
+        Command::Edit(args) => edit::execute(args, global_options).await?,
         Command::Install(args) => install::execute(args, global_options).await?,
         Command::Uninstall(args) => uninstall::execute(args, global_options).await?,
         Command::Remove(args) => remove::execute(args, global_options).await?,
-        Command::List(args) => list::execute(args).await?,
+        Command::List(args) => list::execute(args, global_options).await?,
         Command::Sync(args) => sync::execute(args, global_options).await?,
-        Command::Expose(subcommand) => expose::execute(subcommand).await?,
-        Command::Shortcut(subcommand) => shortcut::execute(subcommand).await?,
+        Command::Expose(subcommand) => expose::execute(subcommand, global_options).await?,
+        Command::Shortcut(subcommand) => shortcut::execute(subcommand, global_options).await?,
         Command::Update(args) => update::execute(args, global_options).await?,
-        Command::Upgrade(args) => upgrade::execute(args).await?,
-        Command::UpgradeAll(args) => upgrade_all::execute(args).await?,
-        Command::Tree(args) => tree::execute(args).await?,
+        Command::Upgrade(args) => upgrade::execute(args, global_options).await?,
+        Command::UpgradeAll(args) => upgrade_all::execute(args, global_options).await?,
+        Command::Tree(args) => tree::execute(args, global_options).await?,
     };
     Ok(())
 }

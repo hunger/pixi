@@ -4,6 +4,7 @@ use miette::Context;
 use pixi_config::{Config, ConfigCli};
 use pixi_global::{self, EnvironmentName, ExposedName, Mapping, StateChanges};
 
+use crate::GlobalOptions;
 use crate::global::revert_environment_after_error;
 
 /// Add exposed binaries from an environment to your global environment
@@ -61,7 +62,7 @@ pub enum SubCommand {
 }
 
 /// Expose some binaries
-pub async fn execute(args: SubCommand) -> miette::Result<()> {
+pub async fn execute(args: SubCommand, _global_options: &GlobalOptions) -> miette::Result<()> {
     match args {
         SubCommand::Add(args) => add(args).await?,
         SubCommand::Remove(args) => remove(args).await?,

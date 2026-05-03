@@ -1,3 +1,4 @@
+use crate::GlobalOptions;
 use crate::global::revert_environment_after_error;
 use clap::Parser;
 use fancy_display::FancyDisplay;
@@ -46,7 +47,7 @@ pub enum SubCommand {
 }
 
 /// Add or remove shortcuts from your machine
-pub async fn execute(args: SubCommand) -> miette::Result<()> {
+pub async fn execute(args: SubCommand, _global_options: &GlobalOptions) -> miette::Result<()> {
     match args {
         SubCommand::Add(args) => add(args).await?,
         SubCommand::Remove(args) => remove(args).await?,

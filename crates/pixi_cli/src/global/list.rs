@@ -7,6 +7,8 @@ use pixi_global::list::{
 use pixi_global::{EnvironmentName, Project};
 use std::str::FromStr;
 
+use crate::GlobalOptions;
+
 /// Lists global environments with their dependencies and exposed commands. Can also display all packages within a specific global environment when using the --environment flag.
 ///
 /// All environments:
@@ -51,7 +53,7 @@ pub enum GlobalSortBy {
     Name,
 }
 
-pub async fn execute(args: Args) -> miette::Result<()> {
+pub async fn execute(args: Args, _global_options: &GlobalOptions) -> miette::Result<()> {
     let config = Config::with_cli_config(&args.config);
     let project = Project::discover_or_create()
         .await?
