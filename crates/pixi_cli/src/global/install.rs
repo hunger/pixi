@@ -16,13 +16,13 @@ use crate::GlobalOptions;
 use crate::global::{global_specs::GlobalSpecs, revert_environment_after_error};
 use pixi_config::{self, Config, ConfigCli};
 use pixi_global::{
-    self, BinDir, EnvChanges, EnvRoot, EnvState, EnvironmentName, LocaliseMode, Mapping, Project,
+    self, EnvChanges, EnvRoot, EnvState, EnvironmentName, LocaliseMode, Mapping, Project,
     StateChange, StateChanges,
     common::{NotChangedReason, contains_menuinst_document},
     list::list_all_global_environments,
     project::{ExposedType, GlobalSpec},
 };
-use pixi_varlink::{ExposeMapping, InstallReply, InstallRequest, ReporterClient};
+use pixi_varlink::{InstallReply, InstallRequest, ReporterClient};
 
 use super::wire_reporter_client::WireReporterClient;
 
@@ -391,27 +391,19 @@ async fn setup_environment(
 
 /// Daemon-routed counterpart to [`setup_environment`].
 ///
-/// Same client-side manifest manipulation as the local path (add the
-/// env entry, set platform, register dependencies + expose mappings),
-/// but instead of running the install locally, send an `Install` RPC
-/// to the daemon at `socket`. The daemon owns the on-disk prefix and
-/// trampolines under its `data` root; the client localises the prefix
-/// at `~/.pixi/envs/<env_name>` (single symlink — see
-/// [`pixi_global::localise_prefix`]) and symlinks each exposed
-/// trampoline under `~/.pixi/bin/`. The shortcut + completion +
-/// manifest-save tail is shared with the local path via
-/// [`Project::finalise_environment_no_trampolines`].
-///
-/// Limitations of this first cut:
-/// - Only explicit `--expose` mappings are surfaced; default
-///   "expose every binary in the package" doesn't apply yet (the
-///   client would have to introspect a prefix that doesn't exist
-///   yet to enumerate the binaries).
-/// - `add_packages_from_install_changes` isn't wired through, so
-///   the `state_changes` summary only carries `AddedEnvironment` /
-///   `UpdatedEnvironment` markers without per-package detail.
-/// - `complex executable_relname` like `dotnet/dotnet` isn't
-///   supported by the daemon's `parse_expose_source` yet.
+/// Shape matches the local path: prepare the manifest prologue,
+/// run the install, localise the prefix, sync the expose mappings,
+/// write trampolines, finalise (shortcuts + completions + save).
+/// The only difference is *who* runs the install — the daemon at
+/// `socket` instead of an in-process dispatcher. After
+/// [`pixi_global::localise_prefix`] makes the prefix readable at
+/// `~/.pixi/envs/<env_name>`, the rest of the tail uses the same
+/// [`Project::sync_exposed_names`] +
+/// [`Project::expose_executables_from_environment`] +
+/// [`Project::finalise_environment_no_trampolines`] machinery the
+/// local path does, so default-expose-all, multi-component
+/// `executable_relname`, and per-package `AddedPackage` state
+/// changes all behave the same way on either path.
 async fn setup_environment_via_daemon(
     env_name: &EnvironmentName,
     args: &Args,
@@ -427,8 +419,9 @@ async fn setup_environment_via_daemon(
     } = prepare_install_manifest(env_name, args, specs, project).await?;
 
     // Build the wire request: resolve channel URLs via the project's
-    // channel config, render specs as match-spec strings, convert
-    // expose mappings to the daemon's wire shape.
+    // channel config and render specs as match-spec strings. Expose
+    // mappings stay client-side — the daemon doesn't deal with
+    // trampolines anymore.
     let channel_config = project.config().global_channel_config().clone();
     let channel_urls: Vec<String> = channels
         .iter()
@@ -447,31 +440,17 @@ async fn setup_environment_via_daemon(
         .collect::<miette::Result<Vec<_>>>()?;
     // Ship `executable_relname` (the path under the prefix's
     // `bin/`), not `executable_name` (just the basename) — packages
-    // like `dotnet` ship a binary at `bin/dotnet/dotnet`, and the
-    // server needs the full relative path to point the trampoline
-    // at the right file.
-    let expose_for_wire: Vec<ExposeMapping> = args
-        .expose
-        .iter()
-        .map(|m| ExposeMapping {
-            exe_name: m.exposed_name().to_string(),
-            source: m.executable_relname().to_string(),
-        })
-        .collect();
-
     let request = InstallRequest {
         env_name: env_name.as_str().to_string(),
         specs: spec_strings,
         channels: channel_urls,
         platform: args.platform.map(|p| p.to_string()),
-        expose: expose_for_wire,
         force_reinstall: args.force_reinstall,
     };
 
     // Auth target is `~/.pixi/envs/`: the directory the localised
     // prefix symlink will live under.
     let env_root = EnvRoot::from_env().await?;
-    let bin_dir = BinDir::from_env().await?;
 
     let mut conn = pixi_varlink::connect(socket, env_root.path())
         .await
@@ -564,30 +543,18 @@ async fn setup_environment_via_daemon(
         .await
         .map_err(|e| miette!("{e}"))?;
 
-    // Pick the trampoline directory the bin-dir symlinks should point
-    // at. In `Symlink` mode the local prefix is itself just a symlink
-    // back to `server_prefix`, so either works; in `Reflink`/`Copy`
-    // mode the walk already reflink/copy'd `.trampoline/` into the
-    // local tree, so pointing at the local path keeps the install
-    // self-contained (the loopback test exercises this — the server
-    // tempdir is gone before the user runs the trampoline).
-    let trampoline_dir = match localise_mode {
-        LocaliseMode::Symlink => server_prefix.join(".trampoline"),
-        LocaliseMode::Reflink | LocaliseMode::Copy => local_prefix.join(".trampoline"),
-    };
-    for mapping in &args.expose {
-        let exe_name = mapping.exposed_name().to_string();
-        let bin_name = if cfg!(windows) {
-            format!("{exe_name}.exe")
-        } else {
-            exe_name.clone()
-        };
-        let trampoline = trampoline_dir.join(&bin_name);
-        let local_path = bin_dir.path().join(&bin_name);
-        pixi_global::localise_trampoline(&trampoline, &local_path)
-            .await
-            .map_err(|e| miette!("{e}"))?;
-    }
+    // Reuse the local install path's expose-name + trampoline
+    // machinery now that the prefix is on the local filesystem.
+    // `sync_exposed_names` resolves the `--expose` / `--with` flags
+    // into manifest mappings (default-expose-all when neither is
+    // given), and `expose_executables_from_environment` walks those
+    // mappings to write a trampoline per binary into the bin dir —
+    // identical to what `setup_environment` does for a local
+    // install.
+    sync_exposed_names(env_name, project, args).await?;
+    state_changes |= project
+        .expose_executables_from_environment(env_name)
+        .await?;
 
     // Synthesise per-package state changes from the localised
     // prefix's `conda-meta/`. Local install path computes these

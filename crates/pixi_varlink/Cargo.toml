@@ -49,13 +49,6 @@ uuid = { workspace = true }
 # `zlink`'s default features include `tracing`, which turns on zlink's
 # connection-layer span/event output through the same subscriber.
 zlink = { workspace = true }
-
-# Real install path: solve via dispatcher's `SolvePixiEnvironmentKey`,
-# install via dispatcher's `install_pixi_environment` (which transparently
-# delegates the binary phase to `pixi_compute_engine`). The daemon
-# constructs its own dispatcher per install call against the server's
-# `data` / `cache` roots.
-itertools = { workspace = true }
 # WireReporter needs to name JsonRpcBackendSpec / RepositoryReference
 # in trait method signatures so the dispatcher's `Reporter` and its
 # git-checkout sub-trait can be implemented for it. Rattler's install
@@ -66,14 +59,11 @@ pixi_build_discovery = { workspace = true }
 pixi_command_dispatcher = { workspace = true }
 pixi_compute_reporters = { workspace = true }
 pixi_git = { workspace = true }
-pixi_global = { workspace = true }
 pixi_path = { workspace = true }
 pixi_spec = { workspace = true }
 pixi_spec_containers = { workspace = true }
-pixi_utils = { workspace = true }
 rattler = { workspace = true }
 rattler_conda_types = { workspace = true }
-rattler_shell = { workspace = true }
 rattler_virtual_packages = { workspace = true }
 
 [dev-dependencies]

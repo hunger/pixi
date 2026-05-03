@@ -16,20 +16,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
-use itertools::Itertools;
 use ordermap::OrderMap;
 use pixi_command_dispatcher::{
     BuildEnvironment, CacheDirs, CommandDispatcher, EnvironmentRef, EnvironmentSpec, EphemeralEnv,
     InstallPixiEnvironmentSpec,
     keys::{SolvePixiEnvironmentKey, SolvePixiEnvironmentSpec},
-};
-use pixi_global::{
-    ExposedName,
-    trampoline::{Configuration, Trampoline},
 };
 use pixi_path::AbsPathBuf;
 use pixi_spec::PixiSpec;
@@ -37,7 +31,6 @@ use pixi_spec_containers::DependencyMap;
 use rattler_conda_types::{
     ChannelConfig, ChannelUrl, MatchSpec, PackageName, ParseStrictness, Platform, prefix::Prefix,
 };
-use rattler_shell::activation::prefix_path_entries;
 use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -188,10 +181,6 @@ pub struct InstallRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
 
-    /// Trampoline mappings the client wants exposed.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub expose: Vec<ExposeMapping>,
-
     /// Force a rebuild + reinstall of every package, ignoring the
     /// fingerprint short-circuit.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -200,29 +189,6 @@ pub struct InstallRequest {
 
 fn is_false(b: &bool) -> bool {
     !*b
-}
-
-/// One requested trampoline mapping.
-///
-/// The trampoline binary lands at
-/// `<prefix>/.trampoline/<exe_name>` (with a `.exe` suffix on
-/// Windows) and its JSON at
-/// `<prefix>/.trampoline/trampoline_configuration/<exe_name>.json` —
-/// both deterministic from `prefix` (returned in
-/// [`InstallReply::Success`]) and `exe_name`, so the client can
-/// derive both paths without the server returning them. The client
-/// only needs to symlink `~/.pixi/bin/<exe_name>` to the binary;
-/// invoking it through that symlink resolves `current_exe()` back
-/// to the server side, and the trampoline reads its sibling JSON
-/// directly.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct ExposeMapping {
-    /// Name to surface as `~/.pixi/bin/<exe_name>`.
-    pub exe_name: String,
-    /// `<package>/<binary>` reference into the installed env. The
-    /// daemon resolves the binary to `<server-prefix>/bin/<binary>`
-    /// (the package name is informational).
-    pub source: String,
 }
 
 /// One streaming reply from `Install`.
@@ -251,9 +217,9 @@ pub enum InstallReply {
     /// Terminal success. Final reply in the stream.
     Success {
         /// Absolute server-side install prefix path the client should
-        /// localise (symlink to in step 4 / 6). Trampoline locations
-        /// for each [`ExposeMapping`] are derivable: see
-        /// [`ExposeMapping`]'s docs.
+        /// localise. Once it's reachable at `~/.pixi/envs/<env>` the
+        /// client takes over with the local install path's
+        /// expose / trampoline / finalise machinery.
         prefix: String,
     },
     /// Terminal failure. Final reply in the stream.
@@ -310,10 +276,11 @@ pub enum InstallFailure {
 }
 
 /// Drive a real `Install` request end-to-end: build a dispatcher
-/// rooted at the server's `cache` dir, solve the requested specs into
-/// records, lay them down in `<data>/<HASH>/`, and write trampolines
-/// for any [`ExposeMapping`]s the client requested. Persists the
-/// fingerprint marker so subsequent identical requests short-circuit.
+/// rooted at the server's `cache` dir, solve the requested specs
+/// into records, and lay them down in `<data>/<HASH>/`. Persists
+/// the fingerprint marker so subsequent identical requests
+/// short-circuit. Trampolines and expose mappings are the client's
+/// concern — the daemon stops at the materialised prefix.
 ///
 /// On success returns the absolute prefix path. Failures land in
 /// [`InstallFailure::InstallFailed`] with the underlying message — the
@@ -455,157 +422,7 @@ pub(crate) async fn run_install(
         );
     }
 
-    build_trampolines(&prefix_path, auth_path, request).await?;
-
     Ok(prefix_path)
-}
-
-/// Generate trampolines for every `request.expose` entry by activating
-/// the server prefix and rewriting paths to the client's perspective.
-///
-/// **Key asymmetry.** The trampoline binaries and their JSON
-/// configurations live on the server (`<server-prefix>/.trampoline/`),
-/// but the JSONs reference *client-side* paths: `exe` and `CONDA_PREFIX`
-/// point at `<auth_path>/<env_name>/...`, where the client will
-/// eventually symlink the prefix. When the trampoline runs (invoked
-/// via the client's `~/.pixi/bin/<exe>` symlink), it canonicalises
-/// `current_exe()` back to the server side, reads its sibling JSON,
-/// and execs the configured binary — which lives on the server too,
-/// reachable through the client's prefix symlink. So everything ends
-/// up on the server at runtime, but the *user-visible* paths stay
-/// rooted at the client's `~/.pixi/envs/<env_name>` for activation
-/// and shell display.
-async fn build_trampolines(
-    server_prefix: &Path,
-    auth_path: &Path,
-    request: &InstallRequest,
-) -> Result<(), InstallFailure> {
-    if request.expose.is_empty() {
-        return Ok(());
-    }
-
-    // The client will eventually symlink this directory at
-    // `<auth_path>/<env_name>` → `<server_prefix>`; we synthesise the
-    // client-side equivalent of every server-side path that ends up in
-    // a trampoline JSON.
-    let client_prefix = auth_path.join(&request.env_name);
-
-    let prefix = pixi_utils::prefix::Prefix::new(server_prefix.to_path_buf());
-    let path_current = std::env::var("PATH").unwrap_or_default();
-    let mut activation =
-        prefix
-            .run_activation()
-            .await
-            .map_err(|e| InstallFailure::InstallFailed {
-                reason: format!("activation failed for {}: {e}", server_prefix.display()),
-            })?;
-    let path_after = activation
-        .remove("PATH")
-        .or_else(|| activation.remove("Path"))
-        .unwrap_or_else(|| path_current.clone());
-    let server_path_diff = compute_path_diff(&path_current, &path_after, server_prefix)?;
-
-    // Rewrite every server-prefix occurrence in the activation env so
-    // the trampoline-run subshell sees client-side paths (matters for
-    // CONDA_PREFIX in particular, which the user may inspect).
-    let server_prefix_str =
-        server_prefix
-            .to_str()
-            .ok_or_else(|| InstallFailure::InstallFailed {
-                reason: format!(
-                    "server prefix path is not valid UTF-8: {}",
-                    server_prefix.display()
-                ),
-            })?;
-    let client_prefix_str =
-        client_prefix
-            .to_str()
-            .ok_or_else(|| InstallFailure::InstallFailed {
-                reason: format!(
-                    "client prefix path is not valid UTF-8: {}",
-                    client_prefix.display()
-                ),
-            })?;
-    let rewrite = |s: &str| s.replace(server_prefix_str, client_prefix_str);
-    let env_for_trampoline: HashMap<String, String> = activation
-        .iter()
-        .map(|(k, v)| (k.clone(), rewrite(v)))
-        .collect();
-    let path_diff = rewrite(&server_path_diff);
-
-    let trampoline_root = server_prefix.join(".trampoline");
-    for mapping in &request.expose {
-        let binary = parse_expose_source(&mapping.source)?;
-        let exposed = ExposedName::from_str(&mapping.exe_name).map_err(|e| {
-            InstallFailure::InstallFailed {
-                reason: format!("invalid exposed name {:?}: {e}", mapping.exe_name),
-            }
-        })?;
-        let configuration = Configuration::new(
-            client_prefix.join("bin").join(&binary),
-            path_diff.clone(),
-            env_for_trampoline.clone(),
-        );
-        Trampoline::new(exposed, trampoline_root.clone(), configuration)
-            .save()
-            .await
-            .map_err(|e| InstallFailure::InstallFailed {
-                reason: format!("failed to write trampoline {:?}: {e}", mapping.exe_name),
-            })?;
-    }
-    Ok(())
-}
-
-/// Validate an [`ExposeMapping::source`] (a relative path under a
-/// prefix's `bin/`) and return it as-is on success.
-///
-/// Accepts multi-component paths so `bin/dotnet/dotnet`-style
-/// layouts work. Rejects anything that could escape `bin/`:
-/// absolute paths, empty components, parent-directory components
-/// (`..`), and Windows-style backslashes (which would slip past
-/// the `/`-tokenisation).
-fn parse_expose_source(source: &str) -> Result<String, InstallFailure> {
-    if source.is_empty() {
-        return Err(InstallFailure::InstallFailed {
-            reason: "expose source must not be empty".to_string(),
-        });
-    }
-    if source.starts_with('/') || source.contains('\\') {
-        return Err(InstallFailure::InstallFailed {
-            reason: format!("expose source {source:?} must be a relative POSIX path under `bin/`"),
-        });
-    }
-    for component in source.split('/') {
-        if component.is_empty() || component == "." || component == ".." {
-            return Err(InstallFailure::InstallFailed {
-                reason: format!("expose source {source:?} contains an empty or `.`/`..` component"),
-            });
-        }
-    }
-    Ok(source.to_string())
-}
-
-/// Replicates `pixi_global::install::path_diff` (which is
-/// `pub(crate)`): everything `path_after` adds over `path_before`,
-/// plus the prefix's well-known PATH entries even if they happened to
-/// be in `path_before`. Joined with the platform PATH separator.
-fn compute_path_diff(
-    path_before: &str,
-    path_after: &str,
-    prefix: &Path,
-) -> Result<String, InstallFailure> {
-    let paths_before: Vec<PathBuf> = std::env::split_paths(path_before).collect();
-    let paths_after: Vec<PathBuf> = std::env::split_paths(path_after).collect();
-    let prefix_entries = prefix_path_entries(prefix, &Platform::current());
-    let diff = paths_after
-        .iter()
-        .filter(|p| !paths_before.contains(p) || prefix_entries.contains(p))
-        .unique();
-    std::env::join_paths(diff)
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| InstallFailure::InstallFailed {
-            reason: format!("could not join PATH entries: {e}"),
-        })
 }
 
 fn parse_channels(channels: &[String]) -> Result<Vec<ChannelUrl>, InstallFailure> {
@@ -790,38 +607,6 @@ mod tests {
             assert!(
                 matches!(err, InstallFailure::InvalidEnvName { .. }),
                 "expected {bad:?} to be rejected"
-            );
-        }
-    }
-
-    /// Multi-component sources (`dotnet/dotnet`, `nested/bin/foo`)
-    /// are accepted verbatim; absolute paths, parent components,
-    /// and backslashes are rejected so the trampoline path can't
-    /// escape the prefix's `bin/`.
-    #[test]
-    fn parse_expose_source_accepts_multi_component_relpaths() {
-        for ok in ["foo", "dotnet/dotnet", "nested/bin/foo", "py-3.11"] {
-            assert_eq!(parse_expose_source(ok).unwrap(), ok);
-        }
-    }
-
-    #[test]
-    fn parse_expose_source_rejects_traversal() {
-        for bad in [
-            "",
-            "/etc/passwd",
-            "../etc/passwd",
-            "foo/../bar",
-            "subdir/",
-            "/subdir/foo",
-            "subdir\\bin",
-            ".",
-            "./foo",
-        ] {
-            let err = parse_expose_source(bad).unwrap_err();
-            assert!(
-                matches!(err, InstallFailure::InstallFailed { .. }),
-                "expected {bad:?} to be rejected, got {err:?}"
             );
         }
     }

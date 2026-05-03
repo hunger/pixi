@@ -1114,13 +1114,14 @@ impl Project {
     /// Run the *client-side* post-install tail for `env_name`: register
     /// menuinst shortcuts in the manifest (when `add_shortcuts` is
     /// true), sync them to disk, sync shell completions, and persist
-    /// the manifest. Trampolines are deliberately *not* in this tail —
-    /// the daemon-routed install path writes them server-side, while
-    /// the local install path lays them down via
+    /// the manifest. Trampolines are deliberately *not* in this tail
+    /// — both the local and daemon-routed install paths lay them down
+    /// via
     /// [`expose_executables_from_environment`](Self::expose_executables_from_environment)
-    /// before calling this. The split exists so the daemon path can
-    /// invoke just the local-state half without reaching into the
-    /// trampoline machinery.
+    /// before calling this. Splitting the tail this way lets either
+    /// path call just the local-state half without re-running the
+    /// trampoline machinery, which matters when a previous step
+    /// already wrote the trampolines (e.g. on a no-op resync).
     ///
     /// `shortcut_specs` are the user-requested top-level packages.
     /// They drive shortcut detection: any package whose prefix record

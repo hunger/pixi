@@ -25,8 +25,8 @@ mod reporter_wire;
 mod wire_reporter;
 
 pub use install::{
-    ExposeMapping, InstallFailure, InstallReply, InstallRequest, SALT_LEN, ServerConfig,
-    ServerConfigError, env_hash, validate_env_name,
+    InstallFailure, InstallReply, InstallRequest, SALT_LEN, ServerConfig, ServerConfigError,
+    env_hash, validate_env_name,
 };
 pub use reporter_wire::{
     CondaSolveEnvWire, InstallEnvWire, LoggingReporterClient, PixiSolveEnvWire, ReporterCall,
