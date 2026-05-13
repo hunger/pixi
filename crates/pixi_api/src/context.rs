@@ -5,8 +5,8 @@ use miette::IntoDiagnostic;
 use pixi_core::workspace::{Environment, PypiDeps, UpdateDeps, WorkspaceMut};
 use pixi_core::{Workspace, environment::LockFileUsage};
 use pixi_manifest::{
-    EnvironmentName, Feature, FeatureName, PrioritizedChannel, SpecType, TargetSelector, Task,
-    TaskName,
+    EnvironmentName, Feature, FeatureName, PixiPlatform, PixiPlatformName, PrioritizedChannel,
+    SpecType, TargetSelector, Task, TaskName,
 };
 use pixi_pypi_spec::{PixiPypiSpec, PypiPackageName};
 use pixi_spec::PixiSpec;
@@ -125,13 +125,13 @@ impl<I: Interface> WorkspaceContext<I> {
             .await
     }
 
-    pub async fn list_platforms(&self) -> HashMap<EnvironmentName, Vec<Platform>> {
+    pub async fn list_platforms(&self) -> HashMap<EnvironmentName, Vec<PixiPlatformName>> {
         crate::workspace::workspace::platform::list(&self.workspace).await
     }
 
     pub async fn add_platforms(
         &self,
-        platform: Vec<Platform>,
+        platform: Vec<PixiPlatform>,
         no_install: bool,
         feature: Option<String>,
     ) -> miette::Result<()> {
@@ -147,7 +147,7 @@ impl<I: Interface> WorkspaceContext<I> {
 
     pub async fn remove_platforms(
         &self,
-        platform: Vec<Platform>,
+        platform: Vec<PixiPlatform>,
         no_install: bool,
         feature: Option<String>,
     ) -> miette::Result<()> {
@@ -368,7 +368,7 @@ impl<I: Interface> WorkspaceContext<I> {
         name: TaskName,
         task: Task,
         feature: FeatureName,
-        platform: Option<Platform>,
+        platform: Option<PixiPlatformName>,
     ) -> miette::Result<()> {
         crate::workspace::task::add_task(
             &self.interface,
@@ -385,7 +385,7 @@ impl<I: Interface> WorkspaceContext<I> {
         &self,
         name: TaskName,
         task: Task,
-        platform: Option<Platform>,
+        platform: Option<PixiPlatformName>,
     ) -> miette::Result<()> {
         crate::workspace::task::alias_task(
             &self.interface,
@@ -400,7 +400,7 @@ impl<I: Interface> WorkspaceContext<I> {
     pub async fn remove_task(
         &self,
         names: Vec<TaskName>,
-        platform: Option<Platform>,
+        platform: Option<PixiPlatformName>,
         feature: FeatureName,
     ) -> miette::Result<()> {
         crate::workspace::task::remove_tasks(

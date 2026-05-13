@@ -41,8 +41,8 @@ use pixi_consts::consts;
 use pixi_diff::LockFileDiff;
 use pixi_manifest::{
     AssociateProvenance, BuildVariantSource, EnvironmentName, Environments, HasWorkspaceManifest,
-    LoadManifestsError, ManifestProvenance, Manifests, PackageManifest, SpecType, WithProvenance,
-    WithWarnings, WorkspaceManifest,
+    LoadManifestsError, ManifestProvenance, Manifests, PackageManifest, PixiPlatform,
+    PixiPlatformName, SpecType, WithProvenance, WithWarnings, WorkspaceManifest,
 };
 use pixi_path::AbsPathBuf;
 use pixi_pypi_spec::{PixiPypiSpec, PypiPackageName};
@@ -549,7 +549,7 @@ impl Workspace {
     }
 
     /// Returns the resolved variant configuration for a given platform.
-    pub fn variants(&self, platform: Platform) -> Result<VariantConfig, VariantsError> {
+    pub fn variants(&self, platform: &PixiPlatform) -> Result<VariantConfig, VariantsError> {
         // Get inline variants for all targets
         let mut variant_configuration: BTreeMap<String, Vec<VariantValue>> = BTreeMap::new();
         // Resolves from most specific to least specific.
@@ -814,10 +814,10 @@ impl Workspace {
         lock_file: &LockFile,
         conda_packages: HashSet<PackageName>,
         pypi_packages: HashSet<pep508_rs::PackageName>,
-        affected_environments: HashSet<(&str, Platform)>,
+        affected_environments: HashSet<(&str, PixiPlatformName)>,
     ) -> LockFile {
         filter_lock_file(self, lock_file, |env, platform, package| {
-            if affected_environments.contains(&(env.name().as_str(), platform)) {
+            if affected_environments.contains(&(env.name().as_str(), platform.clone())) {
                 match package {
                     LockedPackageKind::Conda(name) => !conda_packages.contains(name),
                     LockedPackageKind::Pypi(name) => !pypi_packages.contains(name),
@@ -1113,10 +1113,11 @@ mod tests {
         )
         .unwrap();
 
+        let linux64 = pixi_manifest::PixiPlatform::from_subdir(Platform::Linux64);
         assert_snapshot!(format_dependencies(
             workspace
                 .default_environment()
-                .combined_dependencies(Some(Platform::Linux64))
+                .combined_dependencies(Some(&linux64))
         ));
     }
 
@@ -1153,10 +1154,11 @@ mod tests {
         )
         .unwrap();
 
+        let linux64 = pixi_manifest::PixiPlatform::from_subdir(Platform::Linux64);
         assert_snapshot!(format_dependencies(
             workspace
                 .default_environment()
-                .combined_dependencies(Some(Platform::Linux64))
+                .combined_dependencies(Some(&linux64))
         ));
     }
 
@@ -1187,10 +1189,11 @@ mod tests {
         )
         .unwrap();
 
+        let linux64 = pixi_manifest::PixiPlatform::from_subdir(Platform::Linux64);
         assert_snapshot!(format_dependencies(
             workspace
                 .default_environment()
-                .combined_dependencies(Some(Platform::Linux64))
+                .combined_dependencies(Some(&linux64))
         ));
     }
 
@@ -1218,22 +1221,25 @@ mod tests {
         )
         .unwrap();
 
+        let linux64 = pixi_manifest::PixiPlatform::from_subdir(Platform::Linux64);
+        let win64 = pixi_manifest::PixiPlatform::from_subdir(Platform::Win64);
+        let osx_arm64 = pixi_manifest::PixiPlatform::from_subdir(Platform::OsxArm64);
         assert_snapshot!(format!(
             "= Linux64\n{}\n\n= Win64\n{}\n\n= OsxArm64\n{}",
             fmt_activation_scripts(
                 workspace
                     .default_environment()
-                    .activation_scripts(Some(Platform::Linux64))
+                    .activation_scripts(Some(&linux64))
             ),
             fmt_activation_scripts(
                 workspace
                     .default_environment()
-                    .activation_scripts(Some(Platform::Win64))
+                    .activation_scripts(Some(&win64))
             ),
             fmt_activation_scripts(
                 workspace
                     .default_environment()
-                    .activation_scripts(Some(Platform::OsxArm64))
+                    .activation_scripts(Some(&osx_arm64))
             )
         ));
     }
@@ -1258,25 +1264,28 @@ mod tests {
         )
         .unwrap();
 
+        let osx64 = pixi_manifest::PixiPlatform::from_subdir(Platform::Osx64);
+        let win64 = pixi_manifest::PixiPlatform::from_subdir(Platform::Win64);
+        let linux64 = pixi_manifest::PixiPlatform::from_subdir(Platform::Linux64);
         assert_debug_snapshot!(
             workspace
                 .workspace
                 .value
-                .tasks(Some(Platform::Osx64), &FeatureName::DEFAULT)
+                .tasks(Some(&osx64), &FeatureName::DEFAULT)
                 .unwrap()
         );
         assert_debug_snapshot!(
             workspace
                 .workspace
                 .value
-                .tasks(Some(Platform::Win64), &FeatureName::DEFAULT)
+                .tasks(Some(&win64), &FeatureName::DEFAULT)
                 .unwrap()
         );
         assert_debug_snapshot!(
             workspace
                 .workspace
                 .value
-                .tasks(Some(Platform::Linux64), &FeatureName::DEFAULT)
+                .tasks(Some(&linux64), &FeatureName::DEFAULT)
                 .unwrap()
         );
     }

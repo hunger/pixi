@@ -32,11 +32,11 @@ pub use package::{PackageDefaults, PackageError, TomlPackage, WorkspacePackagePr
 pub use platform::TomlPlatform;
 pub use preview::TomlPreview;
 pub use pyproject::PyProjectToml;
-use rattler_conda_types::Platform;
 pub use target::TomlTarget;
 use toml_span::{DeserError, Span};
 pub use workspace::TomlWorkspace;
 
+use crate::PixiPlatform;
 use crate::{TargetSelector, TomlError, error::GenericError, utils::PixiSpanned};
 
 pub trait FromTomlStr {
@@ -64,7 +64,7 @@ enum PlatformSpan {
 fn create_unsupported_selector_warning(
     platform_span: PlatformSpan,
     selector: &PixiSpanned<TargetSelector>,
-    matching_platforms: &[Platform],
+    matching_platforms: &[&PixiPlatform],
 ) -> GenericError {
     let (feature_or_workspace, span) = match platform_span {
         PlatformSpan::Feature(name, span) => (Cow::Owned(format!("feature '{name}'")), span),
