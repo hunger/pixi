@@ -193,7 +193,6 @@ pub struct AddArgs {
     /// (`linux-64`) or `<name>=<subdir>` for a custom-named platform
     /// (`gpu-linux=linux-64`). When any virtual-package flag is set, exactly
     /// one positional may be given.
-    #[clap(long, value_name = "VERSION")]
     #[clap(required = true, num_args=1.., value_name = "PLATFORM|NAME=PLATFORM")]
     pub platform: Vec<String>,
 
