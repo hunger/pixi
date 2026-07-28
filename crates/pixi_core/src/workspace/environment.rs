@@ -216,7 +216,22 @@ impl<'p> Environment<'p> {
                 current,
                 system_virtual_packages
                     .iter()
-                    .map(|vp| format!("{}={}", vp.name.as_normalized(), vp.version))
+                    .map(|vp| {
+                        // `__archspec` decides matches on its build string
+                        match pixi_manifest::platform::is_archspec(&vp.name)
+                            .then(|| {
+                                pixi_manifest::platform::archspec_microarchitecture(
+                                    &vp.build_string,
+                                )
+                            })
+                            .flatten()
+                        {
+                            Some(microarchitecture) => {
+                                format!("{}={}", vp.name.as_normalized(), microarchitecture)
+                            }
+                            None => format!("{}={}", vp.name.as_normalized(), vp.version),
+                        }
+                    })
                     .format(", "),
                 declared.iter().format(", "),
                 candidates.iter().map(|p| p.name().as_str()).format(", "),

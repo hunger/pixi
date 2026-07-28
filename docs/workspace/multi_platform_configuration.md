@@ -96,6 +96,26 @@ Each inline-table entry has:
   not `x86-64-v3`). A CPU newer than the bundled database can't be named until
   Pixi ships an updated archspec; set `archspec = "0"` to declare the
   microarchitecture explicitly unknown.
+
+  A declared `archspec` is matched against the host through the microarchitecture inheritance graph, not by name equality:
+  a machine reporting `skylake` satisfies `archspec = "x86_64_v3"`, because `skylake` descends from it and can run those binaries.
+  A `nehalem` machine does not.
+  Cross-family names never match (an Apple Silicon host does not satisfy `x86_64`, even under Rosetta), so use `CONDA_OVERRIDE_ARCHSPEC` when you deliberately want to target an emulated microarchitecture.
+
+  A host whose microarchitecture is unknown satisfies *every* declared `archspec`.
+  Such a machine cannot prove it runs a given variant, but rejecting all of them would strand containers and CI runners wherever detection degrades.
+  Detection itself falls back to the subdir baseline (`x86_64`, `aarch64`, …) rather than to "unknown", so in practice this applies when the microarchitecture is explicitly unknown: `CONDA_OVERRIDE_ARCHSPEC=0`, or an environment that recorded `archspec = "0"`.
+  Pixi warns when it validates such an environment.
+
+  Because the first declared platform the machine can run wins, listing microarchitecture variants **most specific first** gives you automatic best-variant selection:
+
+  ```toml title="pixi.toml"
+  platforms = [
+    { name = "avx512", platform = "linux-64", archspec = "x86_64_v4" },
+    { name = "avx2", platform = "linux-64", archspec = "x86_64_v3" },
+    "linux-64",
+  ]
+  ```
 - `cuda` also accepts a `{ driver, arch }` table that declares the CUDA driver
   version (`__cuda`) together with the GPU compute capability (`__cuda_arch`):
 

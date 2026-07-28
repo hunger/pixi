@@ -17,6 +17,7 @@ use url::Url;
 use super::pypi::pypi_options::PypiOptions;
 use crate::{
     PixiPlatform, PixiPlatformName, PrioritizedChannel, S3Options, TargetSelector, Targets,
+    platform::{is_archspec, satisfied_by_system},
     preview::Preview,
 };
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
@@ -214,9 +215,7 @@ impl Workspace {
 
     /// Declared virtual packages from `env_platforms` whose host subdir
     /// matches `current` but whose requirement is not provided by
-    /// `system_virtual_packages`. Powers the
-    /// [`Self::possible_pixi_platforms`]-returns-nothing diagnostic, so the
-    /// caller can tell the user which VPs to mock via `CONDA_OVERRIDE_*`.
+    /// `system_virtual_packages`.
     pub fn unsatisfied_platform_requirements(
         &self,
         current: Platform,
@@ -230,10 +229,12 @@ impl Workspace {
             .filter(|d| d.subdir_matches_host)
         {
             for declared in diagnosis.unsatisfied_virtual_packages {
-                if !unsatisfied
-                    .iter()
-                    .any(|u| u.name == declared.name && u.version == declared.version)
-                {
+                if !unsatisfied.iter().any(|u| {
+                    u.name == declared.name
+                        // Ignore the version for archspec!
+                        && (u.version == declared.version || is_archspec(&declared.name))
+                        && u.build_string == declared.build_string
+                }) {
                     unsatisfied.push(declared);
                 }
             }
@@ -293,8 +294,8 @@ pub struct PlatformMatchDiagnosis {
     pub subdir_matches_host: bool,
 
     /// Declared virtual packages (excluding subdir defaults) the host does not
-    /// provide at a high enough version. Empty when the only mismatch is the
-    /// subdir, or when the platform runs here.
+    /// provide, per [`crate::platform::satisfied_by_system`]. Empty when the
+    /// only mismatch is the subdir, or when the platform runs here.
     pub unsatisfied_virtual_packages: Vec<GenericVirtualPackage>,
 }
 
@@ -304,16 +305,6 @@ impl PlatformMatchDiagnosis {
     pub fn matches_host(&self) -> bool {
         self.subdir_matches_host && self.unsatisfied_virtual_packages.is_empty()
     }
-}
-
-/// Returns true if `declared` is provided by the system: the system must list
-/// a virtual package of the same name with a version at least as high as the
-/// declared one.
-fn satisfied_by_system(declared: &GenericVirtualPackage, system: &[GenericVirtualPackage]) -> bool {
-    system
-        .iter()
-        .find(|s| s.name == declared.name)
-        .is_some_and(|s| s.version >= declared.version)
 }
 
 /// A source that contributes additional build variant definitions.

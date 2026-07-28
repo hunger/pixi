@@ -14,10 +14,10 @@ use pixi_manifest::{
 };
 use rattler_conda_types::{GenericVirtualPackage, Platform};
 use rattler_lock::LockFile;
-use rattler_virtual_packages::{Archspec, Cuda, CudaArch, LibC, Linux, Osx, VirtualPackage};
+use rattler_virtual_packages::{Cuda, CudaArch, LibC, Linux, Osx, VirtualPackage};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, Once};
 use thiserror::Error;
 
 /// Convert a [`PixiPlatform`]'s declared virtual packages into the typed
@@ -67,17 +67,9 @@ fn generic_to_virtual_package(gvp: &GenericVirtualPackage) -> Option<VirtualPack
         "__cuda_arch" => Some(VirtualPackage::CudaArch(CudaArch {
             version: gvp.version.clone(),
         })),
-        "__archspec" => {
-            // Rattler maps an archspec string through a microarch database
-            // lookup; an empty/"0" build-string means "unknown microarch"
-            // and `from_name` returns the generic catch-all in that case.
-            if gvp.build_string.is_empty() || gvp.build_string == "0" {
-                return Some(VirtualPackage::Archspec(Archspec::Unknown));
-            }
-            Some(VirtualPackage::Archspec(Archspec::from_name(
-                gvp.build_string.as_str(),
-            )))
-        }
+        "__archspec" => Some(VirtualPackage::Archspec(
+            pixi_manifest::platform::archspec_from_build_string(&gvp.build_string),
+        )),
         _ => None,
     }
 }
@@ -230,21 +222,50 @@ pub fn minimum_compatible_declared_platform<'p>(
 }
 
 /// The declared virtual packages of `platform` that the machine does not
-/// provide (missing entirely, or present at a lower version).
+/// provide, per [`pixi_manifest::platform::satisfied_by_system`].
+///
+/// The subdir-default `__archspec` is skipped: running the subdir at all,
+/// implies its baseline microarchitecture.
 fn unsatisfied_virtual_packages(
     platform: &PixiPlatform,
     system: &[GenericVirtualPackage],
 ) -> Vec<GenericVirtualPackage> {
+    let is_default_archspec = |required: &GenericVirtualPackage| {
+        pixi_manifest::platform::is_archspec(&required.name)
+            && pixi_manifest::platform::is_subdir_default(required, platform.subdir())
+    };
     platform
         .declared_virtual_packages()
         .iter()
-        .filter(|required| {
-            !system
-                .iter()
-                .any(|sys| sys.name == required.name && sys.version >= required.version)
-        })
+        .filter(|required| !is_default_archspec(required))
+        .inspect(|required| warn_if_archspec_undetectable(required, system))
+        .filter(|required| !pixi_manifest::platform::satisfied_by_system(required, system))
         .cloned()
         .collect()
+}
+
+/// A host that cannot name its own microarchitecture matches every declared
+/// `archspec`, so the platform is accepted without ever being verified. Only
+/// reachable where an unknown microarchitecture is recorded: detection falls
+/// back to the subdir baseline, never to `Unknown`.
+fn warn_if_archspec_undetectable(
+    required: &GenericVirtualPackage,
+    system: &[GenericVirtualPackage],
+) {
+    static WARNED: Once = Once::new();
+    if !pixi_manifest::platform::archspec_undetectable(required, system) {
+        return;
+    }
+    let Some(microarchitecture) = archspec_microarchitecture_of(required) else {
+        return;
+    };
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "This machine does not report a CPU microarchitecture, so the declared \
+             archspec '{microarchitecture}' cannot be verified. Treating the platform as \
+             runnable; packages built for '{microarchitecture}' may not run here."
+        );
+    });
 }
 
 /// The platform the environment was installed for cannot run the installed
@@ -351,12 +372,13 @@ fn describe_resolution_gap(
 
     let requirements = unmet
         .iter()
-        .map(|required| {
-            format!(
+        .map(|required| match archspec_microarchitecture_of(required) {
+            Some(microarchitecture) => format!("archspec {microarchitecture}"),
+            None => format!(
                 "{} >={}",
                 required.name.as_normalized().trim_start_matches('_'),
                 required.version
-            )
+            ),
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -364,11 +386,17 @@ fn describe_resolution_gap(
         .iter()
         .map(
             |required| match machine.iter().find(|sys| sys.name == required.name) {
-                Some(sys) => format!(
-                    "only provides '{} {}'",
-                    sys.name.as_normalized(),
-                    sys.version
-                ),
+                Some(sys) => match archspec_microarchitecture_of(required) {
+                    Some(_) => match archspec_microarchitecture_of(sys) {
+                        Some(host) => format!("only provides archspec '{host}'"),
+                        None => "cannot determine its own microarchitecture".to_string(),
+                    },
+                    None => format!(
+                        "only provides '{} {}'",
+                        sys.name.as_normalized(),
+                        sys.version
+                    ),
+                },
                 None => format!("does not provide '{}'", required.name.as_normalized()),
             },
         )
@@ -381,6 +409,14 @@ fn describe_resolution_gap(
          {RERESOLVE} may install packages that do, which would no longer run on this \
          machine."
     )
+}
+
+/// The microarchitecture an `__archspec` entry names, or `None` for any other
+/// virtual package and for an `__archspec` that names none.
+fn archspec_microarchitecture_of(package: &GenericVirtualPackage) -> Option<&str> {
+    pixi_manifest::platform::is_archspec(&package.name)
+        .then(|| pixi_manifest::platform::archspec_microarchitecture(&package.build_string))
+        .flatten()
 }
 
 /// Marker-file paths we've already emitted the "runs by accident" warning for
@@ -1030,6 +1066,44 @@ packages: []
             &[gvp("__glibc", "2.17")],
         );
         insta::assert_snapshot!(gap, @"requires cuda >=12, glibc >=2.28, but this machine does not provide '__cuda' and only provides '__glibc 2.17'. The currently installed packages don't actually need them, so the environment still runs, but the next re-resolve (e.g. 'pixi update' or a change to the manifest) may install packages that do, which would no longer run on this machine.");
+    }
+
+    /// The version `__archspec` carries is a constant, so the version-shaped
+    /// phrasing would read "requires archspec >=0, but this machine only
+    /// provides '__archspec 1'" -- a comparison that is satisfied on its face
+    /// and never names either microarchitecture.
+    #[test]
+    fn resolution_gap_names_archspec_microarchitectures() {
+        let base = PixiPlatformName::from(Platform::Linux64);
+        let archspec = |microarchitecture: &str, version: &str| GenericVirtualPackage {
+            build_string: microarchitecture.to_string(),
+            ..gvp("__archspec", version)
+        };
+        let gap = describe_resolution_gap(
+            &base,
+            None,
+            &[archspec("cascadelake", "0")],
+            &[archspec("zen5", "1")],
+        );
+        insta::assert_snapshot!(gap, @"requires archspec cascadelake, but this machine only provides archspec 'zen5'. The currently installed packages don't actually need it, so the environment still runs, but the next re-resolve (e.g. 'pixi update' or a change to the manifest) may install packages that do, which would no longer run on this machine.");
+    }
+
+    /// A host that reports the "unknown" sentinel has no microarchitecture to
+    /// name, so the gap says that rather than quoting `0`.
+    #[test]
+    fn resolution_gap_reports_undetectable_host_archspec() {
+        let base = PixiPlatformName::from(Platform::Linux64);
+        let archspec = |microarchitecture: &str, version: &str| GenericVirtualPackage {
+            build_string: microarchitecture.to_string(),
+            ..gvp("__archspec", version)
+        };
+        let gap = describe_resolution_gap(
+            &base,
+            None,
+            &[archspec("cascadelake", "0")],
+            &[archspec("0", "1")],
+        );
+        insta::assert_snapshot!(gap, @"requires archspec cascadelake, but this machine cannot determine its own microarchitecture. The currently installed packages don't actually need it, so the environment still runs, but the next re-resolve (e.g. 'pixi update' or a change to the manifest) may install packages that do, which would no longer run on this machine.");
     }
 
     #[test]

@@ -4,11 +4,11 @@ use itertools::Itertools;
 use miette::Diagnostic;
 use pixi_manifest::{EnvironmentName, PixiPlatform, PixiPlatformName};
 use pypi_modifiers::pypi_tags::{PyPITagError, get_tags_from_machine, is_python_record};
-use rattler_conda_types::ParseMatchSpecError;
 use rattler_conda_types::ParseStrictness::Lenient;
 use rattler_conda_types::{
     GenericVirtualPackage, MatchSpec, Matches, PackageName, Platform, Version, VersionSpec,
 };
+use rattler_conda_types::{ParseMatchSpecError, StringMatcher};
 use rattler_lock::{CondaPackageData, ConversionError, LockFile, PypiPackageData};
 use rattler_virtual_packages::{
     DetectVirtualPackageError, VirtualPackage, VirtualPackageOverrides,
@@ -38,10 +38,15 @@ impl VirtualPackageNotFoundError {
         system_virtual_packages: &Vec<&GenericVirtualPackage>,
     ) -> Self {
         let required_version = required_package.version.as_ref().and_then(spec_version);
+        let build_string = match required_package.build.as_ref() {
+            Some(StringMatcher::Exact(value)) => Some(value.as_str()),
+            _ => None,
+        };
+
         let help = required_package
             .name
             .as_exact()
-            .and_then(|name| conda_override_hint(name.as_normalized(), required_version))
+            .and_then(|name| conda_override_hint(name, required_version, build_string))
             .map(|hint| {
                 format!(
                     " You can mock the virtual package by overriding the environment variable, e.g.: '`{hint}`'"

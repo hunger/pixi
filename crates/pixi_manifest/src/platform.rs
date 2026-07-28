@@ -803,15 +803,77 @@ pub fn is_subdir_default(gvp: &GenericVirtualPackage, subdir: Platform) -> bool 
     })
 }
 
+/// `true` for packages called `__archspec`
+pub fn is_archspec(name: &PackageName) -> bool {
+    name.as_normalized() == "__archspec"
+}
+
 /// The microarchitecture named by an `__archspec` build string, or `None` when
 /// it encodes "unknown microarchitecture" (empty, or the `"0"` sentinel rattler
-/// serializes `Archspec::Unknown` as). The single owner of that encoding;
-/// validate and render through this rather than re-testing the strings.
+/// serializes `Archspec::Unknown` as).
 pub fn archspec_microarchitecture(build_string: &str) -> Option<&str> {
     if build_string.is_empty() || build_string == "0" {
         None
     } else {
         Some(build_string)
+    }
+}
+
+/// Returns true if `system` contains a virtual package that matches `required`.
+/// A match has the same name, its version is at least as high as the `required`
+/// version and the build strings match exactly.
+///
+/// `__archspec` is the exception:
+/// its build strings are microarchitecture names compared through the archspec
+/// DAG, and its version is a provenance marker that is ignored.
+///
+/// Both sides are concrete capabilities (what a host reports, what a manifest
+/// platform declares), never requirements.
+pub fn satisfied_by_system(
+    required: &GenericVirtualPackage,
+    system: &[GenericVirtualPackage],
+) -> bool {
+    let Some(provided) = system.iter().find(|s| s.name == required.name) else {
+        return false;
+    };
+    if is_archspec(&required.name) {
+        let host = archspec_from_build_string(&provided.build_string);
+        return match host {
+            // A host that cannot name its own microarchitecture cannot prove it
+            // runs the declared one, but rejecting every declaration would
+            // strand containers and CI wherever detection degrades. Match
+            // permissively; callers warn via `archspec_undetectable`.
+            Archspec::Unknown => true,
+            Archspec::Microarchitecture(_) => {
+                host.is_compatible_with(&archspec_from_build_string(&required.build_string))
+            }
+        };
+    }
+    provided.version >= required.version
+        && (required.build_string.is_empty() || provided.build_string == required.build_string)
+}
+
+/// `true` when `required` names a microarchitecture but the system reports its
+/// own as `Unknown`, the case [`satisfied_by_system`] matches permissively.
+/// A system with no `__archspec` at all is a different case: an ordinary
+/// missing virtual package.
+pub fn archspec_undetectable(
+    required: &GenericVirtualPackage,
+    system: &[GenericVirtualPackage],
+) -> bool {
+    is_archspec(&required.name)
+        && archspec_microarchitecture(&required.build_string).is_some()
+        && system.iter().any(|provided| {
+            provided.name == required.name
+                && archspec_microarchitecture(&provided.build_string).is_none()
+        })
+}
+
+/// Map an `__archspec` build string to rattler's typed [`Archspec`].
+pub fn archspec_from_build_string(build_string: &str) -> Archspec {
+    match archspec_microarchitecture(build_string) {
+        None => Archspec::Unknown,
+        Some(name) => Archspec::from_name(name),
     }
 }
 
@@ -841,7 +903,7 @@ pub fn validate_virtual_package_build_string(
     name: &PackageName,
     build_string: &str,
 ) -> Result<(), String> {
-    if name.as_normalized() == "__archspec"
+    if is_archspec(name)
         && let Some(microarchitecture) = archspec_microarchitecture(build_string)
     {
         validate_archspec_name(microarchitecture)?;
@@ -875,7 +937,7 @@ fn closest_archspec_name(name: &str) -> Option<String> {
 /// Returns true if `name` is a microarchitecture the archspec database knows.
 /// Generic (invented) nodes are not part of the DAG, so they don't count.
 fn is_known_archspec_name(name: &str) -> bool {
-    Microarchitecture::known_targets().contains_key(name)
+    Archspec::from_known_name(name).is_some()
 }
 
 /// Parse a virtual-package entry the way it's stored in `pixi.lock` -- either
@@ -1055,6 +1117,113 @@ mod tests {
             .declared_virtual_packages()
             .iter()
             .any(|gvp| gvp.name.as_normalized() == name)
+    }
+
+    fn generic_virtual_package_with_build(
+        name: &str,
+        version: &str,
+        build_string: &str,
+    ) -> GenericVirtualPackage {
+        GenericVirtualPackage {
+            build_string: build_string.to_string(),
+            ..gvp(name, version)
+        }
+    }
+
+    #[test]
+    fn satisfied_by_system_compares_name_and_version() {
+        let system = vec![gvp("__cuda", "12.4")];
+        // Same name, system version at least as high.
+        assert!(satisfied_by_system(&gvp("__cuda", "12"), &system));
+        assert!(satisfied_by_system(&gvp("__cuda", "12.4"), &system));
+        // A higher requirement, or a name the system lacks, is unsatisfied.
+        assert!(!satisfied_by_system(&gvp("__cuda", "13"), &system));
+        assert!(!satisfied_by_system(&gvp("__glibc", "2.17"), &system));
+    }
+
+    #[test]
+    fn satisfied_by_system_compares_build_strings() {
+        let system = vec![generic_virtual_package_with_build("__foo", "1", "special")];
+        // A declared build string must be provided exactly.
+        assert!(satisfied_by_system(
+            &generic_virtual_package_with_build("__foo", "1", "special"),
+            &system
+        ));
+        assert!(!satisfied_by_system(
+            &generic_virtual_package_with_build("__foo", "1", "other"),
+            &system
+        ));
+        // Declaring no build string accepts any provided one.
+        assert!(satisfied_by_system(&gvp("__foo", "1"), &system));
+        // A declared build string is not satisfied by an empty provided one.
+        assert!(!satisfied_by_system(
+            &generic_virtual_package_with_build("__bar", "1", "special"),
+            &[gvp("__bar", "1")]
+        ));
+    }
+
+    #[test]
+    fn satisfied_by_system_matches_archspec_through_the_dag() {
+        let skylake = vec![generic_virtual_package_with_build(
+            "__archspec",
+            "1",
+            "skylake",
+        )];
+        // A host microarchitecture satisfies any of its DAG ancestors. This is
+        // the case plain build-string equality would wrongly reject.
+        assert!(satisfied_by_system(
+            &generic_virtual_package_with_build("__archspec", "0", "x86_64_v3"),
+            &skylake
+        ));
+        assert!(satisfied_by_system(
+            &generic_virtual_package_with_build("__archspec", "0", "x86_64"),
+            &skylake
+        ));
+        // ...but not a more specific, sibling, or cross-family one.
+        assert!(!satisfied_by_system(
+            &generic_virtual_package_with_build("__archspec", "0", "cascadelake"),
+            &skylake
+        ));
+        assert!(!satisfied_by_system(
+            &generic_virtual_package_with_build("__archspec", "0", "zen2"),
+            &skylake
+        ));
+        assert!(!satisfied_by_system(
+            &generic_virtual_package_with_build("__archspec", "0", "m1"),
+            &skylake
+        ));
+        // The version `__archspec` carries is a meaningless constant (rattler
+        // emits 1, the manifest 0) and must not affect the comparison.
+        assert!(satisfied_by_system(
+            &generic_virtual_package_with_build("__archspec", "2", "x86_64"),
+            &skylake
+        ));
+        // A bare declaration constrains nothing, even against an unknown host.
+        let unknown = vec![generic_virtual_package_with_build("__archspec", "1", "0")];
+        assert!(satisfied_by_system(&gvp("__archspec", "0"), &unknown));
+        assert!(satisfied_by_system(
+            &generic_virtual_package_with_build("__archspec", "0", "0"),
+            &skylake
+        ));
+        // An unknown host microarchitecture satisfies any declaration: it
+        // cannot prove the match, and rejecting would strand hosts whose
+        // detection degraded. `archspec_undetectable` flags it for a warning.
+        let declared = generic_virtual_package_with_build("__archspec", "0", "x86_64");
+        assert!(satisfied_by_system(&declared, &unknown));
+        assert!(archspec_undetectable(&declared, &unknown));
+        // A host that names its microarchitecture is decided on the DAG alone,
+        // whether it matches or not, and never warns.
+        assert!(!archspec_undetectable(&declared, &skylake));
+        assert!(!archspec_undetectable(
+            &generic_virtual_package_with_build("__archspec", "0", "m1"),
+            &skylake
+        ));
+        // A bare declaration is satisfied outright, so there is nothing to warn
+        // about, and a system without `__archspec` is an ordinary missing
+        // package rather than an undetectable microarchitecture.
+        assert!(!archspec_undetectable(&gvp("__archspec", "0"), &unknown));
+        assert!(!satisfied_by_system(&declared, &[]));
+        assert!(!archspec_undetectable(&declared, &[]));
     }
 
     #[test]

@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 import yaml
 
-from .common import CURRENT_PLATFORM, ExitCode, verify_cli_command
+from .common import ANSI_ESCAPE_PATTERN, CURRENT_PLATFORM, ExitCode, verify_cli_command
 
 
 # ----------------------------------------------------------------------------
@@ -1510,6 +1510,196 @@ def test_round_trip_after_edit_preserves_other_entries(
     assert "linux-64" in platforms
     rich = next(p for p in platforms if isinstance(p, dict) and p["name"] == "gpu-linux")
     assert rich["cuda"] == "12.4"
+
+
+# `x86_64_v2` is an ancestor of every x86-64 CPU since ~2009, so any host
+# running this suite descends from it; `m1` sits in the aarch64 branch, so no
+# x86-64 host ever does. The pair keeps these assertions independent of
+# whichever CPU the suite happens to run on. `x86_64` itself would not work
+# here: it is the linux-64/win-64 subdir default, so `is_subdir_default` elides
+# it before the DAG comparison ever runs.
+ALWAYS_SATISFIED_ARCHSPEC = "x86_64_v2"
+NEVER_SATISFIED_ARCHSPEC = "m1"
+
+x86_64_only = pytest.mark.skipif(
+    CURRENT_PLATFORM not in ("linux-64", "win-64"),
+    reason="the archspec names used here assume an x86-64 host",
+)
+
+SELECTION_LOG = "selecting best platform for environment"
+
+
+def _write_manifest(directory: Path, body: str) -> Path:
+    manifest = directory / "pixi.toml"
+    manifest.write_text(body)
+    return manifest
+
+
+def _selected_platform(pixi: Path, manifest: Path) -> str:
+    """The platform pixi actually selects for the default environment.
+
+    Read off the `-vv` selection trace, the only place the choice is reported
+    without installing anything.
+    """
+    output = verify_cli_command(
+        [pixi, "info", "-vv", "--manifest-path", manifest],
+        ExitCode.SUCCESS,
+    )
+    # `Output.stderr` is stored raw, so strip here rather than via `strip_ansi`.
+    stderr = ANSI_ESCAPE_PATTERN.sub("", output.stderr)
+    line = next(entry for entry in stderr.splitlines() if SELECTION_LOG in entry)
+    return line.rsplit("selected ", 1)[1].strip()
+
+
+@x86_64_only
+def test_platform_list_matches_archspec_through_the_dag(
+    pixi: Path, tmp_pixi_workspace: Path
+) -> None:
+    """`platform list` marks exactly the variants the host descends from.
+
+    A declared microarchitecture is matched through the archspec inheritance
+    graph, so a more capable CPU satisfies a baseline while a weaker one does
+    not, and cross-family names never match.
+    """
+    manifest = _write_manifest(
+        tmp_pixi_workspace,
+        f"""
+[workspace]
+name = "variants"
+channels = []
+platforms = [
+  {{ name = "avx512", platform = "{CURRENT_PLATFORM}", archspec = "x86_64_v4" }},
+  {{ name = "avx2", platform = "{CURRENT_PLATFORM}", archspec = "x86_64_v3" }},
+  "{CURRENT_PLATFORM}",
+]
+""",
+    )
+
+    # `skylake` is an `x86_64_v3` machine: it runs `avx2` but not `avx512`.
+    verify_cli_command(
+        [pixi, "workspace", "platform", "list", "--manifest-path", manifest],
+        ExitCode.SUCCESS,
+        env={"CONDA_OVERRIDE_ARCHSPEC": "skylake"},
+        strip_ansi=True,
+        stdout_contains=[
+            f"avx2: platform={CURRENT_PLATFORM}, archspec=x86_64_v3 (supported by current machine)",
+            f"avx512: platform={CURRENT_PLATFORM}, archspec=x86_64_v4\n",
+        ],
+    )
+
+    # `nehalem` is only `x86_64_v2`: neither variant runs, the bare subdir does.
+    verify_cli_command(
+        [pixi, "workspace", "platform", "list", "--manifest-path", manifest],
+        ExitCode.SUCCESS,
+        env={"CONDA_OVERRIDE_ARCHSPEC": "nehalem"},
+        strip_ansi=True,
+        stdout_contains=[
+            f"{CURRENT_PLATFORM}: platform={CURRENT_PLATFORM} (supported by current machine)"
+        ],
+        stdout_excludes=["archspec=x86_64_v3 (supported", "archspec=x86_64_v4 (supported"],
+    )
+
+    # A cross-family host satisfies neither x86-64 variant.
+    verify_cli_command(
+        [pixi, "workspace", "platform", "list", "--manifest-path", manifest],
+        ExitCode.SUCCESS,
+        env={"CONDA_OVERRIDE_ARCHSPEC": NEVER_SATISFIED_ARCHSPEC},
+        strip_ansi=True,
+        stdout_excludes=["archspec=x86_64_v3 (supported", "archspec=x86_64_v4 (supported"],
+    )
+
+
+@x86_64_only
+def test_platform_list_accepts_every_variant_on_an_undetectable_host(
+    pixi: Path, tmp_pixi_workspace: Path
+) -> None:
+    """A host that reports no microarchitecture cannot rule any variant out.
+
+    `CONDA_OVERRIDE_ARCHSPEC=0` is the "unknown microarchitecture" sentinel.
+    Such a host can't prove it runs a declared variant, but rejecting every one
+    would strand containers and CI wherever detection degrades, so the match is
+    permissive.
+    """
+    manifest = _write_manifest(
+        tmp_pixi_workspace,
+        f"""
+[workspace]
+name = "undetectable"
+channels = []
+platforms = [
+  {{ name = "avx512", platform = "{CURRENT_PLATFORM}", archspec = "x86_64_v4" }},
+  {{ name = "cross", platform = "{CURRENT_PLATFORM}", archspec = "{NEVER_SATISFIED_ARCHSPEC}" }},
+]
+""",
+    )
+    verify_cli_command(
+        [pixi, "workspace", "platform", "list", "--manifest-path", manifest],
+        ExitCode.SUCCESS,
+        env={"CONDA_OVERRIDE_ARCHSPEC": "0"},
+        strip_ansi=True,
+        stdout_contains=[
+            "archspec=x86_64_v4 (supported by current machine)",
+            f"archspec={NEVER_SATISFIED_ARCHSPEC} (supported by current machine)",
+        ],
+    )
+
+
+@x86_64_only
+def test_selection_rejects_cross_family_archspec(pixi: Path, tmp_pixi_workspace: Path) -> None:
+    """A platform declaring an unreachable microarchitecture is not selected."""
+    manifest = _write_manifest(
+        tmp_pixi_workspace,
+        f"""
+[workspace]
+name = "cross-family"
+channels = []
+platforms = [
+  {{ name = "unreachable", platform = "{CURRENT_PLATFORM}", archspec = "{NEVER_SATISFIED_ARCHSPEC}" }},
+  {{ name = "reachable", platform = "{CURRENT_PLATFORM}", archspec = "{ALWAYS_SATISFIED_ARCHSPEC}" }},
+]
+""",
+    )
+    assert _selected_platform(pixi, manifest) == "'reachable'"
+
+
+@x86_64_only
+def test_selection_prefers_the_first_declared_runnable_platform(
+    pixi: Path, tmp_pixi_workspace: Path
+) -> None:
+    """Declaration order decides between two platforms the host can both run.
+
+    This is what makes "list variants most specific first" give best-variant
+    selection: nothing ranks by specificity, the first runnable entry wins.
+    """
+    most_specific_first = _write_manifest(
+        tmp_pixi_workspace,
+        f"""
+[workspace]
+name = "ordered"
+channels = []
+platforms = [
+  {{ name = "specific", platform = "{CURRENT_PLATFORM}", archspec = "{ALWAYS_SATISFIED_ARCHSPEC}" }},
+  "{CURRENT_PLATFORM}",
+]
+""",
+    )
+    assert _selected_platform(pixi, most_specific_first) == "'specific'"
+
+    generic_first_dir = tmp_pixi_workspace / "generic-first"
+    generic_first_dir.mkdir()
+    generic_first = _write_manifest(
+        generic_first_dir,
+        f"""
+[workspace]
+name = "ordered-generic-first"
+channels = []
+platforms = [
+  "{CURRENT_PLATFORM}",
+  {{ name = "specific", platform = "{CURRENT_PLATFORM}", archspec = "{ALWAYS_SATISFIED_ARCHSPEC}" }},
+]
+""",
+    )
+    assert _selected_platform(pixi, generic_first) == f"'{CURRENT_PLATFORM}'"
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience entry point

@@ -3,7 +3,7 @@ use fancy_display::FancyDisplay;
 use itertools::Itertools;
 use miette::{Diagnostic, LabeledSpan};
 use pixi_manifest::{EnvironmentName, PixiPlatformName, PlatformMatchDiagnosis, TaskName};
-use rattler_conda_types::{GenericVirtualPackage, Platform, Version};
+use rattler_conda_types::{GenericVirtualPackage, PackageName, Platform, Version};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
@@ -139,7 +139,13 @@ impl Diagnostic for UnsupportedPlatformError {
         let overrides: Vec<String> = self
             .unsatisfied_requirements
             .iter()
-            .filter_map(|req| conda_override_hint(req.name.as_normalized(), Some(&req.version)))
+            .filter_map(|req| {
+                conda_override_hint(
+                    &req.name,
+                    Some(&req.version),
+                    Some(req.build_string.as_str()),
+                )
+            })
             .collect();
 
         let base = if overrides.is_empty() {
@@ -170,9 +176,14 @@ impl Diagnostic for UnsupportedPlatformError {
 fn format_requirements(reqs: &[GenericVirtualPackage]) -> String {
     reqs.iter()
         .map(|r| {
+            // `__archspec` carries its requirement in the build string, and its
+            // version is a provenance marker.
+            if let Some(microarchitecture) = archspec_requirement(r) {
+                format!("{} ({})", r.name.as_normalized(), microarchitecture)
+            }
             // Version 0 encodes a version-less requirement (a bare `__cuda`
             // dependency): the package must be present at any version.
-            if r.version == Version::major(0) {
+            else if r.version == Version::major(0) {
                 format!("{} (any version)", r.name.as_normalized())
             } else {
                 format!("{} >= {}", r.name.as_normalized(), r.version)
@@ -181,11 +192,25 @@ fn format_requirements(reqs: &[GenericVirtualPackage]) -> String {
         .join(", ")
 }
 
+/// The microarchitecture an `__archspec` entry requires, or `None` for any
+/// other virtual package and for an `__archspec` that names none.
+fn archspec_requirement(required: &GenericVirtualPackage) -> Option<&str> {
+    pixi_manifest::platform::is_archspec(&required.name)
+        .then(|| pixi_manifest::platform::archspec_microarchitecture(&required.build_string))
+        .flatten()
+}
+
 /// `CONDA_OVERRIDE_*` hint for a missing virtual package: the required
-/// version when known, a realistic example otherwise. `None` for virtual
-/// packages without a known override (e.g. `__unix`).
-pub(crate) fn conda_override_hint(name: &str, version: Option<&Version>) -> Option<String> {
-    let env_var = match name {
+/// version when known, a realistic example otherwise. `build_string` supplies
+/// the required `__archspec` microarchitecture, which is what that variable
+/// takes; `None` for virtual packages without a known override (e.g. `__unix`).
+pub(crate) fn conda_override_hint(
+    name: &PackageName,
+    version: Option<&Version>,
+    build_string: Option<&str>,
+) -> Option<String> {
+    let norm_name = name.as_normalized();
+    let env_var = match norm_name {
         "__glibc" => "CONDA_OVERRIDE_GLIBC",
         "__cuda" => "CONDA_OVERRIDE_CUDA",
         "__osx" => "CONDA_OVERRIDE_OSX",
@@ -194,11 +219,18 @@ pub(crate) fn conda_override_hint(name: &str, version: Option<&Version>) -> Opti
         "__archspec" => "CONDA_OVERRIDE_ARCHSPEC",
         _ => return None,
     };
+    // `CONDA_OVERRIDE_ARCHSPEC` names a microarchitecture, never a version.
+    if pixi_manifest::platform::is_archspec(name) {
+        let microarchitecture = build_string
+            .and_then(pixi_manifest::platform::archspec_microarchitecture)
+            .unwrap_or("0");
+        return Some(format!("{env_var}={microarchitecture}"));
+    }
     // A version-0 requirement means "any version"; "=0" reads like nonsense,
     // so suggest a realistic value instead.
     let example = match version.filter(|v| **v != Version::major(0)) {
         Some(version) => version.to_string(),
-        None => match name {
+        None => match norm_name {
             "__glibc" => "2.17".to_string(),
             "__cuda" => "12.0".to_string(),
             "__osx" => "10.15".to_string(),
@@ -276,6 +308,37 @@ mod tests {
         let help = e.help().unwrap().to_string();
         assert!(help.contains("CONDA_OVERRIDE_CUDA=11"), "{help}");
         assert!(help.contains("pixi install --platform"), "{help}");
+    }
+
+    /// `__archspec` states its requirement as a microarchitecture in the
+    /// build string
+    #[test]
+    fn archspec_requirement_names_the_microarchitecture() {
+        let archspec = GenericVirtualPackage {
+            build_string: "x86_64_v4".to_string(),
+            ..vp("__archspec", "0")
+        };
+        let mut e = err(vec![archspec.clone()]);
+        e.platform_diagnostics = vec![diagnosis("avx512", Platform::Linux64, true, vec![archspec])];
+        let display = e.to_string();
+        assert!(
+            display.contains("missing virtual packages: __archspec (x86_64_v4)"),
+            "{display}"
+        );
+        assert!(
+            display.contains("Unsatisfied requirements: __archspec (x86_64_v4)"),
+            "{display}"
+        );
+        let help = e.help().unwrap().to_string();
+        assert!(help.contains("CONDA_OVERRIDE_ARCHSPEC=x86_64_v4"), "{help}");
+    }
+
+    /// An `__archspec` naming no microarchitecture constrains nothing, so the
+    /// override can only be the "unknown" sentinel.
+    #[test]
+    fn bare_archspec_requirement_suggests_the_unknown_sentinel() {
+        let help = err(vec![vp("__archspec", "0")]).help().unwrap().to_string();
+        assert!(help.contains("CONDA_OVERRIDE_ARCHSPEC=0"), "{help}");
     }
 
     #[test]
