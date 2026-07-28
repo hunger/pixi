@@ -31,9 +31,9 @@ use pixi_command_dispatcher::{
 use pixi_config::{Config, RunPostLinkScripts, default_channel_config, pixi_home};
 use pixi_consts::consts::{self};
 use pixi_core::environment::{
-    EnvironmentFile, LockedEnvironmentHash, PlatformData, write_environment_file,
+    EnvironmentFile, LockedEnvironmentHash, PlatformData, RequiredPlatform, write_environment_file,
 };
-use pixi_core::lock_file::virtual_packages::minimal_required_virtual_packages;
+use pixi_core::lock_file::virtual_packages::required_virtual_package_specs;
 use pixi_core::repodata::Repodata;
 use pixi_core::workspace::stdlib_variants::{StdlibVersionPin, derive_stdlib_variants};
 use pixi_manifest::{InlinePackageManifest, PixiPlatform, PrioritizedChannel, WorkspaceManifest};
@@ -867,7 +867,7 @@ impl Project {
         let resolved_platform = PlatformData::new(platform, resolved_virtual_packages);
         let depends: Vec<&str> = resolved_depends.iter().map(String::as_str).collect();
         let minimum_supported_platform =
-            PlatformData::new(platform, minimal_required_virtual_packages(&depends));
+            RequiredPlatform::new(platform, required_virtual_package_specs(&depends));
 
         write_environment_file(
             prefix.root(),

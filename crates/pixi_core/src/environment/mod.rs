@@ -15,7 +15,10 @@ pub use pixi_python_status::PythonStatus;
 use pixi_spec::{GitSpec, PixiSpec};
 use pixi_utils::EnvironmentFingerprint;
 use pixi_utils::{prefix::Prefix, rlimit::try_increase_rlimit_to_sensible};
-use rattler_conda_types::{GenericVirtualPackage, Platform};
+use rattler_conda_types::{
+    GenericVirtualPackage, MatchSpec, PackageNameMatcher, ParseMatchSpecError, ParseStrictness,
+    Platform, StringMatcher, Version, VersionSpec, version_spec::RangeOperator,
+};
 use rattler_lock::{LockFile, LockedPackage};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -357,6 +360,118 @@ impl Display for PlatformData {
     }
 }
 
+/// The requirements the installed packages place on the machine: the conda
+/// subdir plus the virtual-package specs some resolved dependency depends on.
+///
+/// Requirements are [`MatchSpec`]s, not [`GenericVirtualPackage`]s: a `depends`
+/// entry can carry a version range and a build-string pattern, and conda-forge
+/// really does (`__archspec[version='1.*', build='^(x86_64_v3|skylake|...)$']`),
+/// so lowering one into a concrete virtual package would silently drop the
+/// constraint. Concrete capabilities keep using [`PlatformData`].
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "RequiredPlatformRaw", into = "RequiredPlatformRaw")]
+pub struct RequiredPlatform {
+    subdir: Platform,
+    requirements: Vec<MatchSpec>,
+}
+
+impl RequiredPlatform {
+    /// A requirement set from a subdir and the specs resolved dependencies ask
+    /// for.
+    pub fn new(subdir: Platform, requirements: Vec<MatchSpec>) -> Self {
+        Self {
+            subdir,
+            requirements,
+        }
+    }
+
+    /// The conda subdir these requirements were resolved for.
+    pub fn subdir(&self) -> Platform {
+        self.subdir
+    }
+
+    /// The virtual-package specs resolved dependencies require.
+    pub fn requirements(&self) -> &[MatchSpec] {
+        &self.requirements
+    }
+}
+
+impl Display for RequiredPlatform {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.subdir)?;
+        if !self.requirements.is_empty() {
+            let requirements = self
+                .requirements
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(f, " [{requirements}]")?;
+        }
+        Ok(())
+    }
+}
+
+/// On-disk shape of [`RequiredPlatform`]. Specs are stored as conda match-spec
+/// strings, matching how [`GenericVirtualPackage`] renders itself in this file
+/// rather than serde's verbose field-wise form for [`MatchSpec`].
+#[derive(Serialize, Deserialize)]
+struct RequiredPlatformRaw {
+    subdir: Platform,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requirements: Vec<String>,
+    /// Written by pixi 0.74 and earlier, which recorded requirements as
+    /// concrete virtual packages. Read for migration, never written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    virtual_packages: Vec<GenericVirtualPackage>,
+}
+
+impl From<RequiredPlatform> for RequiredPlatformRaw {
+    fn from(platform: RequiredPlatform) -> Self {
+        Self {
+            subdir: platform.subdir,
+            requirements: platform
+                .requirements
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            virtual_packages: Vec::new(),
+        }
+    }
+}
+
+impl TryFrom<RequiredPlatformRaw> for RequiredPlatform {
+    type Error = ParseMatchSpecError;
+
+    fn try_from(raw: RequiredPlatformRaw) -> Result<Self, Self::Error> {
+        let mut requirements = raw
+            .requirements
+            .iter()
+            .map(|spec| MatchSpec::from_str(spec, ParseStrictness::Lenient))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Migrate a marker from pixi <= 0.74. Its versions meant ">= version"
+        // under the old comparator, which is not what re-parsing the rendered
+        // `__name=version` form as a match spec would mean (`version.*`), so
+        // convert field by field instead.
+        requirements.extend(raw.virtual_packages.iter().map(legacy_requirement));
+        Ok(Self::new(raw.subdir, requirements))
+    }
+}
+
+/// Reinterpret a legacy marker's concrete virtual package as the requirement it
+/// stood for: at least this version, and version 0 meaning "any version".
+fn legacy_requirement(package: &GenericVirtualPackage) -> MatchSpec {
+    let version = (package.version != Version::major(0))
+        .then(|| VersionSpec::Range(RangeOperator::GreaterEquals, package.version.clone()));
+    MatchSpec {
+        name: PackageNameMatcher::Exact(package.name.clone()),
+        version,
+        build: (!package.build_string.is_empty())
+            .then(|| StringMatcher::Exact(package.build_string.clone())),
+        ..MatchSpec::default()
+    }
+}
+
 /// Information about the environment that was used to create the environment.
 ///
 /// The install fingerprint that downstream caches key on lives in a
@@ -381,11 +496,11 @@ pub struct EnvironmentFile {
     /// by an older pixi, or when no declared platform runs on this machine.
     #[serde(default)]
     pub resolved_platform: Option<PlatformData>,
-    /// The minimum platform the installed packages actually require (the subdir
-    /// plus only the virtual packages some resolved dependency depends on). Can
+    /// The minimum the installed packages actually require (the subdir plus
+    /// only the virtual-package specs some resolved dependency depends on). Can
     /// be weaker than [`Self::resolved_platform`]. `None` as above.
     #[serde(default)]
-    pub minimum_supported_platform: Option<PlatformData>,
+    pub minimum_supported_platform: Option<RequiredPlatform>,
     /// Fingerprints of the manifest's source dependencies at install time,
     /// keyed by package name: a hash of the source spec plus any inline
     /// package definition. Only written by `pixi global`, which has no lock
@@ -953,6 +1068,80 @@ mod tests {
             LockedEnvironmentHash::from_environment(environment, Some(&one)),
             LockedEnvironmentHash::from_environment(environment, Some(&other)),
         );
+    }
+
+    /// A requirement set round-trips through the marker as match-spec strings,
+    /// keeping a CEP-29 regex build matcher intact. conda-forge's microarch
+    /// metapackages emit exactly this shape, and recording it as a concrete
+    /// virtual package would reduce it to a name it never had.
+    #[test]
+    fn required_platform_round_trips_regex_requirements() {
+        let archspec = "__archspec[version='1.*', build='^(x86_64_v3|haswell|skylake)$']";
+        let requirements = vec![
+            MatchSpec::from_str(archspec, ParseStrictness::Lenient).unwrap(),
+            MatchSpec::from_str("__glibc >=2.17", ParseStrictness::Lenient).unwrap(),
+        ];
+        let platform = RequiredPlatform::new(Platform::Linux64, requirements);
+
+        let json = serde_json::to_string(&platform).unwrap();
+        // Stored as strings, like the concrete virtual packages beside them,
+        // rather than serde's field-wise form for a match spec.
+        assert!(json.contains("x86_64_v3|haswell|skylake"), "{json}");
+        assert!(!json.contains("\"build\":{"), "{json}");
+
+        let restored: RequiredPlatform = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.subdir(), Platform::Linux64);
+        let rendered: Vec<String> = restored
+            .requirements()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            rendered.iter().any(|spec| spec.contains("skylake")),
+            "{rendered:?}"
+        );
+        // The build matcher survives as a regex, not as a literal name.
+        let archspec_spec = restored
+            .requirements()
+            .iter()
+            .find(|spec| {
+                spec.name
+                    .as_exact()
+                    .is_some_and(|name| name.as_normalized() == "__archspec")
+            })
+            .expect("__archspec requirement");
+        assert!(
+            matches!(archspec_spec.build, Some(StringMatcher::Regex(_))),
+            "{:?}",
+            archspec_spec.build
+        );
+    }
+
+    /// A marker written by pixi 0.74 or earlier recorded requirements as
+    /// concrete virtual packages whose version meant ">= version". Reading one
+    /// must reproduce that meaning, not what re-parsing `__glibc=2.17` as a
+    /// match spec would mean (`2.17.*`).
+    #[test]
+    fn legacy_marker_requirements_migrate_to_match_specs() {
+        let legacy = r#"{
+            "subdir": "linux-64",
+            "virtual_packages": ["__glibc=2.17", "__cuda=0"]
+        }"#;
+        let restored: RequiredPlatform = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored.subdir(), Platform::Linux64);
+        let rendered: Vec<String> = restored
+            .requirements()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        // A recorded version becomes a lower bound; version 0 meant "any".
+        assert_eq!(rendered, vec!["__glibc >=2.17", "__cuda"]);
+
+        // Re-serializing writes the modern field and drops the legacy one, so
+        // the migration happens once.
+        let json = serde_json::to_string(&restored).unwrap();
+        assert!(json.contains("requirements"), "{json}");
+        assert!(!json.contains("virtual_packages"), "{json}");
     }
 
     /// `PlatformData` stores the platform's composition (subdir + declared

@@ -69,7 +69,7 @@ use crate::{
     activation::CurrentEnvVarBehavior,
     environment::{
         CondaPrefixUpdated, EnvironmentFile, InstallFilter, LockFileUsage, LockedEnvironmentHash,
-        PerEnvironmentAndPlatform, PerGroup, PerGroupAndPlatform, PlatformData,
+        PerEnvironmentAndPlatform, PerGroup, PerGroupAndPlatform, PlatformData, RequiredPlatform,
         read_environment_file, write_environment_file,
     },
     lock_file::{
@@ -775,20 +775,17 @@ impl<'p> LockFileDerivedData<'p> {
     fn installed_platform_data(
         &self,
         environment: &Environment<'p>,
-    ) -> Option<(PlatformData, PlatformData)> {
+    ) -> Option<(PlatformData, RequiredPlatform)> {
         let resolved = self.install_platform(environment)?;
-        let minimal =
+        let mut minimal =
             compute_minimal_required_platforms(&self.lock_file, environment.name(), &[resolved]);
         // A subdir whose lock entry has no conda packages is absent from the
-        // map; the minimum is then the subdir with no required virtual packages.
-        let minimum = minimal.get(&resolved.subdir()).map_or_else(
-            || PlatformData {
-                subdir: resolved.subdir(),
-                virtual_packages: Vec::new(),
-            },
-            PlatformData::from,
-        );
-        Some((PlatformData::from(resolved), minimum))
+        // map; the minimum is then the subdir with no requirements at all.
+        let requirements = minimal.remove(&resolved.subdir()).unwrap_or_default();
+        Some((
+            PlatformData::from(resolved),
+            RequiredPlatform::new(resolved.subdir(), requirements),
+        ))
     }
 
     /// Returns the up-to-date prefix for the given environment.

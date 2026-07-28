@@ -7,7 +7,7 @@ use archspec::cpu::Microarchitecture;
 use pixi_default_versions::{
     default_glibc_version, default_linux_version, default_mac_os_version, default_windows_version,
 };
-use rattler_conda_types::{GenericVirtualPackage, PackageName, Platform, Version};
+use rattler_conda_types::{GenericVirtualPackage, PackageName, Platform, StringMatcher, Version};
 use rattler_virtual_packages::{
     Archspec, DetectVirtualPackageError, Override, VirtualPackageOverrides, VirtualPackages,
 };
@@ -839,6 +839,29 @@ pub fn satisfied_by_system(
     }
     provided.version >= required.version
         && (required.build_string.is_empty() || provided.build_string == required.build_string)
+}
+
+/// Whether a host reporting `host_build_string` satisfies an `__archspec`
+/// *requirement* whose build matcher is `required`.
+///
+/// An exact name is compared through the DAG: it names the baseline a package
+/// was built for, so any descendant host can run it -- conda-forge still ships
+/// per-name microarch builds, and a lock made on `haswell` must keep working on
+/// `skylake`. A glob or regex already spells out every compatible name (the
+/// per-level builds emit a CEP-29 regex), so it matches as a string. No matcher
+/// constrains nothing.
+pub fn archspec_requirement_satisfied(
+    required: Option<&StringMatcher>,
+    host_build_string: &str,
+) -> bool {
+    match required {
+        None => true,
+        Some(StringMatcher::Exact(name)) => archspec_provides(
+            &archspec_from_build_string(host_build_string),
+            &archspec_from_build_string(name),
+        ),
+        Some(matcher) => matcher.matches(host_build_string),
+    }
 }
 
 /// Map an `__archspec` build string to rattler's typed [`Archspec`].

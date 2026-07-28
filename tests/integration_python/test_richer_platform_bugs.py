@@ -111,7 +111,7 @@ cuda = "*"
         [pixi, "install", "--manifest-path", manifest],
         ExitCode.FAILURE,
         env={"CONDA_OVERRIDE_CUDA": "10"},
-        stderr_contains="__cuda >= 12",
+        stderr_contains="__cuda >=12",
     )
 
 

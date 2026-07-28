@@ -2,12 +2,13 @@ use crate::workspace::errors::conda_override_hint;
 use fancy_display::FancyDisplay;
 use itertools::Itertools;
 use miette::Diagnostic;
+use pixi_manifest::platform::archspec_requirement_satisfied;
 use pixi_manifest::{EnvironmentName, PixiPlatform, PixiPlatformName};
 use pypi_modifiers::pypi_tags::{PyPITagError, get_tags_from_machine, is_python_record};
 use rattler_conda_types::ParseMatchSpecError;
 use rattler_conda_types::ParseStrictness::Lenient;
 use rattler_conda_types::{
-    GenericVirtualPackage, MatchSpec, Matches, PackageName, Platform, Version, VersionSpec,
+    GenericVirtualPackage, MatchSpec, Matches, Platform, StringMatcher, Version, VersionSpec,
 };
 use rattler_lock::{CondaPackageData, ConversionError, LockFile, PypiPackageData};
 use rattler_virtual_packages::{
@@ -19,9 +20,16 @@ use thiserror::Error;
 use uv_distribution_filename::WheelFilename;
 
 /// Define accepted virtual packages as a constant set
-/// These packages will be checked against the system virtual packages
+/// These packages will be checked against the system virtual packages.
 const ACCEPTED_VIRTUAL_PACKAGES: &[&str] = &[
-    "__glibc", "__musl", "__eglibc", "__cuda", "__osx", "__win", "__linux",
+    "__glibc",
+    "__musl",
+    "__eglibc",
+    "__cuda",
+    "__osx",
+    "__win",
+    "__linux",
+    "__archspec",
 ];
 
 #[derive(Debug, Error, Diagnostic)]
@@ -38,12 +46,18 @@ impl VirtualPackageNotFoundError {
         system_virtual_packages: &Vec<&GenericVirtualPackage>,
     ) -> Self {
         let required_version = required_package.version.as_ref().and_then(spec_version);
+        // `__archspec` is named by microarchitecture; a pattern build matcher
+        // names no single value to suggest, so the hint falls back to an example.
+        let required_build = match required_package.build.as_ref() {
+            Some(StringMatcher::Exact(build)) => Some(build.as_str()),
+            Some(_) | None => None,
+        };
         let help = required_package
             .name
             .as_exact()
-            // No accepted virtual package needs a build string for its hint:
-            // `__archspec`, the only one that would, is skipped before here.
-            .and_then(|name| conda_override_hint(name.as_normalized(), required_version, None))
+            .and_then(|name| {
+                conda_override_hint(name.as_normalized(), required_version, required_build)
+            })
             .map(|hint| {
                 format!(
                     " You can mock the virtual package by overriding the environment variable, e.g.: '`{hint}`'"
@@ -112,28 +126,28 @@ pub(crate) fn get_required_virtual_packages_from_depends(
 /// dependencies are always pinned to one exact version (`__cuda 12` /
 /// `__cuda >=12` both mean version `12`), so the operator is irrelevant -- we
 /// just read the version. Specs with no version (a bare `__cuda`) yield `None`.
-fn spec_version(spec: &VersionSpec) -> Option<&Version> {
+pub(crate) fn spec_version(spec: &VersionSpec) -> Option<&Version> {
     match spec {
         VersionSpec::Range(_, version) | VersionSpec::Exact(_, version) => Some(version),
         _ => None,
     }
 }
 
-/// Compute the minimal-required platform for each subdir the environment was
-/// resolved for: the subdir plus exactly the virtual packages that some resolved
-/// dependency requires, each at the highest version seen across all packages.
+/// Compute the minimal requirements for each subdir the environment was
+/// resolved for: exactly the virtual-package specs that some resolved dependency
+/// requires.
 ///
 /// The result is keyed by subdir; `declared_platforms` that share a subdir are
 /// unioned. Only `depends` is considered, mirroring
 /// [`validate_system_meets_environment_requirements`]. A subdir whose lock-file
 /// entry has no conda packages is omitted (the caller falls back to the declared
-/// platform); a subdir with packages but no virtual-package requirements yields a
-/// platform with an empty declared set.
+/// platform); a subdir with packages but no virtual-package requirements yields
+/// an empty requirement list.
 pub(crate) fn compute_minimal_required_platforms(
     lock_file: &LockFile,
     environment_name: &EnvironmentName,
     declared_platforms: &[&PixiPlatform],
-) -> HashMap<Platform, PixiPlatform> {
+) -> HashMap<Platform, Vec<MatchSpec>> {
     let Some(environment) = lock_file.environment(environment_name.as_str()) else {
         return HashMap::new();
     };
@@ -159,58 +173,44 @@ pub(crate) fn compute_minimal_required_platforms(
         .into_iter()
         .map(|(subdir, depends)| {
             let depends: Vec<&str> = depends.iter().map(String::as_str).collect_vec();
-            (
-                subdir,
-                PixiPlatform::from_required_virtual_packages(
-                    subdir,
-                    minimal_required_virtual_packages(&depends),
-                ),
-            )
+            (subdir, required_virtual_package_specs(&depends))
         })
         .collect()
 }
 
-/// The virtual packages that some dependency in `depends` requires: each
-/// accepted virtual package at the highest version seen across all `depends`,
-/// with a version-less requirement (bare `__cuda`) pinned to version 0 so it
-/// survives but loses to any versioned one. The result is sorted by name.
+/// The virtual-package requirements some dependency in `depends` places on the
+/// machine: the specs themselves, deduplicated and sorted for a stable marker
+/// file.
 ///
-/// This is the per-subdir core of `compute_minimal_required_platforms`,
-/// shared with `pixi global` which derives the same minimum from an installed
+/// The specs are kept verbatim rather than folded into one entry per name. A
+/// `depends` entry can carry a version range and a build-string pattern --
+/// conda-forge's microarch metapackages emit
+/// `__archspec[version='1.*', build='^(x86_64_v3|skylake|...)$']` -- so
+/// collapsing them into a concrete `GenericVirtualPackage`, or into the highest
+/// version seen, throws the constraint away. Requiring all of them is both
+/// lossless and exactly what the resolver asked for.
+///
+/// This is the per-subdir core of `compute_minimal_required_platforms`, shared
+/// with `pixi global`, which derives the same minimum from an installed
 /// environment's records rather than a lock file.
-pub fn minimal_required_virtual_packages(depends: &[&str]) -> Vec<GenericVirtualPackage> {
+pub fn required_virtual_package_specs(depends: &[&str]) -> Vec<MatchSpec> {
     let Ok(specs) = get_required_virtual_packages_from_depends(depends) else {
         return Vec::new();
     };
 
-    let mut aggregated: HashMap<PackageName, GenericVirtualPackage> = HashMap::new();
+    let mut requirements: Vec<MatchSpec> = Vec::new();
     for spec in specs {
-        let Some(name) = spec.name.as_exact() else {
+        // A spec with a non-exact name matches nothing we can check.
+        if spec.name.as_exact().is_none() {
             continue;
-        };
-        let version = spec
-            .version
-            .as_ref()
-            .and_then(spec_version)
-            .cloned()
-            .unwrap_or_else(|| Version::major(0));
-        aggregated
-            .entry(name.clone())
-            .and_modify(|existing| {
-                if version > existing.version {
-                    existing.version = version.clone();
-                }
-            })
-            .or_insert_with(|| GenericVirtualPackage {
-                name: name.clone(),
-                version,
-                build_string: String::new(),
-            });
+        }
+        let rendered = spec.to_string();
+        if !requirements.iter().any(|seen| seen.to_string() == rendered) {
+            requirements.push(spec);
+        }
     }
-
-    let mut vps: Vec<GenericVirtualPackage> = aggregated.into_values().collect();
-    vps.sort_by(|a, b| a.name.as_normalized().cmp(b.name.as_normalized()));
-    vps
+    requirements.sort_by_key(ToString::to_string);
+    requirements
 }
 
 /// Get the wheel filenames from the lock file pypi package data
@@ -336,7 +336,15 @@ pub(crate) fn validate_system_meets_environment_requirements(
         };
 
         if let Some(local_vpkg) = generic_system_virtual_packages.get(name) {
-            if !required.matches(local_vpkg) {
+            // `__archspec` compares microarchitectures, not strings: its
+            // version is a meaningless constant, and an exactly-named build
+            // is a baseline any descendant host can run.
+            let satisfied = if name.as_normalized() == "__archspec" {
+                archspec_requirement_satisfied(required.build.as_ref(), &local_vpkg.build_string)
+            } else {
+                required.matches(local_vpkg)
+            };
+            if !satisfied {
                 return Err(VirtualPackageNotFoundError::new(
                     &required,
                     &generic_system_virtual_packages.values().collect(),
@@ -388,7 +396,7 @@ mod test {
     use insta::assert_snapshot;
     use pixi_test_utils::format_diagnostic;
     use rattler_conda_types::package::DistArchiveIdentifier;
-    use rattler_conda_types::{PackageRecord, ParseStrictness, Platform};
+    use rattler_conda_types::{PackageName, PackageRecord, ParseStrictness, Platform};
     use rattler_lock::{CondaBinaryData, PlatformData, PlatformName, UrlOrPath};
     use rattler_virtual_packages::Override;
     use std::path::Path;
@@ -450,27 +458,76 @@ mod test {
             &[&declared],
         );
 
-        let platform = minimal
+        let requirements = minimal
             .get(&Platform::Linux64)
-            .expect("linux-64 minimal platform");
-        assert_eq!(platform.subdir(), Platform::Linux64);
+            .expect("linux-64 minimal requirements");
 
-        // The resolved packages require `__cuda` at the highest version seen.
-        let cuda = platform
-            .declared_virtual_packages()
+        // Every `__cuda` spec the resolved packages ask for is kept verbatim
+        // rather than folded into one entry at the highest version.
+        let cuda: Vec<String> = requirements
             .iter()
-            .find(|vp| vp.name.as_normalized() == "__cuda")
-            .expect("__cuda is required");
-        assert_eq!(cuda.version, Version::from_str("12").unwrap());
+            .filter(|spec| {
+                spec.name
+                    .as_exact()
+                    .is_some_and(|n| n.as_normalized() == "__cuda")
+            })
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(cuda, vec!["__cuda >=12".to_string()]);
 
-        // Only depended-on VPs are present; subdir defaults are not padded in
-        // (`__archspec` is a linux-64 default but never appears in `depends`).
+        // Only depended-on virtual packages are present; subdir defaults are
+        // not padded in (`__archspec` is a linux-64 default but never appears
+        // in `depends`).
+        assert!(!requirements.iter().any(|spec| {
+            spec.name
+                .as_exact()
+                .is_some_and(|n| n.as_normalized() == "__archspec")
+        }));
+    }
+
+    /// A `depends` entry's build matcher survives into the requirement set.
+    ///
+    /// conda-forge's microarch metapackages constrain `__archspec` with a
+    /// CEP-29 regex naming every compatible microarchitecture. Folding these
+    /// into a `GenericVirtualPackage` -- which can only hold one literal build
+    /// string -- dropped the constraint entirely, and taking the "highest
+    /// version" collapsed distinct requirements into one.
+    #[test]
+    fn required_specs_keep_build_matchers_and_every_distinct_spec() {
+        let depends = [
+            "__archspec[version='1.*', build='^(x86_64_v3|haswell|skylake)$']",
+            "__archspec 1 haswell",
+            "__cuda >=11",
+            "__cuda >=12",
+            // A duplicate of the first spec must not appear twice.
+            "__archspec[version='1.*', build='^(x86_64_v3|haswell|skylake)$']",
+            // A non-virtual dependency is not a requirement on the machine.
+            "python >=3.12",
+        ];
+        let requirements = required_virtual_package_specs(&depends);
+        let rendered: Vec<String> = requirements.iter().map(ToString::to_string).collect();
+
+        // Both `__cuda` bounds are kept: the machine must satisfy every spec,
+        // and nothing here justifies picking one.
         assert!(
-            !platform
-                .declared_virtual_packages()
-                .iter()
-                .any(|vp| vp.name.as_normalized() == "__archspec")
+            rendered.contains(&"__cuda >=11".to_string()),
+            "{rendered:?}"
         );
+        assert!(
+            rendered.contains(&"__cuda >=12".to_string()),
+            "{rendered:?}"
+        );
+        // The regex reached the requirement set as a regex.
+        let regex_spec = requirements
+            .iter()
+            .find(|spec| matches!(spec.build, Some(StringMatcher::Regex(_))))
+            .expect("the regex build matcher must survive");
+        assert!(regex_spec.build.as_ref().is_some_and(|build| {
+            build.matches("skylake") && build.matches("haswell") && !build.matches("nehalem")
+        }));
+        // Deduplicated, and non-virtual dependencies are excluded.
+        assert_eq!(rendered.len(), 4, "{rendered:?}");
+        assert!(!rendered.iter().any(|spec| spec.contains("python")));
     }
 
     /// A version-less virtual-package dependency (bare `__cuda`) still
@@ -503,15 +560,21 @@ packages:
             &[&declared],
         );
 
-        let platform = minimal
+        let requirements = minimal
             .get(&Platform::Linux64)
-            .expect("linux-64 minimal platform");
-        let cuda = platform
-            .declared_virtual_packages()
+            .expect("linux-64 minimal requirements");
+        let cuda = requirements
             .iter()
-            .find(|vp| vp.name.as_normalized() == "__cuda")
-            .expect("bare __cuda must survive into the minimal platform");
-        assert_eq!(cuda.version, Version::major(0));
+            .find(|spec| {
+                spec.name
+                    .as_exact()
+                    .is_some_and(|n| n.as_normalized() == "__cuda")
+            })
+            .expect("bare __cuda must survive into the minimal requirements");
+        // A bare spec keeps its "any version" meaning instead of being pinned
+        // to a synthetic version 0.
+        assert_eq!(cuda.version, None);
+        assert_eq!(cuda.to_string(), "__cuda");
     }
 
     #[test]
@@ -703,24 +766,52 @@ packages:
         }
     }
 
+    /// `__archspec` requirements are validated against the host, through the
+    /// microarchitecture graph. The fixture's package requires
+    /// `__archspec 1 x86_64` -- an exactly-named build, which is the shape
+    /// conda-forge's legacy per-name microarch builds still use -- so any
+    /// descendant host satisfies it while a cross-family one does not.
+    ///
+    /// This used to be skipped entirely, letting a lock install on a machine
+    /// that cannot run it.
     #[test]
-    fn test_archspec_skip() {
+    fn test_archspec_matched_through_the_dag() {
         let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let lock_file_path = root_dir.join("../../tests/data/lock_files/archspec.lock");
         let lock_file = LockFile::from_path(&lock_file_path).unwrap();
         let platform = pixi_manifest::PixiPlatform::from_subdir(Platform::Linux64);
 
-        let mut overrides = VirtualPackageOverrides::default();
-        overrides.libc = Some(Override::String("2.17".to_string()));
+        let overrides = |archspec: &str| {
+            let mut overrides = VirtualPackageOverrides::default();
+            overrides.libc = Some(Override::String("2.17".to_string()));
+            overrides.archspec = Some(Override::String(archspec.to_string()));
+            overrides
+        };
+        let validate = |archspec: &str| {
+            validate_system_meets_environment_requirements(
+                &lock_file,
+                &platform,
+                &EnvironmentName::default(),
+                Some(overrides(archspec)),
+            )
+        };
 
-        // validate that the archspec is skipped
-        validate_system_meets_environment_requirements(
-            &lock_file,
-            &platform,
-            &EnvironmentName::default(),
-            Some(overrides),
-        )
-        .unwrap();
+        // The exact baseline, and anything descending from it, can run.
+        for archspec in ["x86_64", "nehalem", "skylake", "zen4"] {
+            validate(archspec)
+                .unwrap_or_else(|error| panic!("{archspec} should satisfy __archspec: {error:?}"));
+        }
+
+        // A cross-family host cannot run x86_64 code, nor can a host whose
+        // microarchitecture is unknown.
+        for archspec in ["m1", "0"] {
+            let error =
+                validate(archspec).expect_err(&format!("{archspec} should not satisfy __archspec"));
+            assert!(
+                matches!(error, MachineValidationError::VirtualPackageNotFound(_)),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]

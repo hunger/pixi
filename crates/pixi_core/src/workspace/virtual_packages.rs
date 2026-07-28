@@ -1,4 +1,4 @@
-use crate::environment::PlatformData;
+use crate::environment::{PlatformData, RequiredPlatform};
 use crate::lock_file::virtual_packages::{
     MachineValidationError, compute_minimal_required_platforms,
     validate_system_meets_environment_requirements,
@@ -9,10 +9,11 @@ use crate::workspace::{
 };
 use fancy_display::FancyDisplay;
 use miette::Diagnostic;
+use pixi_manifest::platform::archspec_requirement_satisfied;
 use pixi_manifest::{
     EnvironmentName, FeaturesExt, HasWorkspaceManifest, PixiPlatform, PixiPlatformName,
 };
-use rattler_conda_types::{GenericVirtualPackage, Platform};
+use rattler_conda_types::{GenericVirtualPackage, MatchSpec, Matches, Platform};
 use rattler_lock::LockFile;
 use rattler_virtual_packages::{Cuda, CudaArch, LibC, Linux, Osx, VirtualPackage};
 use std::collections::HashSet;
@@ -149,7 +150,7 @@ pub fn verify_current_platform_can_run_environment(
         // in the resolution-derived requirements the machine actually lacks.
         Err(unmet) => {
             let mut error = environment.unsupported_platform_error();
-            error.unsatisfied_requirements = unmet;
+            error.unsatisfied_requirements = unmet.into_iter().map(Into::into).collect();
             Err(VerifyCurrentPlatformError::from(Box::new(error)))
         }
     }
@@ -163,7 +164,7 @@ pub fn verify_current_platform_can_run_environment(
 pub fn minimum_compatible_declared_platform<'p>(
     environment: &Environment<'p>,
     lock_file: &LockFile,
-) -> Result<&'p PixiPlatform, Vec<GenericVirtualPackage>> {
+) -> Result<&'p PixiPlatform, Vec<MatchSpec>> {
     let current = environment
         .workspace()
         .host_platform(
@@ -197,14 +198,14 @@ pub fn minimum_compatible_declared_platform<'p>(
     let minimal =
         compute_minimal_required_platforms(lock_file, environment.name(), &declared_platforms);
 
-    let mut unmet: Option<Vec<GenericVirtualPackage>> = None;
+    let mut unmet: Option<Vec<MatchSpec>> = None;
     for subdir in &candidate_subdirs {
         // A subdir with no resolved packages requires no virtual packages, so
         // the machine trivially satisfies it -- e.g. an empty environment whose
         // only content is tasks still runs under an unsatisfiable requirement.
         let unsatisfied = minimal
             .get(subdir)
-            .map(|platform| unsatisfied_virtual_packages(platform, &system_virtual_packages))
+            .map(|requirements| unmet_requirements(requirements, &system_virtual_packages))
             .unwrap_or_default();
         if unsatisfied.is_empty() {
             if let Some(declared) = declared_platforms
@@ -221,14 +222,15 @@ pub fn minimum_compatible_declared_platform<'p>(
     Err(unmet.unwrap_or_default())
 }
 
-/// The declared virtual packages of `platform` that the machine does not
-/// provide, per [`pixi_manifest::platform::satisfied_by_system`].
+/// The declared capabilities of `platform` that the machine does not provide,
+/// per [`pixi_manifest::platform::satisfied_by_system`]. Both sides are
+/// concrete, so the archspec DAG applies.
 ///
 /// The subdir-default `__archspec` is skipped: running the subdir at all,
 /// natively or emulated, implies its baseline microarchitecture, which a
 /// cross-family host (Apple Silicon under Rosetta running `osx-64`) could
 /// never satisfy through the DAG.
-fn unsatisfied_virtual_packages(
+fn unmet_capabilities(
     platform: &PixiPlatform,
     system: &[GenericVirtualPackage],
 ) -> Vec<GenericVirtualPackage> {
@@ -245,6 +247,38 @@ fn unsatisfied_virtual_packages(
         .collect()
 }
 
+/// The `requirements` the machine's virtual packages do not satisfy.
+///
+/// These come from package `depends`, so they are match specs and are matched
+/// as such -- version ranges and build-string patterns included. No DAG is
+/// involved: a microarchitecture requirement already spells out every
+/// compatible name in its build-string regex, except when it names one
+/// exactly, which [`archspec_requirement_satisfied`] handles.
+fn unmet_requirements(
+    requirements: &[MatchSpec],
+    system: &[GenericVirtualPackage],
+) -> Vec<MatchSpec> {
+    requirements
+        .iter()
+        .filter(|required| !requirement_satisfied(required, system))
+        .cloned()
+        .collect()
+}
+
+/// Whether `system` provides a virtual package matching `required`.
+fn requirement_satisfied(required: &MatchSpec, system: &[GenericVirtualPackage]) -> bool {
+    let Some(name) = required.name.as_exact() else {
+        return true;
+    };
+    let Some(provided) = system.iter().find(|package| &package.name == name) else {
+        return false;
+    };
+    if name.as_normalized() == "__archspec" {
+        return archspec_requirement_satisfied(required.build.as_ref(), &provided.build_string);
+    }
+    required.matches(provided)
+}
+
 /// The platform the environment was installed for cannot run the installed
 /// packages: they require virtual packages this platform does not provide.
 #[derive(Debug, Error, Diagnostic)]
@@ -256,11 +290,11 @@ fn unsatisfied_virtual_packages(
 pub struct RunPlatformUnsupportedError {
     environment: EnvironmentName,
     platform: PixiPlatformName,
-    unmet: Vec<GenericVirtualPackage>,
+    unmet: Vec<MatchSpec>,
 }
 
-/// How a base platform compares to the resolved/minimum platforms an
-/// environment was installed for.
+/// How a base platform compares to the resolved platform and the minimum
+/// requirements an environment was installed for.
 #[derive(Debug, PartialEq, Eq)]
 enum RunPlatformVerdict {
     /// The base meets the resolution platform: it runs as intended.
@@ -271,13 +305,13 @@ enum RunPlatformVerdict {
     /// (empty when only the resolution subdir is out of reach).
     OnlyMinimum(Vec<GenericVirtualPackage>),
     /// The base is below the minimum: the installed packages cannot run, with
-    /// the virtual packages it fails to provide.
-    BelowMinimum(Vec<GenericVirtualPackage>),
+    /// the requirements it fails to satisfy.
+    BelowMinimum(Vec<MatchSpec>),
 }
 
-/// The virtual packages `required` needs that `base_capabilities` does not
-/// provide (missing, or present at a lower version). Subdir-agnostic.
-fn unmet_virtual_packages(
+/// The capabilities `required` declares that `base_capabilities` does not
+/// provide. Subdir-agnostic.
+fn unmet_declared_capabilities(
     required: &PlatformData,
     base_capabilities: &[GenericVirtualPackage],
 ) -> Vec<GenericVirtualPackage> {
@@ -285,33 +319,40 @@ fn unmet_virtual_packages(
         required.subdir(),
         required.virtual_packages().to_vec(),
     );
-    unsatisfied_virtual_packages(&required_platform, base_capabilities)
+    unmet_capabilities(&required_platform, base_capabilities)
 }
 
-/// Classify a base platform against the resolution and minimum platforms an
-/// environment was installed for (read from `conda-meta/pixi`). `base_subdirs`
-/// are the subdirs the base can run (a single subdir for an explicit
-/// `--platform`, or the host's candidate subdirs incl. architecture
+/// Classify a base platform against the resolution platform and the minimum
+/// requirements an environment was installed for (read from `conda-meta/pixi`).
+/// `base_subdirs` are the subdirs the base can run (a single subdir for an
+/// explicit `--platform`, or the host's candidate subdirs incl. architecture
 /// fallbacks); a required subdir outside that set never satisfies.
+///
+/// The two checks are deliberately different in kind: the resolved platform is
+/// a set of concrete capabilities, while the minimum is a set of requirements
+/// read from package `depends`.
 fn classify_run_platform(
     base_subdirs: &[Platform],
     base_capabilities: &[GenericVirtualPackage],
     resolved: &PlatformData,
-    minimum: &PlatformData,
+    minimum: &RequiredPlatform,
 ) -> RunPlatformVerdict {
-    let satisfies = |required: &PlatformData| {
-        base_subdirs.contains(&required.subdir())
-            && unmet_virtual_packages(required, base_capabilities).is_empty()
-    };
+    let meets_resolved = base_subdirs.contains(&resolved.subdir())
+        && unmet_declared_capabilities(resolved, base_capabilities).is_empty();
+    let meets_minimum = base_subdirs.contains(&minimum.subdir())
+        && unmet_requirements(minimum.requirements(), base_capabilities).is_empty();
 
-    if satisfies(resolved) {
+    if meets_resolved {
         RunPlatformVerdict::Compatible
-    } else if satisfies(minimum) {
-        RunPlatformVerdict::OnlyMinimum(unmet_virtual_packages(resolved, base_capabilities))
+    } else if meets_minimum {
+        RunPlatformVerdict::OnlyMinimum(unmet_declared_capabilities(resolved, base_capabilities))
     } else if base_subdirs.contains(&minimum.subdir()) {
-        RunPlatformVerdict::BelowMinimum(unmet_virtual_packages(minimum, base_capabilities))
+        RunPlatformVerdict::BelowMinimum(unmet_requirements(
+            minimum.requirements(),
+            base_capabilities,
+        ))
     } else {
-        RunPlatformVerdict::BelowMinimum(minimum.virtual_packages().to_vec())
+        RunPlatformVerdict::BelowMinimum(minimum.requirements().to_vec())
     }
 }
 
@@ -734,7 +775,11 @@ packages:
             &lock("  depends:\n  - __cuda >=9999\n"),
         )
         .expect_err("an unsatisfiable resolved requirement has no fallback");
-        assert!(unmet.iter().any(|vp| vp.name.as_normalized() == "__cuda"));
+        assert!(unmet.iter().any(|spec| {
+            spec.name
+                .as_exact()
+                .is_some_and(|n| n.as_normalized() == "__cuda")
+        }));
     }
 
     /// An environment that resolved no packages at all (its subdir is absent
@@ -848,15 +893,15 @@ packages: []
         };
 
         // Machine provides cuda 12 -> the requirement is met.
-        assert!(unsatisfied_virtual_packages(&platform, &cuda("12")).is_empty());
+        assert!(unmet_capabilities(&platform, &cuda("12")).is_empty());
         // A higher machine version still satisfies the minimum.
-        assert!(unsatisfied_virtual_packages(&platform, &cuda("12.4")).is_empty());
+        assert!(unmet_capabilities(&platform, &cuda("12.4")).is_empty());
         // A lower machine version leaves the requirement unmet.
-        let unmet = unsatisfied_virtual_packages(&platform, &cuda("11"));
+        let unmet = unmet_capabilities(&platform, &cuda("11"));
         assert_eq!(unmet.len(), 1);
         assert_eq!(unmet[0].name.as_normalized(), "__cuda");
         // No cuda at all -> unmet.
-        assert_eq!(unsatisfied_virtual_packages(&platform, &[]).len(), 1);
+        assert_eq!(unmet_capabilities(&platform, &[]).len(), 1);
     }
 
     #[test]
@@ -897,11 +942,21 @@ packages: []
         }
     }
 
+    fn spec(spec: &str) -> MatchSpec {
+        MatchSpec::from_str(spec, rattler_conda_types::ParseStrictness::Lenient).unwrap()
+    }
+
+    /// The marker's minimum is a requirement set, so tests spell it out as
+    /// match specs the way `depends` entries do.
+    fn required_platform(subdir: Platform, specs: &[&str]) -> RequiredPlatform {
+        RequiredPlatform::new(subdir, specs.iter().copied().map(spec).collect())
+    }
+
     #[test]
     fn classify_compatible_when_base_meets_resolution() {
         // Base provides cuda 12.4; resolution needs 12.0 and minimum 12.0.
         let resolved = platform_data(Platform::Linux64, vec![gvp("__cuda", "12.0")]);
-        let minimum = platform_data(Platform::Linux64, vec![gvp("__cuda", "12.0")]);
+        let minimum = required_platform(Platform::Linux64, &["__cuda >=12.0"]);
         let verdict = classify_run_platform(
             &[Platform::Linux64],
             &[gvp("__cuda", "12.4")],
@@ -917,7 +972,7 @@ packages: []
         // base provides 2.17 -- it runs, but by accident. The verdict carries
         // the resolution requirement the base misses.
         let resolved = platform_data(Platform::Linux64, vec![gvp("__glibc", "2.28")]);
-        let minimum = platform_data(Platform::Linux64, vec![gvp("__glibc", "2.17")]);
+        let minimum = required_platform(Platform::Linux64, &["__glibc >=2.17"]);
         let verdict = classify_run_platform(
             &[Platform::Linux64],
             &[gvp("__glibc", "2.17")],
@@ -972,7 +1027,7 @@ packages: []
     fn classify_below_minimum_reports_unmet() {
         // Base glibc 2.12 is below the 2.17 floor the installed packages need.
         let resolved = platform_data(Platform::Linux64, vec![gvp("__glibc", "2.28")]);
-        let minimum = platform_data(Platform::Linux64, vec![gvp("__glibc", "2.17")]);
+        let minimum = required_platform(Platform::Linux64, &["__glibc >=2.17"]);
         let verdict = classify_run_platform(
             &[Platform::Linux64],
             &[gvp("__glibc", "2.12")],
@@ -982,7 +1037,7 @@ packages: []
         match verdict {
             RunPlatformVerdict::BelowMinimum(unmet) => {
                 assert_eq!(unmet.len(), 1);
-                assert_eq!(unmet[0].name.as_normalized(), "__glibc");
+                assert_eq!(unmet[0].to_string(), "__glibc >=2.17");
             }
             other => panic!("expected BelowMinimum, got {other:?}"),
         }
@@ -992,7 +1047,7 @@ packages: []
     fn classify_below_minimum_on_subdir_mismatch() {
         // A subdir outside the base's candidates can never satisfy.
         let resolved = platform_data(Platform::Osx64, vec![]);
-        let minimum = platform_data(Platform::Osx64, vec![]);
+        let minimum = required_platform(Platform::Osx64, &[]);
         let verdict = classify_run_platform(&[Platform::Linux64], &[], &resolved, &minimum);
         assert!(matches!(verdict, RunPlatformVerdict::BelowMinimum(_)));
     }
@@ -1002,7 +1057,7 @@ packages: []
         // An emulated subdir (osx-64 among an osx-arm64 host's candidates) with
         // satisfied virtual packages is compatible.
         let resolved = platform_data(Platform::Osx64, vec![gvp("__osx", "11.0")]);
-        let minimum = platform_data(Platform::Osx64, vec![]);
+        let minimum = required_platform(Platform::Osx64, &[]);
         let verdict = classify_run_platform(
             &[Platform::OsxArm64, Platform::Osx64],
             &[gvp("__osx", "13.0")],

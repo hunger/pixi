@@ -112,7 +112,7 @@ impl<'p> Environment<'p> {
         &self,
     ) -> (
         Option<crate::environment::PlatformData>,
-        Option<crate::environment::PlatformData>,
+        Option<crate::environment::RequiredPlatform>,
     ) {
         match crate::environment::read_environment_file(&self.dir()) {
             Ok(Some(file)) => (file.resolved_platform, file.minimum_supported_platform),
@@ -273,11 +273,11 @@ impl<'p> Environment<'p> {
             .to_vec();
         let env_platforms = self.platforms();
         let workspace = &self.workspace_manifest().workspace;
-        let unsatisfied_requirements = workspace.unsatisfied_platform_requirements(
-            current,
-            &system_virtual_packages,
-            &env_platforms,
-        );
+        let unsatisfied_requirements = workspace
+            .unsatisfied_platform_requirements(current, &system_virtual_packages, &env_platforms)
+            .into_iter()
+            .map(Into::into)
+            .collect();
         let platform_diagnostics =
             workspace.platform_match_diagnostics(current, &system_virtual_packages, &env_platforms);
         UnsupportedPlatformError {

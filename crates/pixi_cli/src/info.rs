@@ -7,7 +7,7 @@ use itertools::Itertools;
 use miette::IntoDiagnostic;
 use pixi_consts::consts;
 use pixi_core::WorkspaceLocator;
-use pixi_core::environment::PlatformData;
+use pixi_core::environment::{PlatformData, RequiredPlatform};
 use pixi_global::{BinDir, EnvRoot};
 use pixi_manifest::platform::subdir_default_virtual_packages;
 use pixi_manifest::toml::inline_virtual_package_specs;
@@ -98,6 +98,24 @@ impl From<&PlatformData> for PlatformInfo {
             // Resolved/minimum is a computed set, not a declaration: don't filter,
             // so a requirement that equals a subdir default still shows.
             virtual_packages: friendly_virtual_packages(data.virtual_packages(), None),
+        }
+    }
+}
+
+/// Built from a marker-file [`RequiredPlatform`]. Requirements are match specs,
+/// so they are rendered as written rather than in the friendly `key=value` form
+/// the concrete platforms use -- a version range or build-string pattern has no
+/// friendly spelling.
+impl From<&RequiredPlatform> for PlatformInfo {
+    fn from(data: &RequiredPlatform) -> Self {
+        Self {
+            name: data.subdir().into(),
+            subdir: data.subdir().to_string(),
+            virtual_packages: data
+                .requirements()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         }
     }
 }

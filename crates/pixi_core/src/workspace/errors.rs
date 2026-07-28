@@ -1,9 +1,10 @@
 use crate::Workspace;
+use crate::lock_file::virtual_packages::spec_version;
 use fancy_display::FancyDisplay;
 use itertools::Itertools;
 use miette::{Diagnostic, LabeledSpan};
 use pixi_manifest::{EnvironmentName, PixiPlatformName, PlatformMatchDiagnosis, TaskName};
-use rattler_conda_types::{GenericVirtualPackage, Platform, Version};
+use rattler_conda_types::{GenericVirtualPackage, MatchSpec, Platform, StringMatcher, Version};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
@@ -21,18 +22,98 @@ pub struct UnsupportedPlatformError {
     /// The platform that was requested
     pub platform: Platform,
 
-    /// Declared virtual packages from workspace platforms that match the
-    /// host subdir but are not provided by this machine. Empty when the
-    /// platform mismatch isn't caused by missing virtual packages -- for
-    /// example, when the user explicitly asked for a platform the
-    /// environment doesn't declare at all.
-    pub unsatisfied_requirements: Vec<GenericVirtualPackage>,
+    /// What this machine fails to provide: either virtual packages declared by
+    /// workspace platforms matching the host subdir, or the requirements the
+    /// locked packages impose when no declared platform matched at all. Empty
+    /// when the platform mismatch isn't caused by virtual packages -- for
+    /// example, when the user explicitly asked for a platform the environment
+    /// doesn't declare at all.
+    pub unsatisfied_requirements: Vec<UnmetRequirement>,
 
     /// Why each platform the environment declares does not run on this
     /// machine (unrunnable subdir or missing virtual packages). Empty when no
     /// breakdown is available (e.g. an explicit `--platform` the environment
     /// doesn't declare).
     pub platform_diagnostics: Vec<PlatformMatchDiagnosis>,
+}
+
+/// Something this machine fails to provide.
+///
+/// A *capability* is what a workspace platform declares it needs -- concrete by
+/// construction, since a manifest can only name a version and a build string. A
+/// *requirement* comes from a locked package's `depends` and can carry a version
+/// range and a build-string pattern, so it stays a [`MatchSpec`]: flattening it
+/// into a concrete package would drop the constraint it expresses.
+#[derive(Debug, Clone)]
+pub enum UnmetRequirement {
+    /// A virtual package a workspace platform declares.
+    Capability(GenericVirtualPackage),
+    /// A virtual-package spec a locked package depends on. Boxed: a `MatchSpec`
+    /// is several times the size of a `GenericVirtualPackage`.
+    Requirement(Box<MatchSpec>),
+}
+
+impl From<GenericVirtualPackage> for UnmetRequirement {
+    fn from(package: GenericVirtualPackage) -> Self {
+        Self::Capability(package)
+    }
+}
+
+impl From<MatchSpec> for UnmetRequirement {
+    fn from(spec: MatchSpec) -> Self {
+        Self::Requirement(Box::new(spec))
+    }
+}
+
+impl UnmetRequirement {
+    /// The `CONDA_OVERRIDE_*` hint that would mock this away, if any.
+    fn override_hint(&self) -> Option<String> {
+        match self {
+            Self::Capability(package) => conda_override_hint(
+                package.name.as_normalized(),
+                Some(&package.version),
+                Some(package.build_string.as_str()),
+            ),
+            Self::Requirement(spec) => {
+                let name = spec.name.as_exact()?;
+                let build = match spec.build.as_ref() {
+                    Some(StringMatcher::Exact(build)) => Some(build.as_str()),
+                    // A pattern names no single value to suggest.
+                    Some(_) | None => None,
+                };
+                conda_override_hint(
+                    name.as_normalized(),
+                    spec.version.as_ref().and_then(spec_version),
+                    build,
+                )
+            }
+        }
+    }
+}
+
+impl Display for UnmetRequirement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // A match spec already renders as the requirement it is.
+            Self::Requirement(spec) => write!(f, "{spec}"),
+            Self::Capability(package) => {
+                // `__archspec` carries a microarchitecture name in its build
+                // string; its version is a meaningless constant.
+                if let Some(microarchitecture) = archspec_microarchitecture_of(package) {
+                    return write!(f, "{} {microarchitecture}", package.name.as_normalized());
+                }
+                // Version 0 encodes a version-less requirement (a bare
+                // `__cuda` dependency): present at any version.
+                if package.version == Version::major(0) {
+                    write!(f, "{} (any version)", package.name.as_normalized())
+                } else {
+                    // Conda's canonical spec spelling, so capabilities and
+                    // match-spec requirements read alike in one message.
+                    write!(f, "{} >={}", package.name.as_normalized(), package.version)
+                }
+            }
+        }
+    }
 }
 
 impl Error for UnsupportedPlatformError {}
@@ -124,7 +205,14 @@ fn format_platform_diagnosis(diagnosis: &PlatformMatchDiagnosis) -> String {
     } else {
         format!(
             "missing virtual packages: {}",
-            format_requirements(&diagnosis.unsatisfied_virtual_packages),
+            format_requirements(
+                &diagnosis
+                    .unsatisfied_virtual_packages
+                    .iter()
+                    .cloned()
+                    .map(UnmetRequirement::from)
+                    .collect::<Vec<_>>(),
+            ),
         )
     };
     format!("{label}: {reason}")
@@ -139,13 +227,7 @@ impl Diagnostic for UnsupportedPlatformError {
         let overrides: Vec<String> = self
             .unsatisfied_requirements
             .iter()
-            .filter_map(|req| {
-                conda_override_hint(
-                    req.name.as_normalized(),
-                    Some(&req.version),
-                    Some(req.build_string.as_str()),
-                )
-            })
+            .filter_map(UnmetRequirement::override_hint)
             .collect();
 
         let base = if overrides.is_empty() {
@@ -173,23 +255,8 @@ impl Diagnostic for UnsupportedPlatformError {
     }
 }
 
-fn format_requirements(reqs: &[GenericVirtualPackage]) -> String {
-    reqs.iter()
-        .map(|r| {
-            // `__archspec` carries a microarchitecture name in its build
-            // string; its version is a meaningless constant.
-            if let Some(microarchitecture) = archspec_microarchitecture_of(r) {
-                return format!("{} {microarchitecture}", r.name.as_normalized());
-            }
-            // Version 0 encodes a version-less requirement (a bare `__cuda`
-            // dependency): the package must be present at any version.
-            if r.version == Version::major(0) {
-                format!("{} (any version)", r.name.as_normalized())
-            } else {
-                format!("{} >= {}", r.name.as_normalized(), r.version)
-            }
-        })
-        .join(", ")
+fn format_requirements(reqs: &[UnmetRequirement]) -> String {
+    reqs.iter().map(ToString::to_string).join(", ")
 }
 
 /// The microarchitecture a `__archspec` entry names, or `None` for any other
@@ -294,7 +361,7 @@ mod tests {
             environments_platforms: vec![],
             environment: EnvironmentName::Default,
             platform: Platform::Linux64,
-            unsatisfied_requirements: unsatisfied,
+            unsatisfied_requirements: unsatisfied.into_iter().map(Into::into).collect(),
             platform_diagnostics: vec![],
         }
     }
@@ -304,7 +371,7 @@ mod tests {
         let e = err(vec![vp("__cuda", "11")]);
         let display = e.to_string();
         assert!(
-            display.contains("Unsatisfied requirements: __cuda >= 11"),
+            display.contains("Unsatisfied requirements: __cuda >=11"),
             "{display}"
         );
         let help = e.help().unwrap().to_string();
@@ -330,7 +397,7 @@ mod tests {
             "{display}"
         );
         assert!(
-            display.contains("Unsatisfied requirements: __cuda >= 11"),
+            display.contains("Unsatisfied requirements: __cuda >=11"),
             "{display}"
         );
     }
@@ -365,7 +432,7 @@ mod tests {
             "{display}"
         );
         assert!(
-            display.contains("gpu-linux (subdir linux-64): missing virtual packages: __cuda >= 12"),
+            display.contains("gpu-linux (subdir linux-64): missing virtual packages: __cuda >=12"),
             "{display}"
         );
     }
