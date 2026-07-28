@@ -976,13 +976,11 @@ impl HostMachine {
         self.candidate_subdirs.contains(&subdir)
     }
 
-    /// `true` when the host advertises a virtual package whose version is
-    /// at least the declared one (conda virtual-package semantics).
+    /// `true` when the host advertises the declared virtual package, per
+    /// [`pixi_manifest::platform::satisfied_by_system`], so `list` colours
+    /// rows by the same rule that selects platforms.
     fn satisfies(&self, declared: &GenericVirtualPackage) -> bool {
-        self.detected
-            .iter()
-            .find(|h| h.name == declared.name)
-            .is_some_and(|h| h.version >= declared.version)
+        pixi_manifest::platform::satisfied_by_system(declared, &self.detected)
     }
 
     /// Does the current machine support running this platform? Combines

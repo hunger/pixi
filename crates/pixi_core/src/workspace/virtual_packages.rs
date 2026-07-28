@@ -14,7 +14,7 @@ use pixi_manifest::{
 };
 use rattler_conda_types::{GenericVirtualPackage, Platform};
 use rattler_lock::LockFile;
-use rattler_virtual_packages::{Archspec, Cuda, CudaArch, LibC, Linux, Osx, VirtualPackage};
+use rattler_virtual_packages::{Cuda, CudaArch, LibC, Linux, Osx, VirtualPackage};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
@@ -67,17 +67,9 @@ fn generic_to_virtual_package(gvp: &GenericVirtualPackage) -> Option<VirtualPack
         "__cuda_arch" => Some(VirtualPackage::CudaArch(CudaArch {
             version: gvp.version.clone(),
         })),
-        "__archspec" => {
-            // Rattler maps an archspec string through a microarch database
-            // lookup; an empty/"0" build-string means "unknown microarch"
-            // and `from_name` returns the generic catch-all in that case.
-            if gvp.build_string.is_empty() || gvp.build_string == "0" {
-                return Some(VirtualPackage::Archspec(Archspec::Unknown));
-            }
-            Some(VirtualPackage::Archspec(Archspec::from_name(
-                gvp.build_string.as_str(),
-            )))
-        }
+        "__archspec" => Some(VirtualPackage::Archspec(
+            pixi_manifest::platform::archspec_from_build_string(&gvp.build_string),
+        )),
         _ => None,
     }
 }
@@ -230,19 +222,25 @@ pub fn minimum_compatible_declared_platform<'p>(
 }
 
 /// The declared virtual packages of `platform` that the machine does not
-/// provide (missing entirely, or present at a lower version).
+/// provide, per [`pixi_manifest::platform::satisfied_by_system`].
+///
+/// The subdir-default `__archspec` is skipped: running the subdir at all,
+/// natively or emulated, implies its baseline microarchitecture, which a
+/// cross-family host (Apple Silicon under Rosetta running `osx-64`) could
+/// never satisfy through the DAG.
 fn unsatisfied_virtual_packages(
     platform: &PixiPlatform,
     system: &[GenericVirtualPackage],
 ) -> Vec<GenericVirtualPackage> {
+    let is_default_archspec = |required: &GenericVirtualPackage| {
+        required.name.as_normalized() == "__archspec"
+            && pixi_manifest::platform::is_subdir_default(required, platform.subdir())
+    };
     platform
         .declared_virtual_packages()
         .iter()
-        .filter(|required| {
-            !system
-                .iter()
-                .any(|sys| sys.name == required.name && sys.version >= required.version)
-        })
+        .filter(|required| !is_default_archspec(required))
+        .filter(|required| !pixi_manifest::platform::satisfied_by_system(required, system))
         .cloned()
         .collect()
 }
@@ -349,14 +347,22 @@ fn describe_resolution_gap(
         );
     }
 
+    // `__archspec`'s payload is the microarchitecture in its build string; its
+    // version is a meaningless constant and must not surface in the message.
+    let microarchitecture = |package: &GenericVirtualPackage| -> Option<String> {
+        (package.name.as_normalized() == "__archspec")
+            .then(|| pixi_manifest::platform::archspec_microarchitecture(&package.build_string))
+            .flatten()
+            .map(str::to_string)
+    };
     let requirements = unmet
         .iter()
         .map(|required| {
-            format!(
-                "{} >={}",
-                required.name.as_normalized().trim_start_matches('_'),
-                required.version
-            )
+            let name = required.name.as_normalized().trim_start_matches('_');
+            match microarchitecture(required) {
+                Some(microarchitecture) => format!("{name} {microarchitecture}"),
+                None => format!("{name} >={}", required.version),
+            }
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -364,11 +370,10 @@ fn describe_resolution_gap(
         .iter()
         .map(
             |required| match machine.iter().find(|sys| sys.name == required.name) {
-                Some(sys) => format!(
-                    "only provides '{} {}'",
-                    sys.name.as_normalized(),
-                    sys.version
-                ),
+                Some(sys) => {
+                    let detail = microarchitecture(sys).unwrap_or_else(|| sys.version.to_string());
+                    format!("only provides '{} {detail}'", sys.name.as_normalized())
+                }
                 None => format!("does not provide '{}'", required.name.as_normalized()),
             },
         )

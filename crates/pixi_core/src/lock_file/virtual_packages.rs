@@ -41,7 +41,9 @@ impl VirtualPackageNotFoundError {
         let help = required_package
             .name
             .as_exact()
-            .and_then(|name| conda_override_hint(name.as_normalized(), required_version))
+            // No accepted virtual package needs a build string for its hint:
+            // `__archspec`, the only one that would, is skipped before here.
+            .and_then(|name| conda_override_hint(name.as_normalized(), required_version, None))
             .map(|hint| {
                 format!(
                     " You can mock the virtual package by overriding the environment variable, e.g.: '`{hint}`'"

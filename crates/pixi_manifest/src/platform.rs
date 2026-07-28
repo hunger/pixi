@@ -815,6 +815,55 @@ pub fn archspec_microarchitecture(build_string: &str) -> Option<&str> {
     }
 }
 
+/// Returns true if the system provides `required`: a virtual package of the
+/// same name, at a version at least as high, and -- when `required` carries a
+/// build string -- exactly that build string. `__archspec` is the exception:
+/// its build strings are microarchitecture names compared through the archspec
+/// DAG, and its version is a meaningless constant that is ignored.
+///
+/// Both sides are concrete capabilities (what a host reports, what a manifest
+/// platform declares), never requirements: a manifest cannot express a version
+/// range or a build-string pattern, so plain comparison is exhaustive here.
+pub fn satisfied_by_system(
+    required: &GenericVirtualPackage,
+    system: &[GenericVirtualPackage],
+) -> bool {
+    let Some(provided) = system.iter().find(|s| s.name == required.name) else {
+        return false;
+    };
+    if required.name.as_normalized() == "__archspec" {
+        return archspec_provides(
+            &archspec_from_build_string(&provided.build_string),
+            &archspec_from_build_string(&required.build_string),
+        );
+    }
+    provided.version >= required.version
+        && (required.build_string.is_empty() || provided.build_string == required.build_string)
+}
+
+/// Map an `__archspec` build string to rattler's typed [`Archspec`].
+pub fn archspec_from_build_string(build_string: &str) -> Archspec {
+    match archspec_microarchitecture(build_string) {
+        None => Archspec::Unknown,
+        Some(name) => Archspec::from_name(name),
+    }
+}
+
+/// Returns true if a host running the `provided` microarchitecture can run
+/// binaries built for the `required` baseline, walking the archspec DAG:
+/// `required` must be the same node or an ancestor of `provided`. An unknown
+/// `required` constrains nothing; an unknown host satisfies only such a bare
+/// requirement.
+fn archspec_provides(provided: &Archspec, required: &Archspec) -> bool {
+    match (provided, required) {
+        (Archspec::Microarchitecture(_) | Archspec::Unknown, Archspec::Unknown) => true,
+        (Archspec::Unknown, Archspec::Microarchitecture(_)) => false,
+        (Archspec::Microarchitecture(provided), Archspec::Microarchitecture(required)) => {
+            provided.name() == required.name() || provided.decendent_of(required)
+        }
+    }
+}
+
 /// Validate a declared `__archspec` microarchitecture name against the archspec
 /// database. An unknown name yields a platform no real host can ever match, so
 /// manifests and the CLI reject it up front; the error suggests the closest
@@ -1055,6 +1104,91 @@ mod tests {
             .declared_virtual_packages()
             .iter()
             .any(|gvp| gvp.name.as_normalized() == name)
+    }
+
+    fn gvp_with_build(name: &str, version: &str, build_string: &str) -> GenericVirtualPackage {
+        GenericVirtualPackage {
+            build_string: build_string.to_string(),
+            ..gvp(name, version)
+        }
+    }
+
+    #[test]
+    fn satisfied_by_system_compares_name_and_version() {
+        let system = vec![gvp("__cuda", "12.4")];
+        // Same name, system version at least as high.
+        assert!(satisfied_by_system(&gvp("__cuda", "12"), &system));
+        assert!(satisfied_by_system(&gvp("__cuda", "12.4"), &system));
+        // A higher requirement, or a name the system lacks, is unsatisfied.
+        assert!(!satisfied_by_system(&gvp("__cuda", "13"), &system));
+        assert!(!satisfied_by_system(&gvp("__glibc", "2.17"), &system));
+    }
+
+    #[test]
+    fn satisfied_by_system_compares_build_strings() {
+        let system = vec![gvp_with_build("__foo", "1", "special")];
+        // A declared build string must be provided exactly.
+        assert!(satisfied_by_system(
+            &gvp_with_build("__foo", "1", "special"),
+            &system
+        ));
+        assert!(!satisfied_by_system(
+            &gvp_with_build("__foo", "1", "other"),
+            &system
+        ));
+        // Declaring no build string accepts any provided one.
+        assert!(satisfied_by_system(&gvp("__foo", "1"), &system));
+        // A declared build string is not satisfied by an empty provided one.
+        assert!(!satisfied_by_system(
+            &gvp_with_build("__bar", "1", "special"),
+            &[gvp("__bar", "1")]
+        ));
+    }
+
+    #[test]
+    fn satisfied_by_system_matches_archspec_through_the_dag() {
+        let skylake = vec![gvp_with_build("__archspec", "1", "skylake")];
+        // A host microarchitecture satisfies any of its DAG ancestors. This is
+        // the case plain build-string equality would wrongly reject.
+        assert!(satisfied_by_system(
+            &gvp_with_build("__archspec", "0", "x86_64_v3"),
+            &skylake
+        ));
+        assert!(satisfied_by_system(
+            &gvp_with_build("__archspec", "0", "x86_64"),
+            &skylake
+        ));
+        // ...but not a more specific, sibling, or cross-family one.
+        assert!(!satisfied_by_system(
+            &gvp_with_build("__archspec", "0", "cascadelake"),
+            &skylake
+        ));
+        assert!(!satisfied_by_system(
+            &gvp_with_build("__archspec", "0", "zen2"),
+            &skylake
+        ));
+        assert!(!satisfied_by_system(
+            &gvp_with_build("__archspec", "0", "m1"),
+            &skylake
+        ));
+        // The version `__archspec` carries is a meaningless constant (rattler
+        // emits 1, the manifest 0) and must not affect the comparison.
+        assert!(satisfied_by_system(
+            &gvp_with_build("__archspec", "2", "x86_64"),
+            &skylake
+        ));
+        // A bare declaration constrains nothing, even against an unknown host.
+        let unknown = vec![gvp_with_build("__archspec", "1", "0")];
+        assert!(satisfied_by_system(&gvp("__archspec", "0"), &unknown));
+        assert!(satisfied_by_system(
+            &gvp_with_build("__archspec", "0", "0"),
+            &skylake
+        ));
+        // An unknown host microarchitecture fails any specific declaration.
+        assert!(!satisfied_by_system(
+            &gvp_with_build("__archspec", "0", "x86_64"),
+            &unknown
+        ));
     }
 
     #[test]
