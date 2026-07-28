@@ -128,7 +128,12 @@ Each inline-table entry has:
     `driver` is exactly equivalent to the bare `cuda = "12.0"` form. Per the
     conda CEP, `__cuda_arch` is meaningless without `__cuda`, so `arch` requires
     `driver`; declaring `arch` (or a raw `__cuda_arch`) alone is rejected.
-- For virtual packages without a friendly key, a raw `__name = "version"` entry is also accepted as an escape hatch. Only the virtual packages pixi knows how to override (`__win`, `__osx`, `__linux`, `__cuda`, `__archspec`, and the libc family `__glibc`/`__musl`/`__eglibc`) take effect at detection; any other raw `__name` is stored but ignored when checking host compatibility.
+- For virtual packages without a friendly key, a raw `__name = "version"` entry is also accepted.
+  Only the virtual packages pixi knows how to override (`__win`, `__osx`, `__linux`, `__cuda`, `__archspec`, and the libc family `__glibc`/`__musl`/`__eglibc`) take effect at detection; any other raw `__name` is stored but ignored when checking host compatibility.
+
+  A raw `__archspec` entry carries a version as well as the micro-architecture (`__archspec = "1=skylake"`), but that version is not yours to choose:
+  per [CEP 30](https://github.com/conda/ceps/blob/main/cep-0030.md) it records only whether the micro-architecture is one the archspec database knows (`1`) or an unknown one (`0`), so Pixi normalizes it and writes the entry back through the friendly `archspec` key.
+  The micro-architecture alone decides which hosts match.
 
 A feature's `platforms` array is a list of names that must each resolve to a workspace platform (or be a bare conda subdir, which Pixi treats as an alias for that subdir).
 This is how you bind a feature to the rich variant:

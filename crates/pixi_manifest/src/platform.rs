@@ -406,6 +406,7 @@ impl PixiPlatform {
         subdir: Platform,
         declared_virtual_packages: Vec<GenericVirtualPackage>,
     ) -> Result<Self, PixiPlatformError> {
+        let declared_virtual_packages = normalize_virtual_packages(declared_virtual_packages);
         if name.as_str() == subdir.as_str()
             && declared_virtual_packages != subdir_default_virtual_packages(subdir)
         {
@@ -461,6 +462,7 @@ impl PixiPlatform {
         subdir: Platform,
         virtual_packages: Vec<GenericVirtualPackage>,
     ) -> Self {
+        let virtual_packages = normalize_virtual_packages(virtual_packages);
         let name = PixiPlatformName(crate::toml::platform::synthesize_name_string(
             subdir,
             &virtual_packages,
@@ -522,7 +524,7 @@ impl PixiPlatform {
         if self.is_subdir_platform() {
             Err(PixiPlatformError::IsSubdirPlatform)
         } else {
-            self.declared_virtual_packages = declared_virtual_packages;
+            self.declared_virtual_packages = normalize_virtual_packages(declared_virtual_packages);
             Ok(())
         }
     }
@@ -632,6 +634,7 @@ impl PixiPlatform {
         }
 
         for upsert in edit.insert_or_update_virtual_packages {
+            let upsert = normalize_virtual_package(upsert);
             if let Some(existing) = self
                 .declared_virtual_packages
                 .iter_mut()
@@ -780,11 +783,7 @@ pub fn subdir_default_virtual_packages(subdir: Platform) -> Vec<GenericVirtualPa
         defaults.push(version_pkg("__osx", default_mac_os_version(subdir)));
     }
     if let Some(spec) = Archspec::from_platform(subdir) {
-        defaults.push(GenericVirtualPackage {
-            name: PackageName::try_from("__archspec").expect("static virtual-package name"),
-            version: Version::major(0),
-            build_string: spec.as_str().to_string(),
-        });
+        defaults.push(GenericVirtualPackage::from(spec));
     }
 
     defaults
@@ -831,19 +830,50 @@ pub fn archspec_microarchitecture_of(package: &GenericVirtualPackage) -> Option<
     archspec_microarchitecture(&package.build_string)
 }
 
+/// The version CEP 30 mandates for an `__archspec` record: `1` when the build
+/// string names a microarchitecture from the archspec database, `0` when it
+/// encodes an unknown one. The version is a provenance marker.
+pub fn archspec_version(build_string: &str) -> Version {
+    match archspec_microarchitecture(build_string) {
+        Some(_) => Version::major(1),
+        None => Version::major(0),
+    }
+}
+
+/// Stamp the CEP 30 version on an `__archspec` record and pass every other
+/// virtual package through untouched. Every parser funnels through this, so a
+/// raw `__archspec = "0=skylake"` and the friendly `archspec = "skylake"`
+/// produce the same record.
+pub fn normalize_virtual_package(mut gvp: GenericVirtualPackage) -> GenericVirtualPackage {
+    if is_archspec(&gvp.name) {
+        gvp.version = archspec_version(&gvp.build_string);
+    }
+    gvp
+}
+
+/// [`normalize_virtual_package`] over a declared set.
+pub fn normalize_virtual_packages(
+    declared: Vec<GenericVirtualPackage>,
+) -> Vec<GenericVirtualPackage> {
+    declared
+        .into_iter()
+        .map(normalize_virtual_package)
+        .collect()
+}
+
 /// The identity of a virtual-package record: what makes two declarations the
 /// same capability, for duplicate detection, subdir-default filtering and
 /// lock-file satisfiability.
 ///
-/// `__archspec` elides the version and canonicalises the unknown encodings
-/// (`""` and `"0"`), leaving the microarchitecture as its whole identity: CEP
+/// `__archspec` elides the version and canonicalizes the unknown encodings
+/// (`""` and `"0"`), leaving the micro-architecture as its whole identity: CEP
 /// 30 makes the version a provenance marker that dependents must not
 /// constrain, and [`satisfied_by_system`] correspondingly ignores it. Anything
 /// else keeps its full `name=version=build` form.
 pub fn virtual_package_identity(gvp: &GenericVirtualPackage) -> String {
     if is_archspec(&gvp.name) {
-        let microarchitecture = archspec_microarchitecture(&gvp.build_string).unwrap_or("0");
-        return format!("__archspec={microarchitecture}");
+        let micro_architecture = archspec_microarchitecture(&gvp.build_string).unwrap_or("0");
+        return format!("__archspec={micro_architecture}");
     }
     gvp.to_string()
 }
@@ -855,7 +885,7 @@ pub fn same_virtual_package(a: &GenericVirtualPackage, b: &GenericVirtualPackage
 }
 
 /// The sorted [`virtual_package_identity`] of each entry, so two declared sets
-/// can be compared as multisets: order is never part of a platform's identity,
+/// can be compared as multi-sets: order is never part of a platform's identity,
 /// in a manifest or in a lock file.
 pub fn sorted_virtual_package_identities<'a>(
     packages: impl IntoIterator<Item = &'a GenericVirtualPackage>,
@@ -866,9 +896,7 @@ pub fn sorted_virtual_package_identities<'a>(
 }
 
 /// [`sorted_virtual_package_identities`] for the raw `name=version[=build]`
-/// strings a lock file stores. An entry that doesn't parse keeps its raw form,
-/// so a malformed lock-file entry still compares unequal to a parsed one rather
-/// than silently dropping out of the comparison.
+/// strings a lock file stores. An entry that doesn't parse keeps its raw form.
 pub fn sorted_locked_virtual_package_identities(raw: &[String]) -> Vec<String> {
     let mut identities: Vec<String> = raw
         .iter()
@@ -885,8 +913,9 @@ pub fn sorted_locked_virtual_package_identities(raw: &[String]) -> Vec<String> {
 /// Returns true if the system provides `required`: a virtual package of the
 /// same name, at a version at least as high, and -- when `required` carries a
 /// build string -- exactly that build string. `__archspec` is the exception:
-/// its build strings are microarchitecture names compared through the archspec
-/// DAG, and its version is a meaningless constant that is ignored.
+/// its build strings are micro-architecture names compared through the archspec
+/// DAG, and its version says only whether the micro-architecture was matched
+/// against the archspec database (CEP 30), so it is ignored here.
 ///
 /// Both sides are concrete capabilities (what a host reports, what a manifest
 /// platform declares), never requirements: a manifest cannot express a version
@@ -1163,9 +1192,47 @@ mod tests {
         }
     }
 
+    /// CEP 30 ties `__archspec`'s version to its build string: a
+    /// database-known micro-architecture is version 1, an unknown one 0. Every
+    /// entry point normalizes, so the two spellings a user can write collapse
+    /// to one record instead of two platforms.
+    #[test]
+    fn archspec_version_follows_the_build_string() {
+        let declared = |raw: &str| {
+            let platform = PixiPlatform::new_with_defaults(
+                PixiPlatformName::try_from("rich").unwrap(),
+                Platform::Linux64,
+                vec![gvp_with_build("__archspec", "0", raw)],
+            )
+            .unwrap();
+            platform
+                .declared_virtual_packages()
+                .iter()
+                .find(|gvp| gvp.name.as_normalized() == "__archspec")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(declared("skylake").version, Version::major(1));
+        // The explicit "unknown microarchitecture" sentinel keeps version 0.
+        assert_eq!(declared("0").version, Version::major(0));
+    }
+
+    /// A normalized record for a known micro-architecture is exactly what
+    /// rattler reports for that micro-architecture.
+    #[test]
+    fn normalized_archspec_matches_rattler() {
+        for name in ["x86_64", "x86_64_v3", "skylake", "m1", "aarch64"] {
+            assert_eq!(
+                normalize_virtual_package(gvp_with_build("__archspec", "0", name)),
+                GenericVirtualPackage::from(Archspec::from_name(name)),
+                "normalisation of '{name}' drifted from rattler's conversion"
+            );
+        }
+    }
+
     /// The version is a provenance marker, so it is not part of a virtual
     /// package's identity: this is what keeps lock files written before
-    /// normalisation satisfying, and what makes the raw escape hatch a
+    /// normalization satisfying, and what makes the raw escape hatch a
     /// spelling of the friendly key rather than a second platform.
     #[test]
     fn virtual_package_identity_ignores_the_archspec_version() {
@@ -1254,8 +1321,9 @@ mod tests {
             &gvp_with_build("__archspec", "0", "m1"),
             &skylake
         ));
-        // The version `__archspec` carries is a meaningless constant (rattler
-        // emits 1, the manifest 0) and must not affect the comparison.
+        // `__archspec`'s version records only whether the micro-architecture was
+        // matched against the archspec database (CEP 30), so it must not affect
+        // the comparison.
         assert!(satisfied_by_system(
             &gvp_with_build("__archspec", "2", "x86_64"),
             &skylake
@@ -1267,7 +1335,7 @@ mod tests {
             &gvp_with_build("__archspec", "0", "0"),
             &skylake
         ));
-        // An unknown host microarchitecture fails any specific declaration.
+        // An unknown host micro-architecture fails any specific declaration.
         assert!(!satisfied_by_system(
             &gvp_with_build("__archspec", "0", "x86_64"),
             &unknown

@@ -470,9 +470,9 @@ mod tests {
             platforms = [{ name = "gpu-linux", platform = "linux-64", cuda = "12.0" }]
             "#,
         );
-        // Older lockfile that materialised the linux-64 defaults alongside
-        // the user's __cuda; the rename pass should treat the entry as
-        // identity-equal to the manifest's `gpu-linux`.
+        // Older lockfile that materialized the linux-64 defaults alongside
+        // the user's __cuda -- including `__archspec` at the version pixi
+        // wrote before.
         let lock = lockfile_with(
             "linux-64-cuda",
             Platform::Linux64,
@@ -489,6 +489,35 @@ mod tests {
 
         assert!(aligned.platform("gpu-linux").is_some());
         assert!(aligned.platform("linux-64-cuda").is_none());
+    }
+
+    /// A customized `__archspec` matches across the version normalization too.
+    /// This is the case the subdir-default filter can't cover: the entry is
+    /// compared, not dropped, so a version-sensitive match would skip the
+    /// rename and leave the lockfile row orphaned.
+    #[test]
+    fn rename_matches_legacy_archspec_version() {
+        let manifest = manifest(
+            r#"
+            [workspace]
+            name = "demo"
+            channels = []
+            platforms = [{ name = "avx2", platform = "linux-64", archspec = "x86_64_v3" }]
+            "#,
+        );
+        let lock = lockfile_with(
+            "linux-64-archspec-x86-64-v3",
+            Platform::Linux64,
+            vec!["__archspec=0=x86_64_v3".to_string()],
+        );
+
+        let aligned = align_platform_names(lock, &manifest, Path::new("/"));
+
+        assert!(aligned.platform("avx2").is_some());
+        assert!(
+            aligned.platform("linux-64-archspec-x86-64-v3").is_none(),
+            "the legacy row should have been renamed, not left behind"
+        );
     }
 
     /// Renaming must keep packages that are only reachable through a source

@@ -1,0 +1,9 @@
+[workspace]
+channels = ["https://prefix.dev/conda-forge"]
+name = "legacy-archspec-version"
+platforms = [
+  { name = "v3", platform = "linux-64", archspec = "x86_64_v3" },
+]
+
+[dependencies]
+_r-mutex = "*"

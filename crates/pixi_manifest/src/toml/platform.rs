@@ -97,9 +97,8 @@ enum VirtualPackageValueKind {
     /// The value is a version string and lands in `GenericVirtualPackage::version`;
     /// `build_string` is left empty.
     Version,
-    /// The value is a microarchitecture string and lands in `build_string`;
-    /// `version` is forced to `0`. This is the shape upstream rattler expects
-    /// for `__archspec`.
+    /// The value is a micro-architecture string and lands in `build_string`.
+    /// `version` is the provenance marker CEP 30 mandates for it.
     Microarch,
 }
 
@@ -421,7 +420,7 @@ fn build_friendly_virtual_package(
             })?;
             Ok(GenericVirtualPackage {
                 name: package_name,
-                version: Version::major(0),
+                version: crate::platform::archspec_version(&raw.value),
                 build_string: raw.value.clone(),
             })
         }
@@ -544,11 +543,13 @@ fn parse_raw_virtual_package(
             line_info: None,
         },
     )?;
-    Ok(GenericVirtualPackage {
-        name,
-        version,
-        build_string,
-    })
+    Ok(crate::platform::normalize_virtual_package(
+        GenericVirtualPackage {
+            name,
+            version,
+            build_string,
+        },
+    ))
 }
 
 fn resolve_subdir(
@@ -804,7 +805,8 @@ fn classify_virtual_packages(
                 package.build_string.is_empty() || package.build_string == "0"
             }
             VirtualPackageValueKind::Microarch => {
-                package.version == Version::major(0) && !package.build_string.is_empty()
+                package.version == crate::platform::archspec_version(&package.build_string)
+                    && !package.build_string.is_empty()
             }
         };
         if !fits {
@@ -1067,7 +1069,7 @@ mod test {
                 "__glibc=2.28".to_string(),
                 "__unix=0".to_string(),
                 "__linux=4.18".to_string(),
-                "__archspec=0=x86_64".to_string(),
+                "__archspec=1=x86_64".to_string(),
             ]
         );
         // `glibc = "2.28"` matches the linux-64 default and is elided from the
@@ -1083,9 +1085,10 @@ mod test {
         .unwrap();
         let package = &parsed.platform.declared_virtual_packages()[0];
         assert_eq!(package.name.as_normalized(), "__archspec");
-        assert_eq!(package.version, Version::major(0));
         assert_eq!(package.build_string, "x86_64_v3");
-        // The synthesised name sanitises the underscores into dashes.
+        // CEP 30: a micro-architecture the archspec database knows is version 1.
+        assert_eq!(package.version, Version::major(1));
+        // The synthesized name sanitizes the underscores into dashes.
         assert_eq!(
             parsed.platform.name().as_str(),
             "linux-64-archspec-x86-64-v3"
@@ -1151,7 +1154,7 @@ mod test {
                 "__unix=0".to_string(),
                 "__linux=4.18".to_string(),
                 "__glibc=2.28".to_string(),
-                "__archspec=0=aarch64".to_string(),
+                "__archspec=1=aarch64".to_string(),
             ]
         );
     }
@@ -1206,10 +1209,43 @@ mod test {
                 "__unix=0".to_string(),
                 "__linux=4.18".to_string(),
                 "__glibc=2.28".to_string(),
-                "__archspec=0=x86_64".to_string(),
+                "__archspec=1=x86_64".to_string(),
             ]
         );
         assert_eq!(parsed.platform.name().as_str(), "linux-64-future-pkg-1-2");
+    }
+
+    /// The raw escape hatch is a spelling of the friendly key, not a second
+    /// platform: `__archspec`'s version is normalized on the way in, so the
+    /// two forms share a name.
+    #[test]
+    fn test_workspace_platform_raw_archspec_matches_friendly_key() {
+        let friendly = TopLevel::from_toml_str(
+            r#"platform = { platform = "linux-64", archspec = "skylake" }"#,
+        )
+        .unwrap()
+        .platform;
+        for raw_version in ["0", "1"] {
+            let raw = TopLevel::from_toml_str(&format!(
+                r#"platform = {{ platform = "linux-64", __archspec = "{raw_version}=skylake" }}"#
+            ))
+            .unwrap()
+            .platform;
+            assert_eq!(
+                virtual_package_specs(&raw),
+                virtual_package_specs(&friendly)
+            );
+            assert_eq!(raw.name().as_str(), friendly.name().as_str());
+            assert!(raw.has_same_definition(&friendly));
+            // ...and it is written back through the friendly key.
+            assert_eq!(
+                serde_json::to_value(TomlPixiPlatform(raw)).unwrap(),
+                serde_json::json!({
+                    "platform": "linux-64",
+                    "archspec": "skylake",
+                }),
+            );
+        }
     }
 
     #[test]
@@ -1229,7 +1265,7 @@ mod test {
                 "__unix=0".to_string(),
                 "__linux=4.18".to_string(),
                 "__glibc=2.28".to_string(),
-                "__archspec=0=x86_64".to_string(),
+                "__archspec=1=x86_64".to_string(),
             ]
         );
         assert_eq!(
@@ -1427,11 +1463,14 @@ mod test {
         }
     }
 
-    fn archspec_virtual_package(microarch: &str) -> GenericVirtualPackage {
+    /// Deliberately built with the pre-normalization version: constructing a
+    /// platform stamps the CEP 30 one, so the serialization tests also cover
+    /// that a stale record still renders through the friendly `archspec` key.
+    fn archspec_virtual_package(micro_architecture: &str) -> GenericVirtualPackage {
         GenericVirtualPackage {
             name: PackageName::try_from("__archspec").unwrap(),
             version: Version::major(0),
-            build_string: microarch.to_string(),
+            build_string: micro_architecture.to_string(),
         }
     }
 

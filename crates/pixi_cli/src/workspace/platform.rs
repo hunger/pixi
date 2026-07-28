@@ -130,13 +130,8 @@ impl VirtualPackageArgs {
             }
             pixi_manifest::platform::validate_archspec_name(&value)
                 .map_err(|message| miette::miette!("{message}"))?;
-            push_unique(
-                &mut specs,
-                &mut seen_names,
-                "__archspec",
-                zero_version(),
-                value,
-            )?;
+            let version = pixi_manifest::platform::archspec_version(&value);
+            push_unique(&mut specs, &mut seen_names, "__archspec", version, value)?;
         }
         if let Some(value) = self.glibc {
             require_subdir_family(subdir, Platform::is_linux, "--glibc", "linux")?;
@@ -264,11 +259,13 @@ fn parse_raw_virtual_package(spec: &str) -> miette::Result<GenericVirtualPackage
     let build_string = parts.next().unwrap_or("").to_string();
     pixi_manifest::platform::validate_virtual_package_build_string(&name, &build_string)
         .map_err(|message| miette::miette!("{message}"))?;
-    Ok(GenericVirtualPackage {
-        name,
-        version,
-        build_string,
-    })
+    Ok(pixi_manifest::platform::normalize_virtual_package(
+        GenericVirtualPackage {
+            name,
+            version,
+            build_string,
+        },
+    ))
 }
 
 /// Parse a positional add argument. Accepts either a bare subdir
