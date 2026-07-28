@@ -11,6 +11,7 @@ use fancy_display::FancyDisplay;
 use miette::Diagnostic;
 use pixi_manifest::{
     EnvironmentName, FeaturesExt, HasWorkspaceManifest, PixiPlatform, PixiPlatformName,
+    platform::archspec_microarchitecture_of,
 };
 use rattler_conda_types::{GenericVirtualPackage, Platform};
 use rattler_lock::LockFile;
@@ -347,14 +348,16 @@ fn describe_resolution_gap(
         );
     }
 
+    // `__archspec`'s payload is the microarchitecture in its build string; its
+    // version is a provenance marker (CEP 30) that would only confuse here.
     let requirements = unmet
         .iter()
         .map(|required| {
-            format!(
-                "{} >={}",
-                required.name.as_normalized().trim_start_matches('_'),
-                required.version
-            )
+            let name = required.name.as_normalized().trim_start_matches('_');
+            match archspec_microarchitecture_of(required) {
+                Some(microarchitecture) => format!("{name} {microarchitecture}"),
+                None => format!("{name} >={}", required.version),
+            }
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -362,11 +365,12 @@ fn describe_resolution_gap(
         .iter()
         .map(
             |required| match machine.iter().find(|sys| sys.name == required.name) {
-                Some(sys) => format!(
-                    "only provides '{} {}'",
-                    sys.name.as_normalized(),
-                    sys.version
-                ),
+                Some(sys) => {
+                    let detail = archspec_microarchitecture_of(sys)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| sys.version.to_string());
+                    format!("only provides '{} {detail}'", sys.name.as_normalized())
+                }
                 None => format!("does not provide '{}'", required.name.as_normalized()),
             },
         )

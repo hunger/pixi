@@ -230,10 +230,13 @@ impl Workspace {
             .filter(|d| d.subdir_matches_host)
         {
             for declared in diagnosis.unsatisfied_virtual_packages {
-                if !unsatisfied
-                    .iter()
-                    .any(|u| u.name == declared.name && u.version == declared.version)
-                {
+                // The build string is part of the identity: two `__archspec`
+                // entries differ only there (their version is a constant).
+                if !unsatisfied.iter().any(|u| {
+                    u.name == declared.name
+                        && u.version == declared.version
+                        && u.build_string == declared.build_string
+                }) {
                     unsatisfied.push(declared);
                 }
             }

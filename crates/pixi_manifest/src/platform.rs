@@ -821,6 +821,17 @@ pub fn archspec_microarchitecture(build_string: &str) -> Option<&str> {
     }
 }
 
+/// The microarchitecture an `__archspec` record names, or `None` for any other
+/// virtual package (and for an explicitly unknown microarchitecture). Callers
+/// that render a virtual package use this to decide whether the build string or
+/// the version is the value a user cares about.
+pub fn archspec_microarchitecture_of(package: &GenericVirtualPackage) -> Option<&str> {
+    if !is_archspec(&package.name) {
+        return None;
+    }
+    archspec_microarchitecture(&package.build_string)
+}
+
 /// Returns true if the system provides `required`: a virtual package of the
 /// same name, at a version at least as high, and -- when `required` carries a
 /// build string -- exactly that build string. `__archspec` is the exception:
