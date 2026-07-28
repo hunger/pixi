@@ -1535,15 +1535,18 @@ def _write_manifest(directory: Path, body: str) -> Path:
     return manifest
 
 
-def _selected_platform(pixi: Path, manifest: Path) -> str:
+def _selected_platform(pixi: Path, manifest: Path, archspec: str | None = None) -> str:
     """The platform pixi actually selects for the default environment.
 
     Read off the `-vv` selection trace, the only place the choice is reported
-    without installing anything.
+    without installing anything. `archspec` sets `CONDA_OVERRIDE_ARCHSPEC` so a
+    test can steer the host microarchitecture.
     """
     output = verify_cli_command(
         [pixi, "info", "-vv", "--manifest-path", manifest],
         ExitCode.SUCCESS,
+        env={} if archspec is None else {"CONDA_OVERRIDE_ARCHSPEC": archspec},
+        strip_ansi=True,
     )
     # `Output.stderr` is stored raw, so strip here rather than via `strip_ansi`.
     stderr = ANSI_ESCAPE_PATTERN.sub("", output.stderr)
