@@ -1512,5 +1512,85 @@ def test_round_trip_after_edit_preserves_other_entries(
     assert rich["cuda"] == "12.4"
 
 
+def _microarch_pair() -> tuple[str, str]:
+    """A (baseline, more_specific) microarchitecture pair for the host family.
+
+    `more_specific` descends from `baseline` in the archspec graph, so a host
+    reporting it satisfies a platform declaring `baseline` -- and not the
+    reverse. Names are family-specific, so pick them from the host subdir.
+    """
+    if "arm64" in CURRENT_PLATFORM or "aarch64" in CURRENT_PLATFORM:
+        return "m1", "m2"
+    return "x86_64_v3", "skylake"
+
+
+def test_archspec_platform_selection_follows_the_dag(pixi: Path, tmp_pixi_workspace: Path) -> None:
+    """A declared `archspec` is matched through the microarchitecture graph.
+
+    A host reporting a descendant microarchitecture can run a platform that
+    declares the baseline; a host reporting only the baseline cannot run one
+    that demands the descendant. Before archspec was matched at all, both
+    hosts matched everything.
+    """
+    baseline, specific = _microarch_pair()
+    manifest = tmp_pixi_workspace / "pixi.toml"
+    manifest.write_text(
+        f"""\
+[workspace]
+name = "platform-test"
+channels = []
+platforms = [
+  {{ name = "picky", platform = "{CURRENT_PLATFORM}", archspec = "{specific}" }},
+  {{ name = "baseline", platform = "{CURRENT_PLATFORM}", archspec = "{baseline}" }},
+]
+"""
+    )
+
+    # A host reporting the descendant satisfies both entries.
+    output = _run_platform(
+        pixi, tmp_pixi_workspace, "list", env={"CONDA_OVERRIDE_ARCHSPEC": specific}
+    )
+    supported = [
+        line.split(":", 1)[0]
+        for line in output.stdout.splitlines()
+        if "(supported by current machine)" in line
+    ]
+    assert supported == ["picky", "baseline"], output.stdout
+
+    # A host reporting only the baseline cannot run the picky entry.
+    output = _run_platform(
+        pixi, tmp_pixi_workspace, "list", env={"CONDA_OVERRIDE_ARCHSPEC": baseline}
+    )
+    supported = [
+        line.split(":", 1)[0]
+        for line in output.stdout.splitlines()
+        if "(supported by current machine)" in line
+    ]
+    assert supported == ["baseline"], output.stdout
+
+
+def test_archspec_platform_rejects_unknown_name(pixi: Path, tmp_pixi_workspace: Path) -> None:
+    """An `archspec` name the database doesn't know fails to parse, with a
+    did-you-mean hint for the dashed spelling."""
+    manifest = tmp_pixi_workspace / "pixi.toml"
+    manifest.write_text(
+        f"""\
+[workspace]
+name = "platform-test"
+channels = []
+platforms = [
+  {{ name = "modern", platform = "{CURRENT_PLATFORM}", archspec = "x86-64-v3" }},
+]
+"""
+    )
+    _run_platform(
+        pixi,
+        tmp_pixi_workspace,
+        "list",
+        expected_exit_code=ExitCode.FAILURE,
+        stderr_contains="did you mean 'x86_64_v3'",
+    )
+
+
 if __name__ == "__main__":  # pragma: no cover - convenience entry point
     sys.exit(pytest.main([__file__, "-x", "-q"]))

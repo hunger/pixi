@@ -65,7 +65,8 @@ use crate::lock_file::LockedPackageKind;
 use rattler_networking::{LazyClient, s3_middleware};
 use rattler_repodata_gateway::Gateway;
 use rattler_virtual_packages::{
-    Cuda, EnvOverride, LibC, Linux, Osx, Override, VirtualPackageOverrides, VirtualPackages,
+    Archspec, Cuda, EnvOverride, LibC, Linux, Osx, Override, VirtualPackageOverrides,
+    VirtualPackages,
 };
 pub use registry::{WorkspaceRegistry, WorkspaceRegistryError};
 pub use solve_group::SolveGroup;
@@ -360,6 +361,43 @@ fn apply_environment_variable_overrides(packages: &mut Vec<GenericVirtualPackage
     );
 
     apply_glibc_override(packages);
+    apply_archspec_override(packages);
+}
+
+/// Apply `CONDA_OVERRIDE_ARCHSPEC` to `packages`: unset leaves the detected
+/// `__archspec` untouched, an empty value removes it, and a microarchitecture
+/// name (or `0` for "unknown") replaces or inserts it.
+///
+/// Rattler's own `Archspec::parse_version` accepts any name, inventing a
+/// parentless node that then fails every DAG comparison, so an unknown name is
+/// ignored with a warning here instead -- the same names the manifest accepts.
+// BREAK: once a released rattler carries conda/rattler#2558, this can collapse
+// into `Archspec::detect_with_fallback`, which rejects unknown names itself.
+fn apply_archspec_override(packages: &mut Vec<GenericVirtualPackage>) {
+    let Ok(value) = std::env::var(Archspec::DEFAULT_ENV_NAME) else {
+        return;
+    };
+    if value.is_empty() {
+        packages.retain(|p| p.name.as_normalized() != "__archspec");
+        return;
+    }
+    if let Err(message) = pixi_manifest::platform::validate_archspec_name(&value) {
+        tracing::warn!(
+            "Ignoring {}='{value}': {message}",
+            Archspec::DEFAULT_ENV_NAME
+        );
+        return;
+    }
+    let overridden =
+        GenericVirtualPackage::from(pixi_manifest::platform::archspec_from_build_string(&value));
+    if let Some(existing) = packages
+        .iter_mut()
+        .find(|p| p.name.as_normalized() == "__archspec")
+    {
+        *existing = overridden;
+    } else {
+        packages.push(overridden);
+    }
 }
 
 /// Apply `CONDA_OVERRIDE_GLIBC` (rattler's only libc slot) to `packages`. The
@@ -1565,6 +1603,67 @@ mod tests {
             .expect("a glibc version override should add __glibc");
         assert_eq!(glibc.version, Version::from_str("2.40").unwrap());
         assert_eq!(glibc.build_string, "0");
+    }
+
+    fn archspec_package(microarchitecture: &str) -> GenericVirtualPackage {
+        GenericVirtualPackage {
+            name: "__archspec".parse().unwrap(),
+            version: Version::major(1),
+            build_string: microarchitecture.to_string(),
+        }
+    }
+
+    /// `CONDA_OVERRIDE_ARCHSPEC` replaces the detected microarchitecture, `0`
+    /// marks it unknown, and an empty value drops `__archspec` entirely. Pixi
+    /// did not honour this variable at all before.
+    #[test]
+    fn archspec_override_replaces_inserts_and_removes() {
+        let packages = temp_env::with_var("CONDA_OVERRIDE_ARCHSPEC", Some("x86_64_v3"), || {
+            let mut packages = vec![archspec_package("skylake")];
+            apply_environment_variable_overrides(&mut packages);
+            packages
+        });
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].build_string, "x86_64_v3");
+
+        // Inserted when the host reported none.
+        let packages = temp_env::with_var("CONDA_OVERRIDE_ARCHSPEC", Some("zen4"), || {
+            let mut packages = Vec::new();
+            apply_environment_variable_overrides(&mut packages);
+            packages
+        });
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].build_string, "zen4");
+
+        // `0` is the explicit unknown-microarchitecture sentinel.
+        let packages = temp_env::with_var("CONDA_OVERRIDE_ARCHSPEC", Some("0"), || {
+            let mut packages = vec![archspec_package("skylake")];
+            apply_environment_variable_overrides(&mut packages);
+            packages
+        });
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].build_string, "0");
+
+        // Empty removes it.
+        let packages = temp_env::with_var("CONDA_OVERRIDE_ARCHSPEC", Some(""), || {
+            let mut packages = vec![archspec_package("skylake")];
+            apply_environment_variable_overrides(&mut packages);
+            packages
+        });
+        assert!(!has_package(&packages, "__archspec"));
+    }
+
+    /// An unknown name would become a parentless node that fails every DAG
+    /// comparison, so it is ignored and the detected value kept.
+    #[test]
+    fn invalid_archspec_override_is_ignored() {
+        let detected = archspec_package("skylake");
+        let packages = temp_env::with_var("CONDA_OVERRIDE_ARCHSPEC", Some("x86-64-v3"), || {
+            let mut packages = vec![detected.clone()];
+            apply_environment_variable_overrides(&mut packages);
+            packages
+        });
+        assert_eq!(packages, vec![detected]);
     }
 
     /// Every legacy `[system-requirements]` shape parses through the
