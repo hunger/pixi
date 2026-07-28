@@ -564,11 +564,9 @@ impl PixiPlatform {
         if self.subdir != other.subdir {
             return false;
         }
-        let mut a = self.customised_virtual_packages();
-        let mut b = other.customised_virtual_packages();
-        a.sort();
-        b.sort();
-        a == b
+        let ours = self.customised_virtual_packages();
+        let theirs = other.customised_virtual_packages();
+        sorted_virtual_package_identities(&ours) == sorted_virtual_package_identities(&theirs)
     }
 
     /// Apply an in-place edit to this platform.
@@ -792,15 +790,16 @@ pub fn subdir_default_virtual_packages(subdir: Platform) -> Vec<GenericVirtualPa
     defaults
 }
 
-/// Returns `true` if `gvp` is exactly the value `subdir_default_virtual_packages`
-/// would emit for `subdir`. Used by the TOML layer to elide default-matching
-/// virtual packages from synthesised names and on-disk serialisation, and by
-/// the lock-file satisfiability check to compare only the user-customised
-/// virtual packages.
+/// Returns `true` if `gvp` declares the same capability as one of the values
+/// `subdir_default_virtual_packages` emits for `subdir`, per
+/// [`virtual_package_identity`]. Used by the TOML layer to elide
+/// default-matching virtual packages from synthesised names and on-disk
+/// serialisation, and by the lock-file satisfiability check to compare only the
+/// user-customised virtual packages.
 pub fn is_subdir_default(gvp: &GenericVirtualPackage, subdir: Platform) -> bool {
-    subdir_default_virtual_packages(subdir).iter().any(|d| {
-        d.name == gvp.name && d.version == gvp.version && d.build_string == gvp.build_string
-    })
+    subdir_default_virtual_packages(subdir)
+        .iter()
+        .any(|d| same_virtual_package(d, gvp))
 }
 
 /// `true` for the microarchitecture virtual package. It is the one name pixi
@@ -830,6 +829,57 @@ pub fn archspec_microarchitecture_of(package: &GenericVirtualPackage) -> Option<
         return None;
     }
     archspec_microarchitecture(&package.build_string)
+}
+
+/// The identity of a virtual-package record: what makes two declarations the
+/// same capability, for duplicate detection, subdir-default filtering and
+/// lock-file satisfiability.
+///
+/// `__archspec` elides the version and canonicalises the unknown encodings
+/// (`""` and `"0"`), leaving the microarchitecture as its whole identity: CEP
+/// 30 makes the version a provenance marker that dependents must not
+/// constrain, and [`satisfied_by_system`] correspondingly ignores it. Anything
+/// else keeps its full `name=version=build` form.
+pub fn virtual_package_identity(gvp: &GenericVirtualPackage) -> String {
+    if is_archspec(&gvp.name) {
+        let microarchitecture = archspec_microarchitecture(&gvp.build_string).unwrap_or("0");
+        return format!("__archspec={microarchitecture}");
+    }
+    gvp.to_string()
+}
+
+/// Returns true if `a` and `b` declare the same capability, per
+/// [`virtual_package_identity`].
+pub fn same_virtual_package(a: &GenericVirtualPackage, b: &GenericVirtualPackage) -> bool {
+    virtual_package_identity(a) == virtual_package_identity(b)
+}
+
+/// The sorted [`virtual_package_identity`] of each entry, so two declared sets
+/// can be compared as multisets: order is never part of a platform's identity,
+/// in a manifest or in a lock file.
+pub fn sorted_virtual_package_identities<'a>(
+    packages: impl IntoIterator<Item = &'a GenericVirtualPackage>,
+) -> Vec<String> {
+    let mut identities: Vec<String> = packages.into_iter().map(virtual_package_identity).collect();
+    identities.sort();
+    identities
+}
+
+/// [`sorted_virtual_package_identities`] for the raw `name=version[=build]`
+/// strings a lock file stores. An entry that doesn't parse keeps its raw form,
+/// so a malformed lock-file entry still compares unequal to a parsed one rather
+/// than silently dropping out of the comparison.
+pub fn sorted_locked_virtual_package_identities(raw: &[String]) -> Vec<String> {
+    let mut identities: Vec<String> = raw
+        .iter()
+        .map(|raw| {
+            parse_locked_virtual_package(raw)
+                .map(|gvp| virtual_package_identity(&gvp))
+                .unwrap_or_else(|| raw.clone())
+        })
+        .collect();
+    identities.sort();
+    identities
 }
 
 /// Returns true if the system provides `required`: a virtual package of the
@@ -1111,6 +1161,39 @@ mod tests {
             build_string: build_string.to_string(),
             ..gvp(name, version)
         }
+    }
+
+    /// The version is a provenance marker, so it is not part of a virtual
+    /// package's identity: this is what keeps lock files written before
+    /// normalisation satisfying, and what makes the raw escape hatch a
+    /// spelling of the friendly key rather than a second platform.
+    #[test]
+    fn virtual_package_identity_ignores_the_archspec_version() {
+        assert!(same_virtual_package(
+            &gvp_with_build("__archspec", "0", "skylake"),
+            &gvp_with_build("__archspec", "1", "skylake"),
+        ));
+        // Both encodings of "unknown" are the same declaration.
+        assert!(same_virtual_package(
+            &gvp_with_build("__archspec", "1", "0"),
+            &gvp("__archspec", "0"),
+        ));
+        // A different microarchitecture is a different declaration...
+        assert!(!same_virtual_package(
+            &gvp_with_build("__archspec", "1", "skylake"),
+            &gvp_with_build("__archspec", "1", "zen2"),
+        ));
+        // ...and for every other virtual package the version still counts.
+        assert!(!same_virtual_package(
+            &gvp("__cuda", "12.4"),
+            &gvp("__cuda", "12.5")
+        ));
+        // A subdir default is recognised through a stale version too, so the
+        // baseline keeps being filtered out of lock-file comparisons.
+        assert!(is_subdir_default(
+            &gvp_with_build("__archspec", "0", "x86_64"),
+            Platform::Linux64
+        ));
     }
 
     #[test]

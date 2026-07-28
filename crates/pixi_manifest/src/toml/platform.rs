@@ -782,11 +782,9 @@ fn classify_virtual_packages(
         .iter()
         .filter(|gvp| {
             baseline.is_none_or(|base| {
-                !base.iter().any(|d| {
-                    d.name == gvp.name
-                        && d.version == gvp.version
-                        && d.build_string == gvp.build_string
-                })
+                !base
+                    .iter()
+                    .any(|d| crate::platform::same_virtual_package(d, gvp))
             })
         })
         .collect();

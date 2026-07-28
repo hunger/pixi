@@ -150,33 +150,34 @@ fn compute_renames(lock_file: &LockFile, manifest: &WorkspaceManifest) -> HashMa
 
 /// Identity-matching VPs for a manifest platform: drop the materialised
 /// subdir defaults so only user-set customisations participate in the match.
-fn workspace_customisations(platform: &PixiPlatform) -> Vec<GenericVirtualPackage> {
+///
+/// Matching on [`platform::sorted_virtual_package_identities`] rather than on
+/// the records themselves keeps a lockfile written before pixi stamped the CEP
+/// 30 `__archspec` version aligned with its manifest platform -- a missed match
+/// here silently skips the rename.
+fn workspace_customisations(platform: &PixiPlatform) -> Vec<String> {
     let subdir = platform.subdir();
-    let mut customised: Vec<GenericVirtualPackage> = platform
-        .declared_virtual_packages()
-        .iter()
-        .filter(|gvp| !platform::is_subdir_default(gvp, subdir))
-        .cloned()
-        .collect();
-    customised.sort_by(|a, b| a.name.as_normalized().cmp(b.name.as_normalized()));
-    customised
+    platform::sorted_virtual_package_identities(
+        platform
+            .declared_virtual_packages()
+            .iter()
+            .filter(|gvp| !platform::is_subdir_default(gvp, subdir)),
+    )
 }
 
 /// Identity-matching VPs for a locked platform: parse the lockfile's
-/// `__name=version[=build]` strings back into [`GenericVirtualPackage`]s, drop
-/// the entries that match the subdir's defaults, and sort by name. Strings
-/// that don't parse are dropped -- the workspace side can't have a
-/// corresponding entry anyway.
-fn locked_customisations(locked: &rattler_lock::Platform<'_>) -> Vec<GenericVirtualPackage> {
+/// `__name=version[=build]` strings back into [`GenericVirtualPackage`]s and
+/// drop the entries that match the subdir's defaults. Strings that don't parse
+/// are dropped -- the workspace side can't have a corresponding entry anyway.
+fn locked_customisations(locked: &rattler_lock::Platform<'_>) -> Vec<String> {
     let subdir = locked.subdir();
-    let mut customised: Vec<GenericVirtualPackage> = locked
+    let parsed: Vec<GenericVirtualPackage> = locked
         .virtual_packages()
         .iter()
         .filter_map(|raw| platform::parse_locked_virtual_package(raw))
         .filter(|gvp| !platform::is_subdir_default(gvp, subdir))
         .collect();
-    customised.sort_by(|a, b| a.name.as_normalized().cmp(b.name.as_normalized()));
-    customised
+    platform::sorted_virtual_package_identities(&parsed)
 }
 
 #[derive(Debug, Error)]

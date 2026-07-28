@@ -12,7 +12,7 @@ use pixi_manifest::{
 };
 use pixi_pypi_spec::PixiPypiSource;
 use pypi_modifiers::Tags;
-use rattler_conda_types::{ChannelUrl, NamedChannelOrUrl, Platform};
+use rattler_conda_types::{ChannelUrl, GenericVirtualPackage, NamedChannelOrUrl, Platform};
 use rattler_lock::{LockedPackage, PypiIndexes, UrlOrPath};
 use url::Url;
 use uv_distribution_filename::{DistExtension, ExtensionError, SourceDistExtension, WheelFilename};
@@ -137,11 +137,10 @@ pub fn verify_environment_satisfiability(
         // changed (e.g. adding/removing `__cuda` or pinning `__glibc` to
         // a non-default version).
         let workspace_subdir = workspace_platform.subdir();
-        let expected_vps: Vec<String> = workspace_platform
+        let expected: Vec<&GenericVirtualPackage> = workspace_platform
             .declared_virtual_packages()
             .iter()
             .filter(|gvp| !pixi_manifest::platform::is_subdir_default(gvp, workspace_subdir))
-            .map(|vp| vp.to_string())
             .collect();
         let locked_vps: Vec<String> = locked
             .virtual_packages
@@ -154,15 +153,15 @@ pub fn verify_environment_satisfiability(
             .cloned()
             .collect();
         let same_subdir = workspace_subdir == locked.subdir;
-        // Compare VPs as multisets: lockfile ordering is not part of the
-        // platform's identity for satisfiability purposes.
-        let same_vps = {
-            let mut a = expected_vps.clone();
-            let mut b = locked_vps.clone();
-            a.sort();
-            b.sort();
-            a == b
-        };
+        // Compare VPs as multisets of identities: lockfile ordering is not part
+        // of the platform's identity, and neither is `__archspec`'s version --
+        // comparing it would invalidate every lock file written before pixi
+        // stamped the CEP 30 value.
+        let same_vps =
+            pixi_manifest::platform::sorted_virtual_package_identities(expected.iter().copied())
+                == pixi_manifest::platform::sorted_locked_virtual_package_identities(&locked_vps);
+        // Only the error needs the rendered form.
+        let expected_vps: Vec<String> = expected.iter().map(ToString::to_string).collect();
         if !same_subdir || !same_vps {
             return Err(EnvironmentUnsat::PlatformDefinitionChanged(
                 PlatformDefinitionChanged {

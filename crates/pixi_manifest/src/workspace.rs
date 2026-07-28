@@ -17,7 +17,8 @@ use url::Url;
 use super::pypi::pypi_options::PypiOptions;
 use crate::{
     PixiPlatform, PixiPlatformName, PrioritizedChannel, S3Options, TargetSelector, Targets,
-    platform::satisfied_by_system, preview::Preview,
+    platform::{same_virtual_package, satisfied_by_system},
+    preview::Preview,
 };
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use once_cell::sync::Lazy;
@@ -230,13 +231,13 @@ impl Workspace {
             .filter(|d| d.subdir_matches_host)
         {
             for declared in diagnosis.unsatisfied_virtual_packages {
-                // The build string is part of the identity: two `__archspec`
-                // entries differ only there (their version is a constant).
-                if !unsatisfied.iter().any(|u| {
-                    u.name == declared.name
-                        && u.version == declared.version
-                        && u.build_string == declared.build_string
-                }) {
+                // Two `__archspec` entries differ only in their build string,
+                // so identity has to cover it -- see
+                // [`crate::platform::virtual_package_identity`].
+                if !unsatisfied
+                    .iter()
+                    .any(|u| same_virtual_package(u, &declared))
+                {
                     unsatisfied.push(declared);
                 }
             }
