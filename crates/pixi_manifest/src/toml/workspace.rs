@@ -685,6 +685,71 @@ mod test {
         );
     }
 
+    /// A declared `__archspec` is matched against the host through the
+    /// microarchitecture DAG, so a more capable CPU satisfies a baseline
+    /// requirement while a weaker one does not. Before this, the declared
+    /// microarchitecture was ignored outright (only versions were compared,
+    /// and `__archspec`'s version is a constant), so every host matched.
+    #[test]
+    fn test_platform_match_diagnostics_archspec_uses_dag() {
+        use std::collections::HashSet;
+
+        use rattler_conda_types::{GenericVirtualPackage, Platform};
+
+        use crate::PixiPlatformName;
+
+        let input = r#"
+        channels = []
+        platforms = [
+          { name = "modern", platform = "linux-64", archspec = "x86_64_v3" },
+        ]
+        "#;
+        let workspace = TomlWorkspace::from_toml_str(input)
+            .unwrap()
+            .into_workspace(ExternalWorkspaceProperties::default(), Path::new(""))
+            .unwrap()
+            .value;
+        let env_platforms: HashSet<PixiPlatformName> =
+            std::iter::once(PixiPlatformName::try_from("modern").unwrap()).collect();
+
+        let host_archspec = |microarchitecture: &str| {
+            vec![GenericVirtualPackage {
+                name: "__archspec".parse().unwrap(),
+                version: "1".parse().unwrap(),
+                build_string: microarchitecture.to_string(),
+            }]
+        };
+
+        // `skylake` descends from `x86_64_v3`, so it runs the platform.
+        let diagnostics = workspace.platform_match_diagnostics(
+            Platform::Linux64,
+            &host_archspec("skylake"),
+            &env_platforms,
+        );
+        assert!(diagnostics[0].matches_host());
+
+        // `nehalem` is only `x86_64_v2`: it must not match, and the gap names
+        // the microarchitecture rather than a version.
+        let diagnostics = workspace.platform_match_diagnostics(
+            Platform::Linux64,
+            &host_archspec("nehalem"),
+            &env_platforms,
+        );
+        assert!(diagnostics[0].subdir_matches_host);
+        assert!(!diagnostics[0].matches_host());
+        let unsatisfied: Vec<String> = diagnostics[0]
+            .unsatisfied_virtual_packages
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(unsatisfied, vec!["__archspec=0=x86_64_v3".to_string()]);
+
+        // A host that reports no microarchitecture at all cannot satisfy it.
+        let diagnostics =
+            workspace.platform_match_diagnostics(Platform::Linux64, &[], &env_platforms);
+        assert!(!diagnostics[0].matches_host());
+    }
+
     /// Two platform entries that resolve to the same name must be rejected,
     /// not silently collapsed to the first (`PixiPlatform` is keyed by name).
     #[test]
