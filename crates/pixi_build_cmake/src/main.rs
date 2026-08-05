@@ -1,13 +1,16 @@
 mod build_script;
+mod cmake_lists;
 mod config;
 mod inputs;
+mod metadata;
 
 use build_script::{BuildPlatform, BuildScriptContext};
 use config::CMakeBackendConfig;
+use metadata::CMakeMetadataProvider;
 use miette::IntoDiagnostic;
 use pixi_build_backend::{
     compilers::default_compiler_variants,
-    generated_recipe::{DefaultMetadataProvider, GenerateRecipe, GeneratedRecipe, PythonParams},
+    generated_recipe::{GenerateRecipe, GeneratedRecipe, PythonParams},
     intermediate_backend::IntermediateBackendInstantiator,
     tools::BackendIdentifier,
 };
@@ -76,19 +79,21 @@ impl GenerateRecipe for CMakeGenerator {
             manifest_path.clone()
         };
 
+        let mut metadata = CMakeMetadataProvider::new(&manifest_root);
+
         let mut generated_recipe =
-            GeneratedRecipe::from_model(model.clone(), &mut DefaultMetadataProvider)
-                .into_diagnostic()?;
+            GeneratedRecipe::from_model(model.clone(), &mut metadata).into_diagnostic()?;
 
         // we need to add compilers
 
         let requirements = &mut generated_recipe.recipe.requirements;
 
-        // Get the list of compilers from config, defaulting to ["cxx"] if not specified
+        // Take the compilers from the config, or fall back to the languages the
+        // project enables in its top level `CMakeLists.txt`.
         let compilers = config
             .compilers
             .clone()
-            .unwrap_or_else(|| vec!["cxx".to_string()]);
+            .unwrap_or_else(|| metadata.compilers());
 
         // Add configured compilers to build requirements
         pixi_build_backend::compilers::add_compilers_to_requirements(
@@ -186,7 +191,10 @@ pub async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
 
     use indexmap::IndexMap;
     use pixi_build_backend::{
@@ -612,76 +620,66 @@ mod tests {
             "version": "0.1.0",
         });
 
-        let generated_recipe = CMakeGenerator::default()
-            .generate_recipe(
-                &project_model,
-                &CMakeBackendConfig {
-                    compilers: Some(vec!["c".to_string(), "cxx".to_string(), "cuda".to_string()]),
-                    ..Default::default()
-                },
-                PathBuf::from("."),
-                Platform::Linux64,
-                None,
-                &HashSet::new(),
-                vec![],
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("Failed to generate recipe");
+        let manifest_root = tempfile::tempdir().expect("Failed to create temp dir");
+        let generated_recipe = recipe_for(
+            manifest_root.path(),
+            CMakeBackendConfig {
+                compilers: Some(vec!["c".to_string(), "cxx".to_string(), "cuda".to_string()]),
+                ..Default::default()
+            },
+            project_model,
+        )
+        .await;
 
-        // Check that we have exactly the expected compilers
-        let build_reqs = &generated_recipe.recipe.requirements.build;
-        let compiler_templates: Vec<String> = build_reqs
+        assert_eq!(
+            requested_compilers(&generated_recipe),
+            vec![
+                "${{ compiler('c') }}".to_string(),
+                "${{ compiler('cxx') }}".to_string(),
+                "${{ compiler('cuda') }}".to_string(),
+            ]
+        );
+    }
+
+    /// The version the recipe declares for the package.
+    fn package_version(generated_recipe: &GeneratedRecipe) -> String {
+        generated_recipe
+            .recipe
+            .package
+            .version
+            .as_concrete()
+            .expect("the version should be concrete")
+            .to_string()
+    }
+
+    /// Collects the compilers that the recipe requests through the
+    /// `compiler()` template function.
+    fn requested_compilers(generated_recipe: &GeneratedRecipe) -> Vec<String> {
+        generated_recipe
+            .recipe
+            .requirements
+            .build
             .iter()
             .filter_map(|item| match item {
                 Item::Value(value) => value
                     .as_template()
-                    .filter(|t| t.to_string().contains("compiler"))
-                    .map(|t| t.to_string()),
+                    .filter(|template| template.to_string().contains("compiler"))
+                    .map(|template| template.to_string()),
                 _ => None,
             })
-            .collect();
-
-        // Should have exactly three compilers
-        assert_eq!(
-            compiler_templates.len(),
-            3,
-            "Should have exactly three compilers"
-        );
-
-        // Check we have the expected compilers
-        assert!(
-            compiler_templates.contains(&"${{ compiler('c') }}".to_string()),
-            "C compiler should be in build requirements"
-        );
-        assert!(
-            compiler_templates.contains(&"${{ compiler('cxx') }}".to_string()),
-            "C++ compiler should be in build requirements"
-        );
-        assert!(
-            compiler_templates.contains(&"${{ compiler('cuda') }}".to_string()),
-            "CUDA compiler should be in build requirements"
-        );
+            .collect()
     }
 
-    #[tokio::test]
-    async fn test_default_compiler_when_not_specified() {
-        let project_model = project_fixture!({
-            "name": "foobar",
-            "version": "0.1.0",
-        });
-
-        let generated_recipe = CMakeGenerator::default()
+    async fn recipe_for(
+        manifest_root: &Path,
+        config: CMakeBackendConfig,
+        project_model: ProjectModel,
+    ) -> GeneratedRecipe {
+        CMakeGenerator::default()
             .generate_recipe(
                 &project_model,
-                &CMakeBackendConfig {
-                    compilers: None,
-                    ..Default::default()
-                },
-                PathBuf::from("."),
+                &config,
+                manifest_root.to_path_buf(),
                 Platform::Linux64,
                 None,
                 &HashSet::default(),
@@ -692,30 +690,167 @@ mod tests {
                 None,
             )
             .await
-            .expect("Failed to generate recipe");
+            .expect("Failed to generate recipe")
+    }
 
-        // Check that we have exactly the expected compilers and build tools
-        let build_reqs = &generated_recipe.recipe.requirements.build;
-        let compiler_templates: Vec<String> = build_reqs
-            .iter()
-            .filter_map(|item| match item {
-                Item::Value(value) => value
-                    .as_template()
-                    .filter(|t| t.to_string().contains("compiler"))
-                    .map(|t| t.to_string()),
-                _ => None,
-            })
-            .collect();
+    /// Generates a recipe for a manifest root that holds `cmake_lists` as its
+    /// top level `CMakeLists.txt`.
+    async fn recipe_for_cmake_lists(
+        cmake_lists: &str,
+        config: CMakeBackendConfig,
+        project_model: ProjectModel,
+    ) -> GeneratedRecipe {
+        let manifest_root = tempfile::tempdir().expect("Failed to create temp dir");
+        fs::write(manifest_root.path().join("CMakeLists.txt"), cmake_lists)
+            .await
+            .expect("Failed to write CMakeLists.txt");
 
-        // Should have exactly one compiler: cxx
+        recipe_for(manifest_root.path(), config, project_model).await
+    }
+
+    #[tokio::test]
+    async fn test_compilers_are_taken_from_the_project_languages() {
+        let generated_recipe = recipe_for_cmake_lists(
+            "project(foobar LANGUAGES C CXX Fortran)",
+            CMakeBackendConfig::default(),
+            project_fixture!({"name": "foobar", "version": "0.1.0"}),
+        )
+        .await;
+
         assert_eq!(
-            compiler_templates.len(),
-            1,
-            "Should have exactly one compiler when not specified"
+            requested_compilers(&generated_recipe),
+            vec![
+                "${{ compiler('c') }}".to_string(),
+                "${{ compiler('cxx') }}".to_string(),
+                "${{ compiler('fortran') }}".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_project_without_any_language_needs_no_compiler() {
+        let generated_recipe = recipe_for_cmake_lists(
+            "project(foobar NONE)",
+            CMakeBackendConfig::default(),
+            project_fixture!({"name": "foobar", "version": "0.1.0"}),
+        )
+        .await;
+
+        assert!(requested_compilers(&generated_recipe).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_configured_compilers_win_over_the_project_languages() {
+        let generated_recipe = recipe_for_cmake_lists(
+            "project(foobar LANGUAGES C CXX Fortran)",
+            CMakeBackendConfig {
+                compilers: Some(vec!["cxx".to_string()]),
+                ..Default::default()
+            },
+            project_fixture!({"name": "foobar", "version": "0.1.0"}),
+        )
+        .await;
+
+        assert_eq!(
+            requested_compilers(&generated_recipe),
+            vec!["${{ compiler('cxx') }}".to_string()]
+        );
+    }
+
+    /// A `CMakeLists.txt` without a `project()` call falls back the same way
+    /// as a missing one.
+    #[tokio::test]
+    async fn test_default_compilers_without_project_call() {
+        let generated_recipe = recipe_for_cmake_lists(
+            "add_subdirectory(sub)",
+            CMakeBackendConfig::default(),
+            project_fixture!({"name": "foobar", "version": "0.1.0"}),
+        )
+        .await;
+
+        assert_eq!(
+            requested_compilers(&generated_recipe),
+            vec![
+                "${{ compiler('c') }}".to_string(),
+                "${{ compiler('cxx') }}".to_string(),
+            ]
+        );
+    }
+
+    /// Metadata the manifest leaves out is filled in from the `project()`
+    /// call.
+    #[tokio::test]
+    async fn test_metadata_comes_from_the_project_call() {
+        let generated_recipe = recipe_for_cmake_lists(
+            r#"project(foobar VERSION 1.2.3 DESCRIPTION "a demo" HOMEPAGE_URL "https://example.com" LANGUAGES CXX)"#,
+            CMakeBackendConfig::default(),
+            project_fixture!({"name": "foobar"}),
+        )
+        .await;
+
+        assert_eq!(package_version(&generated_recipe), "1.2.3");
+
+        let about = &generated_recipe.recipe.about;
+        assert_eq!(
+            about
+                .description
+                .as_ref()
+                .and_then(|value| value.as_concrete())
+                .map(String::as_str),
+            Some("a demo")
         );
         assert_eq!(
-            compiler_templates[0], "${{ compiler('cxx') }}",
-            "Default compiler should be cxx"
+            about
+                .homepage
+                .as_ref()
+                .and_then(|value| value.as_concrete())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("https://example.com/")
+        );
+    }
+
+    /// The version of the manifest wins over the one the `project()` call
+    /// declares, the same way the other backends treat their manifests.
+    #[tokio::test]
+    async fn test_the_manifest_version_wins() {
+        let generated_recipe = recipe_for_cmake_lists(
+            "project(foobar VERSION 1.2.3 LANGUAGES CXX)",
+            CMakeBackendConfig::default(),
+            project_fixture!({"name": "foobar", "version": "0.1.0"}),
+        )
+        .await;
+
+        assert_eq!(package_version(&generated_recipe), "0.1.0");
+    }
+
+    /// Without a `CMakeLists.txt` to read the languages from, the backend
+    /// assumes the languages CMake itself enables by default.
+    #[tokio::test]
+    async fn test_default_compilers_without_cmake_lists() {
+        let project_model = project_fixture!({
+            "name": "foobar",
+            "version": "0.1.0",
+        });
+
+        let manifest_root = tempfile::tempdir().expect("Failed to create temp dir");
+        let generated_recipe = recipe_for(
+            manifest_root.path(),
+            CMakeBackendConfig {
+                compilers: None,
+                ..Default::default()
+            },
+            project_model,
+        )
+        .await;
+
+        assert_eq!(
+            requested_compilers(&generated_recipe),
+            vec![
+                "${{ compiler('c') }}".to_string(),
+                "${{ compiler('cxx') }}".to_string(),
+            ],
+            "CMake enables C and CXX when it cannot be told otherwise"
         );
     }
 
