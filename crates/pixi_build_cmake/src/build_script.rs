@@ -12,6 +12,10 @@ pub struct BuildScriptContext {
     /// Contents of the CMake toolchain file that pins the compilers.
     /// Empty when none of the compilers map to a CMake language.
     pub toolchain_file_lines: Vec<String>,
+    /// Client name of the CMake file API query the build script leaves behind.
+    pub file_api_client: &'static str,
+    /// The CMake file API query itself.
+    pub file_api_query: &'static str,
 }
 
 /// The CMake compiler variable and the environment variable that the conda
@@ -95,6 +99,8 @@ mod test {
             extra_args: extra_args.clone(),
             build_dir: inputs::NINJA_BUILD_DIR,
             toolchain_file_lines: toolchain_file_lines(&[String::from("cxx")]),
+            file_api_client: crate::file_api::CLIENT,
+            file_api_query: crate::file_api::QUERY,
         };
         let script = context.render();
 
@@ -124,6 +130,8 @@ mod test {
             extra_args: vec![],
             build_dir: crate::inputs::NINJA_BUILD_DIR,
             toolchain_file_lines: toolchain_file_lines(&compilers),
+            file_api_client: crate::file_api::CLIENT,
+            file_api_query: crate::file_api::QUERY,
         };
         let script = context.render();
 
@@ -146,6 +154,8 @@ mod test {
             extra_args: vec![],
             build_dir: crate::inputs::NINJA_BUILD_DIR,
             toolchain_file_lines: toolchain_file_lines(&[]),
+            file_api_client: crate::file_api::CLIENT,
+            file_api_query: crate::file_api::QUERY,
         };
 
         assert!(!context.render().contains("conda-toolchain.cmake"));
@@ -164,7 +174,8 @@ mod test {
         insta::assert_snapshot!(lines.join("\n"));
     }
 
-    /// Renders the script for a platform, with a toolchain file.
+    /// Renders the script for a platform, with a toolchain file and the file
+    /// API query.
     fn render(build_platform: BuildPlatform) -> String {
         BuildScriptContext {
             build_platform,
@@ -172,6 +183,8 @@ mod test {
             extra_args: vec![],
             build_dir: inputs::NINJA_BUILD_DIR,
             toolchain_file_lines: toolchain_file_lines(&[String::from("cxx")]),
+            file_api_client: crate::file_api::CLIENT,
+            file_api_query: crate::file_api::QUERY,
         }
         .render()
     }

@@ -22,13 +22,13 @@ rattler_build_recipe = { workspace = true }
 rattler_build_types = { workspace = true }
 rattler_conda_types = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true, features = ["filters", "redactions", "yaml"] }
 rstest = { workspace = true }
-serde_json = { workspace = true }
 strum = { workspace = true }
 tempfile = { workspace = true }
 

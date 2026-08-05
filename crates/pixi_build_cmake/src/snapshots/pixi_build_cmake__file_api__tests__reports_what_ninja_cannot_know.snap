@@ -1,0 +1,14 @@
+---
+source: crates/pixi_build_cmake/src/file_api.rs
+expression: paths
+---
+{
+    "CMakeLists.txt",
+    "cmake/helpers.cmake",
+    "data/app.conf",
+    "gen.hpp.in",
+    "include/**",
+    "include/a.hpp",
+    "src/a.cpp",
+    "src/tool.cpp",
+}

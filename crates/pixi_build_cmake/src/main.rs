@@ -1,6 +1,7 @@
 mod build_script;
 mod cmake_lists;
 mod config;
+mod file_api;
 mod inputs;
 mod metadata;
 
@@ -130,6 +131,8 @@ impl GenerateRecipe for CMakeGenerator {
             extra_args: config.extra_args.clone(),
             build_dir: inputs::NINJA_BUILD_DIR,
             toolchain_file_lines: build_script::toolchain_file_lines(&compilers),
+            file_api_client: file_api::CLIENT,
+            file_api_query: file_api::QUERY,
         }
         .render();
 
@@ -158,6 +161,12 @@ impl GenerateRecipe for CMakeGenerator {
         _editable: bool,
     ) -> miette::Result<Vec<String>> {
         let workdir = workdir.as_ref();
+
+        // Ninja knows the headers every compiled translation unit pulled in,
+        // which is the one thing the file API cannot report. It only knows
+        // them for what it has actually built though, and it never sees the
+        // files an install() copies out of the source tree. The file API
+        // covers exactly those, so the two are unioned.
         let mut globs = match inputs::exact_inputs_from_ninja(workdir) {
             Ok(set) => set,
             Err(err) => {
@@ -168,6 +177,23 @@ impl GenerateRecipe for CMakeGenerator {
                 fallback_input_globs()
             }
         };
+
+        match file_api::declared_inputs(workdir) {
+            Ok(declared) => {
+                tracing::debug!(
+                    "the CMake file API reply declares {} input files",
+                    declared.len()
+                );
+                globs.extend(declared);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    "no CMake file API reply for the build at {}: {err}",
+                    workdir.display()
+                );
+            }
+        }
+
         globs.extend(config.extra_input_globs.iter().cloned());
         Ok(globs.into_iter().collect())
     }
@@ -691,6 +717,39 @@ mod tests {
             .as_concrete()
             .expect("the version should be concrete")
             .to_string()
+    }
+
+    /// Even when ninja has nothing to say, for instance because the build
+    /// directory was wiped, the file API reply still contributes the files the
+    /// project declares.
+    #[test]
+    fn test_input_globs_include_the_file_api_reply() {
+        let workdir = tempfile::tempdir().expect("Failed to create temp dir");
+        let reply = workdir
+            .path()
+            .join("work")
+            .join("build")
+            .join(".cmake/api/v1/reply");
+        fs_err::create_dir_all(&reply).expect("Failed to create the reply directory");
+        fs_err::write(
+            reply.join("index-2026-01-01T00-00-00-0000.json"),
+            r#"{"objects":[{"kind":"cmakeFiles","version":{"major":1},"jsonFile":"cmakeFiles.json"}]}"#,
+        )
+        .expect("Failed to write the index");
+        fs_err::write(
+            reply.join("cmakeFiles.json"),
+            r#"{"paths":{"source":"/src/demo","build":"/src/demo/build"},
+                "inputs":[{"path":"CMakeLists.txt"},{"path":"data/app.conf"}]}"#,
+        )
+        .expect("Failed to write the cmakeFiles object");
+
+        let globs = CMakeGenerator::default()
+            .extract_input_globs_from_build(&CMakeBackendConfig::default(), workdir.path(), false)
+            .expect("Failed to extract the input globs");
+
+        assert!(globs.contains(&"data/app.conf".to_string()));
+        // The ninja side found nothing, so the fallback globs are there too.
+        assert!(globs.iter().any(|glob| glob.contains("cmake")));
     }
 
     /// Collects the compilers that the recipe requests through the

@@ -100,7 +100,7 @@ pub fn exact_inputs_from_ninja(workdir: &Path) -> io::Result<BTreeSet<String>> {
 
 /// rattler-build runs the build script with cwd = `<work_directory>/work`,
 /// and the cmake script does `pushd build` from there.
-fn cmake_build_dir(workdir: &Path) -> PathBuf {
+pub(crate) fn cmake_build_dir(workdir: &Path) -> PathBuf {
     workdir.join("work").join(NINJA_BUILD_DIR)
 }
 
