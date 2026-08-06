@@ -36,3 +36,4 @@ tempfile = { workspace = true }
 default = ["rustls"]
 native-tls = ["pixi_build_backend/native-tls", "rattler_build_core/native-tls"]
 rustls = ["pixi_build_backend/rustls", "rattler_build_core/rustls"]
+slow_integration_tests = []

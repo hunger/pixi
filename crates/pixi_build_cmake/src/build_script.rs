@@ -543,6 +543,7 @@ mod test {
     /// The same value, settled by cmake rather than by the shell. On unix the
     /// stub already proves the split; this proves the parse.
     #[test]
+    #[cfg_attr(not(feature = "slow_integration_tests"), ignore)]
     fn test_a_quote_reaches_cmake_itself() {
         let value = cache_value_for(
             vec![String::from(r#"-DDEMO_TEXT=a "quoted" word"#)],
@@ -557,6 +558,7 @@ mod test {
     /// is written by doubling it. Nothing on another platform exercises that.
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(feature = "slow_integration_tests"), ignore)]
     fn test_a_quote_survives_cmd_exe() {
         let value = cache_value_for(
             vec![String::from(r#"-DDEMO_TEXT=a "quoted" word"#)],
@@ -569,6 +571,7 @@ mod test {
     /// A value holding a space, settled the same way.
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(not(feature = "slow_integration_tests"), ignore)]
     fn test_a_space_survives_cmd_exe() {
         let value = cache_value_for(vec![String::from("-DDEMO_TEXT=two words")], "DEMO_TEXT");
 
