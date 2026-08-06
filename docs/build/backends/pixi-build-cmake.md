@@ -73,6 +73,20 @@ extra-args = [
 ]
 ```
 
+Each entry reaches CMake as one argument, so a value may hold spaces without being quoted by hand:
+
+```toml
+[package.build.config]
+extra-args = ["-DCMAKE_C_FLAGS=-O2 -g", "-DDESCRIPTION=a demo library"]
+```
+
+Environment variables are still expanded, so an argument may name the prefixes the build runs in:
+
+```toml
+[package.build.config]
+extra-args = ["-DSCHEMA_DIR=$PREFIX/share/demo"]  # %LIBRARY_PREFIX% on Windows
+```
+
 For target-specific configuration, platform arguments completely replace the base configuration:
 
 ```toml

@@ -44,7 +44,7 @@ EOF
         -S "my-prefix-dir" \
         -B pixi-discovery \
         -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="$(pwd)/pixi-discovery/pixi-provider.cmake" \
-        test-arg > pixi-discovery/configure.log 2>&1 || true
+        "test-arg" > pixi-discovery/configure.log 2>&1 || true
     grep '^missing ' pixi-discovery/pixi-find-package.log 2>/dev/null \
         | sed 's/^missing \([^ ]*\) \(.*\)/pixi-build-cmake: \2 (\1) was not found/'
 fi
@@ -73,7 +73,7 @@ EOF
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
         -DBUILD_SHARED_LIBS=ON \
         ${PYTHON_ARG:+"$PYTHON_ARG"} \
-        test-arg
+        "test-arg"
 fi
 
 if [ -f "build.ninja" ] && ! ninja -t query install > /dev/null 2>&1; then

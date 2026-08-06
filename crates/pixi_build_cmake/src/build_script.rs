@@ -5,6 +5,8 @@ use serde::Serialize;
 pub struct BuildScriptContext {
     pub build_platform: BuildPlatform,
     pub source_dir: String,
+    /// Extra configure arguments, already quoted for the shell that will run
+    /// the script. Build one with [`quote_arguments`].
     pub extra_args: Vec<String>,
     /// Directory the build tree is configured in, relative to the work
     /// directory the script runs in.
@@ -22,6 +24,30 @@ pub struct BuildScriptContext {
     pub file_api_client: &'static str,
     /// The CMake file API query itself.
     pub file_api_query: &'static str,
+}
+
+/// Quotes each configure argument so the shell passes it on as the single
+/// argument it was written as.
+///
+/// The quotes are the kind that still expand variables, because an argument
+/// naming `$PREFIX` or `%LIBRARY_PREFIX%` is the reason to write one by hand.
+pub fn quote_arguments(arguments: &[String], build_platform: BuildPlatform) -> Vec<String> {
+    arguments
+        .iter()
+        .map(|argument| match build_platform {
+            // A backslash escapes in a double quoted word, so a Windows path
+            // written for the other platform has to survive it.
+            BuildPlatform::Unix => {
+                format!(
+                    "\"{}\"",
+                    argument.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            }
+            // cmd.exe has no escape character; a literal quote is written by
+            // doubling it, and backslashes are just path separators.
+            BuildPlatform::Windows => format!("\"{}\"", argument.replace('"', "\"\"")),
+        })
+        .collect()
 }
 
 /// The CMake compiler variable and the environment variable that the conda
@@ -91,6 +117,8 @@ impl BuildScriptContext {
 mod test {
     use rstest::*;
 
+    use std::{path::Path, process::Command};
+
     use super::*;
     use crate::{discovery, file_api, inputs};
 
@@ -105,8 +133,8 @@ mod test {
         BuildScriptContext {
             build_platform,
             source_dir: String::from(source_dir),
-            extra_args,
             build_dir: inputs::NINJA_BUILD_DIR,
+            extra_args: quote_arguments(&extra_args, build_platform),
             toolchain_file_lines: toolchain_file_lines(compilers),
             provider_file_lines: discovery::provider_file_lines(),
             discovery_dir: discovery::DISCOVERY_DIR,
@@ -169,6 +197,53 @@ mod test {
         assert!(!script.contains("conda-toolchain.cmake"));
     }
 
+    /// A value holding a space has to reach cmake whole, and one naming a
+    /// variable has to keep expanding.
+    #[test]
+    fn test_arguments_are_quoted_for_their_shell() {
+        let arguments = [
+            String::from("-DPLAIN=one"),
+            String::from("-DSPACED=two words"),
+            String::from("-DVAR=$PREFIX/lib"),
+            String::from(r#"-DQUOTED=a "b" c"#),
+        ];
+
+        assert_eq!(
+            quote_arguments(&arguments, BuildPlatform::Unix),
+            [
+                r#""-DPLAIN=one""#,
+                r#""-DSPACED=two words""#,
+                r#""-DVAR=$PREFIX/lib""#,
+                r#""-DQUOTED=a \"b\" c""#,
+            ]
+        );
+        assert_eq!(
+            quote_arguments(&arguments, BuildPlatform::Windows),
+            [
+                r#""-DPLAIN=one""#,
+                r#""-DSPACED=two words""#,
+                r#""-DVAR=$PREFIX/lib""#,
+                r#""-DQUOTED=a ""b"" c""#,
+            ]
+        );
+    }
+
+    /// A Windows path written into extra-args must not lose its separators to
+    /// the escaping on the unix side.
+    #[test]
+    fn test_a_backslash_survives_unix_quoting() {
+        let arguments = [String::from(r"-DDIR=C:\proj\include")];
+
+        assert_eq!(
+            quote_arguments(&arguments, BuildPlatform::Unix),
+            [r#""-DDIR=C:\\proj\\include""#]
+        );
+        assert_eq!(
+            quote_arguments(&arguments, BuildPlatform::Windows),
+            [r#""-DDIR=C:\proj\include""#]
+        );
+    }
+
     #[test]
     fn test_toolchain_file_is_empty_for_unmapped_compilers() {
         assert!(toolchain_file_lines(&[]).is_empty());
@@ -185,7 +260,18 @@ mod test {
     /// Renders the script for a platform, with a toolchain file and the file
     /// API query.
     fn render(build_platform: BuildPlatform) -> String {
-        context(build_platform, "/src/demo", vec![], &[String::from("cxx")]).render()
+        render_with(build_platform, vec![])
+    }
+
+    /// As [`render`], with configure arguments from the manifest.
+    fn render_with(build_platform: BuildPlatform, extra_args: Vec<String>) -> String {
+        context(
+            build_platform,
+            "/src/demo",
+            extra_args,
+            &[String::from("cxx")],
+        )
+        .render()
     }
 
     /// An install prefix holding a space must reach cmake as one argument, so
@@ -233,6 +319,7 @@ mod test {
     fn run_script(
         cmake: &str,
         ninja: &str,
+        extra_args: Vec<String>,
         prefix: &str,
         python: Option<&str>,
     ) -> (std::process::Output, Vec<Vec<String>>) {
@@ -252,9 +339,10 @@ mod test {
         write_stub("ninja", ninja);
 
         let script = dir.path().join("build.sh");
-        fs_err::write(&script, render(BuildPlatform::Unix)).expect("failed to write the script");
+        fs_err::write(&script, render_with(BuildPlatform::Unix, extra_args))
+            .expect("failed to write the script");
 
-        let output = std::process::Command::new("bash")
+        let output = Command::new("bash")
             .arg(&script)
             .current_dir(dir.path())
             .env("ARGV_RECORD", &record)
@@ -295,7 +383,8 @@ mod test {
     /// configure after it.
     #[cfg(unix)]
     fn configure_invocations(prefix: &str, python: Option<&str>) -> Vec<Vec<String>> {
-        let (output, invocations) = run_script(CMAKE_NINJA, NINJA_WITH_INSTALL, prefix, python);
+        let (output, invocations) =
+            run_script(CMAKE_NINJA, NINJA_WITH_INSTALL, vec![], prefix, python);
         assert!(
             output.status.success(),
             "the script failed: {}",
@@ -306,6 +395,217 @@ mod test {
             .into_iter()
             .filter(|arguments| arguments.iter().any(|argument| argument == "-S"))
             .collect()
+    }
+
+    /// The arguments of the real configure run for a manifest that declares
+    /// `extra_args`.
+    #[cfg(unix)]
+    fn configure_arguments_with(extra_args: Vec<String>, prefix: &str) -> Vec<String> {
+        let (output, invocations) =
+            run_script(CMAKE_NINJA, NINJA_WITH_INSTALL, extra_args, prefix, None);
+        assert!(
+            output.status.success(),
+            "the script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        invocations
+            .into_iter()
+            .rfind(|arguments| arguments.iter().any(|argument| argument == "-S"))
+            .expect("no configure invocation was recorded")
+    }
+
+    /// An argument holding a space is one argument. The shell has to be told
+    /// that, rather than left to split on the whitespace.
+    #[cfg(unix)]
+    #[test]
+    fn test_an_extra_argument_holding_a_space_arrives_whole() {
+        let arguments = configure_arguments_with(
+            vec![String::from("-DDESCRIPTION=a demo library")],
+            "/tmp/prefix",
+        );
+
+        assert!(
+            arguments.contains(&"-DDESCRIPTION=a demo library".to_string()),
+            "the argument was split up: {arguments:?}"
+        );
+    }
+
+    /// Configures a throwaway project with `extra_args` through the rendered
+    /// script, using a real cmake, and returns what it recorded for `key`.
+    ///
+    /// The stub above sees the arguments the way the shell split them. Only
+    /// cmake itself sees them the way cmake parses them, which on Windows is
+    /// not the way cmd.exe parses the arguments of a batch file, so a quote
+    /// can only be settled by asking cmake.
+    fn cache_value_for(extra_args: Vec<String>, key: &str) -> Option<String> {
+        // Ask cmake where it lives, rather than a shell, as the shells the two
+        // platforms offer have nothing in common. ninja is its neighbour.
+        let answer = tempfile::tempdir().expect("failed to create a temp dir");
+        let found = answer.path().join("cmake-path");
+        let finder = answer.path().join("find.cmake");
+        fs_err::write(
+            &finder,
+            format!(
+                "file(WRITE \"{}\" \"${{CMAKE_COMMAND}}\")\n",
+                found.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .expect("failed to write the finder");
+
+        let resolved = Command::new("pixi")
+            .args(["exec", "--spec", "cmake", "--spec", "ninja", "--", "cmake"])
+            .arg("-P")
+            .arg(&finder)
+            .output()
+            .expect("failed to resolve cmake through pixi");
+        assert!(
+            resolved.status.success(),
+            "pixi could not provide cmake: {}",
+            String::from_utf8_lossy(&resolved.stderr)
+        );
+
+        let cmake = fs_err::read_to_string(&found).expect("cmake reported no path");
+        let bin = Path::new(cmake.trim())
+            .parent()
+            .expect("cmake sits in a directory")
+            .to_path_buf();
+
+        let source = tempfile::tempdir().expect("failed to create a temp dir");
+        fs_err::write(
+            source.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.20)\nproject(demo NONE)\ninstall(CODE \"message(STATUS ok)\")\n",
+        )
+        .expect("failed to write the project");
+
+        let workdir = tempfile::tempdir().expect("failed to create a temp dir");
+        let work = workdir.path().join("work");
+        fs_err::create_dir_all(&work).expect("failed to create the work directory");
+
+        let build_platform = if cfg!(windows) {
+            BuildPlatform::Windows
+        } else {
+            BuildPlatform::Unix
+        };
+        let rendered = context(
+            build_platform,
+            &source.path().to_string_lossy(),
+            extra_args,
+            &[],
+        )
+        .render();
+
+        let script = work.join(if cfg!(windows) {
+            "build.bat"
+        } else {
+            "build.sh"
+        });
+        fs_err::write(&script, rendered).expect("failed to write the script");
+
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.arg("/c").arg(&script);
+            command
+        } else {
+            let mut command = Command::new("bash");
+            command.arg(&script);
+            command
+        };
+
+        let output = command
+            .current_dir(&work)
+            .env(
+                "PATH",
+                std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                )))
+                .expect("failed to build a PATH"),
+            )
+            .env("PREFIX", workdir.path().join("prefix"))
+            .env("LIBRARY_PREFIX", workdir.path().join("prefix"))
+            .env("CMAKE_ARGS", "")
+            .env("PYTHON", work.join("no-such-python"))
+            .output()
+            .expect("failed to run the build script");
+        assert!(
+            output.status.success(),
+            "the build script failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let cache = fs_err::read_to_string(work.join("build").join(crate::cmake_cache::CACHE_FILE))
+            .expect("cmake wrote no cache");
+
+        crate::cmake_cache::entry(&cache, key).map(ToString::to_string)
+    }
+
+    /// The same value, settled by cmake rather than by the shell. On unix the
+    /// stub already proves the split; this proves the parse.
+    #[test]
+    fn test_a_quote_reaches_cmake_itself() {
+        let value = cache_value_for(
+            vec![String::from(r#"-DDEMO_TEXT=a "quoted" word"#)],
+            "DEMO_TEXT",
+        );
+
+        assert_eq!(value.as_deref(), Some(r#"a "quoted" word"#));
+    }
+
+    /// cmd.exe hands the command line to cmake unsplit, and cmake parses it
+    /// with the Windows rules, where a literal quote inside a quoted argument
+    /// is written by doubling it. Nothing on another platform exercises that.
+    #[cfg(windows)]
+    #[test]
+    fn test_a_quote_survives_cmd_exe() {
+        let value = cache_value_for(
+            vec![String::from(r#"-DDEMO_TEXT=a "quoted" word"#)],
+            "DEMO_TEXT",
+        );
+
+        assert_eq!(value.as_deref(), Some(r#"a "quoted" word"#));
+    }
+
+    /// A value holding a space, settled the same way.
+    #[cfg(windows)]
+    #[test]
+    fn test_a_space_survives_cmd_exe() {
+        let value = cache_value_for(vec![String::from("-DDEMO_TEXT=two words")], "DEMO_TEXT");
+
+        assert_eq!(value.as_deref(), Some("two words"));
+    }
+
+    /// A quote inside the value is part of the value, and has to reach cmake
+    /// as one, without ending the quoting that holds the argument together.
+    #[cfg(unix)]
+    #[test]
+    fn test_an_extra_argument_holding_a_quote_arrives_whole() {
+        let arguments = configure_arguments_with(
+            vec![String::from(r#"-DJSON={"unit": "a demo"}"#)],
+            "/tmp/prefix",
+        );
+
+        assert!(
+            arguments.contains(&r#"-DJSON={"unit": "a demo"}"#.to_string()),
+            "the quotes did not survive: {arguments:?}"
+        );
+    }
+
+    /// Quoting must not cost the expansion, which is most of why an argument
+    /// is written by hand. The expanded value holds a space of its own here,
+    /// which must not split it either.
+    #[cfg(unix)]
+    #[test]
+    fn test_an_extra_argument_still_expands_a_variable() {
+        let arguments = configure_arguments_with(
+            vec![String::from("-DSCHEMA_DIR=$PREFIX/share")],
+            "/tmp/a prefix with spaces",
+        );
+
+        assert!(
+            arguments.contains(&"-DSCHEMA_DIR=/tmp/a prefix with spaces/share".to_string()),
+            "the variable did not expand into one argument: {arguments:?}"
+        );
     }
 
     /// The arguments of the real configure run, which follows the discovery.
@@ -392,8 +692,13 @@ mod test {
     #[cfg(unix)]
     #[test]
     fn test_a_project_that_installs_nothing_is_told_so() {
-        let (output, invocations) =
-            run_script(CMAKE_NINJA, NINJA_WITHOUT_INSTALL, "/tmp/prefix", None);
+        let (output, invocations) = run_script(
+            CMAKE_NINJA,
+            NINJA_WITHOUT_INSTALL,
+            vec![],
+            "/tmp/prefix",
+            None,
+        );
 
         assert!(
             !output.status.success(),
@@ -423,6 +728,7 @@ mod test {
         let (output, _) = run_script(
             CMAKE_OTHER_GENERATOR,
             NINJA_WITHOUT_INSTALL,
+            vec![],
             "/tmp/prefix",
             None,
         );

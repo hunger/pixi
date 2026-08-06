@@ -123,14 +123,16 @@ impl GenerateRecipe for CMakeGenerator {
             )));
         }
 
+        let build_platform = if Platform::current().is_windows() {
+            BuildPlatform::Windows
+        } else {
+            BuildPlatform::Unix
+        };
+
         let build_script = BuildScriptContext {
-            build_platform: if Platform::current().is_windows() {
-                BuildPlatform::Windows
-            } else {
-                BuildPlatform::Unix
-            },
+            build_platform,
             source_dir: manifest_root.display().to_string(),
-            extra_args: config.extra_args.clone(),
+            extra_args: build_script::quote_arguments(&config.extra_args, build_platform),
             build_dir: inputs::NINJA_BUILD_DIR,
             toolchain_file_lines: build_script::toolchain_file_lines(&compilers),
             provider_file_lines: discovery::provider_file_lines(),
