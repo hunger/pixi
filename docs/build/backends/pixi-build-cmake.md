@@ -87,6 +87,8 @@ Environment variables are still expanded, so an argument may name the prefixes t
 extra-args = ["-DSCHEMA_DIR=$PREFIX/share/demo"]  # %LIBRARY_PREFIX% on Windows
 ```
 
+Changing these arguments reconfigures the project. A build tree is otherwise kept between builds and only rebuilt, so the backend records the arguments it configured with in `pixi-configure-args` inside the build directory and compares them on the next run. Arguments that did not change cost nothing; arguments that did are configured in before anything is built.
+
 For target-specific configuration, platform arguments completely replace the base configuration:
 
 ```toml

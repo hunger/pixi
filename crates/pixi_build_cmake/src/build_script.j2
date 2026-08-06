@@ -8,6 +8,10 @@
 {%- set separator = "\\" if is_cmd_exe else "/" -%}
 {%- set current_dir = "%CD%" if is_cmd_exe else "$(pwd)" -%}
 {%- set toolchain_file = "conda-toolchain.cmake" -%}
+{# The configure arguments the build tree was last configured with, kept so a
+   manifest that changes them is not built with the old ones. -#}
+{%- set argument_stamp = "pixi-configure-args" -%}
+{%- set stamped_args = extra_args | join(" ") -%}
 {%- set query_dir = ".cmake" ~ separator ~ "api" ~ separator ~ "v1" ~ separator ~ "query" ~ separator ~ file_api_client -%}
 {%- set toolchain_path = current_dir ~ separator ~ toolchain_file -%}
 {%- set provider_file = discovery_dir ~ separator ~ "pixi-provider.cmake" -%}
@@ -122,12 +126,20 @@ EOF
    ninja build tree to query, so it stands aside for another generator. -#}
 {# Windows -#}
 {% if is_cmd_exe -%}
-if not exist build.ninja (
+{# Compared as files rather than through a variable, as the arguments carry
+   quotes of their own that an `if` comparison would choke on. -#}
+>{{ argument_stamp }}.new echo {{ stamped_args }}
+set PIXI_RECONFIGURE=1
+if exist build.ninja fc {{ argument_stamp }} {{ argument_stamp }}.new > nul 2>&1 && set PIXI_RECONFIGURE=
+if defined PIXI_RECONFIGURE (
 {%- for line in toolchain_file_lines %}
     {{ ">" if loop.first else ">>" }}{{ toolchain_file }} echo {{ line | replace("(", "^(") | replace(")", "^)") }}
 {%- endfor %}
     cmake {{ cmake_args | join(" ^\n        ") }}
     @if errorlevel 1 exit 1
+    move /y {{ argument_stamp }}.new {{ argument_stamp }} > nul
+) else (
+    del {{ argument_stamp }}.new
 )
 
 if exist build.ninja (
@@ -144,13 +156,21 @@ cmake --build . --target install
 
 {# Non Windows #}
 {% else -%}
-if [ ! -f "build.ninja" ]; then
+{# Written through a heredoc so the arguments land verbatim, whatever quoting
+   they carry, and compared as files for the same reason. -#}
+cat > {{ argument_stamp }}.new <<'EOF'
+{{ stamped_args }}
+EOF
+if [ ! -f "build.ninja" ] || ! cmp -s {{ argument_stamp }} {{ argument_stamp }}.new; then
 {%- if toolchain_file_lines %}
     cat > {{ toolchain_file }} <<'EOF'
 {% for line in toolchain_file_lines %}{{ line }}
 {% endfor %}EOF
 {%- endif %}
     cmake {{ cmake_args | join(" \\\n        ") }}
+    mv {{ argument_stamp }}.new {{ argument_stamp }}
+else
+    rm -f {{ argument_stamp }}.new
 fi
 
 if [ -f "build.ninja" ] && ! ninja -t query install > /dev/null 2>&1; then

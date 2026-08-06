@@ -323,13 +323,29 @@ mod test {
         prefix: &str,
         python: Option<&str>,
     ) -> (std::process::Output, Vec<Vec<String>>) {
+        let dir = tempfile::tempdir().expect("failed to create a temp dir");
+        run_script_in(dir.path(), cmake, ninja, extra_args, prefix, python)
+    }
+
+    /// As [`run_script`], in a directory the caller keeps, so that a second
+    /// run meets the build tree the first one left behind.
+    #[cfg(unix)]
+    fn run_script_in(
+        dir: &Path,
+        cmake: &str,
+        ninja: &str,
+        extra_args: Vec<String>,
+        prefix: &str,
+        python: Option<&str>,
+    ) -> (std::process::Output, Vec<Vec<String>>) {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().expect("failed to create a temp dir");
-        let record = dir.path().join("argv");
+        let dir = dir.to_path_buf();
+        let dir = dir.as_path();
+        let record = dir.join("argv");
 
         let write_stub = |name: &str, body: &str| {
-            let path = dir.path().join(name);
+            let path = dir.join(name);
             fs_err::write(&path, body).expect("failed to write a stub");
             let mut permissions = fs_err::metadata(&path).unwrap().permissions();
             permissions.set_mode(0o755);
@@ -338,26 +354,21 @@ mod test {
         write_stub("cmake", cmake);
         write_stub("ninja", ninja);
 
-        let script = dir.path().join("build.sh");
+        let script = dir.join("build.sh");
         fs_err::write(&script, render_with(BuildPlatform::Unix, extra_args))
             .expect("failed to write the script");
 
         let output = Command::new("bash")
             .arg(&script)
-            .current_dir(dir.path())
+            .current_dir(dir)
             .env("ARGV_RECORD", &record)
-            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
             .env("PREFIX", prefix)
             .env("CMAKE_ARGS", "")
             .env(
                 "PYTHON",
                 python.map_or_else(
-                    || {
-                        dir.path()
-                            .join("no-such-python")
-                            .to_string_lossy()
-                            .into_owned()
-                    },
+                    || dir.join("no-such-python").to_string_lossy().into_owned(),
                     str::to_string,
                 ),
             )
@@ -413,6 +424,105 @@ mod test {
             .into_iter()
             .rfind(|arguments| arguments.iter().any(|argument| argument == "-S"))
             .expect("no configure invocation was recorded")
+    }
+
+    /// The configure calls a run made, in order.
+    #[cfg(unix)]
+    fn configures(invocations: &[Vec<String>]) -> Vec<&Vec<String>> {
+        invocations
+            .iter()
+            .filter(|arguments| arguments.iter().any(|argument| argument == "-S"))
+            .collect()
+    }
+
+    /// A build tree is configured once and then reused, so a manifest that
+    /// changes its configure arguments has to be noticed, or the package is
+    /// quietly built with the arguments of the run before it.
+    #[cfg(unix)]
+    #[test]
+    fn test_changed_arguments_configure_again() {
+        let dir = tempfile::tempdir().expect("failed to create a temp dir");
+
+        let (first, _) = run_script_in(
+            dir.path(),
+            CMAKE_NINJA,
+            NINJA_WITH_INSTALL,
+            vec![String::from("-DDEMO=first")],
+            "/tmp/prefix",
+            None,
+        );
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        let (second, invocations) = run_script_in(
+            dir.path(),
+            CMAKE_NINJA,
+            NINJA_WITH_INSTALL,
+            vec![String::from("-DDEMO=second")],
+            "/tmp/prefix",
+            None,
+        );
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+
+        // The shell strips the quoting on the way to cmake, so the recorded
+        // argument is the bare value.
+        let configured_with_the_new_argument = configures(&invocations)
+            .iter()
+            .any(|arguments| arguments.iter().any(|argument| argument == "-DDEMO=second"));
+        assert!(
+            configured_with_the_new_argument,
+            "the changed argument never reached a configure run: {invocations:?}"
+        );
+    }
+
+    /// The other half: arguments that did not change must not cost a
+    /// reconfigure on every build.
+    #[cfg(unix)]
+    #[test]
+    fn test_unchanged_arguments_only_build() {
+        let dir = tempfile::tempdir().expect("failed to create a temp dir");
+        let arguments = vec![String::from("-DDEMO=same")];
+
+        let (first, _) = run_script_in(
+            dir.path(),
+            CMAKE_NINJA,
+            NINJA_WITH_INSTALL,
+            arguments.clone(),
+            "/tmp/prefix",
+            None,
+        );
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        fs_err::remove_file(dir.path().join("argv")).expect("failed to clear the record");
+
+        let (second, invocations) = run_script_in(
+            dir.path(),
+            CMAKE_NINJA,
+            NINJA_WITH_INSTALL,
+            arguments,
+            "/tmp/prefix",
+            None,
+        );
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert!(
+            configures(&invocations).is_empty(),
+            "the second build configured again for nothing: {invocations:?}"
+        );
     }
 
     /// An argument holding a space is one argument. The shell has to be told
