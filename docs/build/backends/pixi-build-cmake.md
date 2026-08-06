@@ -251,6 +251,22 @@ found required ZLIB
 missing optional SomeOptionalThing
 ```
 
+## System Dependencies
+
+CMake searches the machine it runs on, and a native build is not confined to the prefixes conda created for it. A library or tool picked up from `/usr` builds fine on your machine and is then missing, or a different version, wherever the package is installed.
+
+After the build the backend reads `CMakeCache.txt` and reports every path the configure run settled on that belongs to neither the conda environment nor your own source tree:
+
+```
+⚠ warning cmake took PKG_CONFIG_EXECUTABLE from outside the environment: /usr/bin/pkg-config
+```
+
+The fix is to add the package that provides it, here `pkg-config`, to `build-dependencies`.
+
+Programs leak more easily than libraries. The conda compiler activation sets `CMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY`, which keeps library searches inside the prefixes, but `CMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER`, which lets tool searches reach the whole machine.
+
+Install destinations such as `CMAKE_INSTALL_OLDINCLUDEDIR`, which is `/usr/include` by default, say nothing about what the build used and are not reported. Neither is `CMAKE_OSX_SYSROOT`, since macOS builds take the SDK from the machine on purpose.
+
 ## Toolchain File
 
 The conda compiler packages export the compiler they installed through environment variables such as `CC` and `CXX`. Instead of leaving it to CMake to pick those up, the backend writes a toolchain file that names them explicitly and passes it to the configure step. This keeps the compiler choice visible in the build directory and propagates it to sub-builds that inherit `CMAKE_TOOLCHAIN_FILE`, such as `ExternalProject` and `FetchContent`.

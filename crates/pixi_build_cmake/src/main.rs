@@ -1,4 +1,5 @@
 mod build_script;
+mod cmake_cache;
 mod cmake_lists;
 mod config;
 mod discovery;
@@ -169,6 +170,10 @@ impl GenerateRecipe for CMakeGenerator {
         // Tell the user about anything the project looked for and did not
         // find, which a missing optional dependency makes easy to overlook.
         discovery::report_missing_packages(workdir);
+
+        // And about anything it took from the machine instead of the
+        // environment, which builds here and breaks elsewhere.
+        cmake_cache::report_system_dependencies(workdir);
 
         // Ninja knows the headers every compiled translation unit pulled in,
         // which is the one thing the file API cannot report. It only knows
