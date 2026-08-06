@@ -8,6 +8,9 @@
 {%- set toolchain_file = "conda-toolchain.cmake" -%}
 {%- set query_dir = ".cmake\\api\\v1\\query\\" ~ file_api_client if is_cmd_exe else ".cmake/api/v1/query/" ~ file_api_client -%}
 {%- set toolchain_path = ("%CD%\\" ~ toolchain_file) if is_cmd_exe else ("$(pwd)/" ~ toolchain_file) -%}
+{%- set discovery_dir = "pixi-discovery" -%}
+{%- set provider_file = discovery_dir ~ ("\\" if is_cmd_exe else "/") ~ "pixi-provider.cmake" -%}
+{%- set find_log = discovery_dir ~ ("\\" if is_cmd_exe else "/") ~ "pixi-find-package.log" -%}
 
 {# `${PYTHON_ARG:+...}` and `%PYTHON_ARG%` both vanish when the probe below
    found no interpreter -#}
@@ -34,6 +37,16 @@
 ] + extra_args
 -%}
 
+{# The discovery run only has to reach the find_package() calls, so it skips
+   the toolchain file, which lives in the build directory it never enters. -#}
+{%- set discovery_args = [
+    env("CMAKE_ARGS"),
+    "-GNinja",
+    "-S \"" ~ source_dir ~ "\"",
+    "-B " ~ discovery_dir,
+    "-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=\"" ~ (("%CD%\\" ~ provider_file) if is_cmd_exe else ("$(pwd)/" ~ provider_file)) ~ "\"",
+] + extra_args -%}
+
 {#- Output version information -#}
 ninja --version
 cmake --version
@@ -56,6 +69,30 @@ if [ -x "$PYTHON" ]; then
 fi
 {% endif -%}
 
+{# Find out what the project searches for, in a throwaway build tree. The
+   provider stands in for whatever is missing, so a single run reports every
+   package instead of stopping at the first one that cannot be found. The real
+   configure below runs afterwards, in its own directory and without it. -#}
+{% if is_cmd_exe -%}
+if not exist {{ build_dir }}\build.ninja (
+    if not exist {{ discovery_dir }} mkdir {{ discovery_dir }}
+{%- for line in provider_file_lines %}
+    {{ ">" if loop.first else ">>" }}{{ provider_file }} echo {{ line | replace("(", "^(") | replace(")", "^)") | replace("|", "^|") }}
+{%- endfor %}
+    cmake {{ discovery_args | join(" ^\n        ") }} > {{ discovery_dir }}\configure.log 2>&1
+    findstr /b "missing" {{ find_log }} > nul 2>&1 && echo pixi-build-cmake: packages the project looked for and did not find: & findstr /b "missing" {{ find_log }}
+)
+{% else -%}
+if [ ! -f "{{ build_dir }}/build.ninja" ]; then
+    mkdir -p {{ discovery_dir }}
+    cat > {{ provider_file }} <<'EOF'
+{% for line in provider_file_lines %}{{ line }}
+{% endfor %}EOF
+    cmake {{ discovery_args | join(" \\\n        ") }} > {{ discovery_dir }}/configure.log 2>&1 || true
+    grep '^missing ' {{ find_log }} 2>/dev/null \
+        | sed 's/^missing \([^ ]*\) \(.*\)/pixi-build-cmake: \2 (\1) was not found/'
+fi
+{% endif %}
 {# Set up the build directory -#}
 {% if is_cmd_exe -%}
 if not exist {{ build_dir }} mkdir {{ build_dir }}

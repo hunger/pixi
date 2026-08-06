@@ -131,6 +131,9 @@ impl GenerateRecipe for CMakeGenerator {
             extra_args: config.extra_args.clone(),
             build_dir: inputs::NINJA_BUILD_DIR,
             toolchain_file_lines: build_script::toolchain_file_lines(&compilers),
+            provider_file_lines: build_script::provider_file_lines(
+                "${CMAKE_CURRENT_LIST_DIR}/pixi-find-package.log",
+            ),
             file_api_client: file_api::CLIENT,
             file_api_query: file_api::QUERY,
         }

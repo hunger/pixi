@@ -220,6 +220,26 @@ Anything the manifest declares wins, so these are only used where it is silent. 
 
 Values that CMake only expands while configuring, such as `VERSION ${DEMO_VERSION}` or an `@DEMO_VERSION@` placeholder, cannot be resolved by the backend and are skipped. Declare those in `pixi.toml` instead. CMake has no keyword for the license, so `about.license` always comes from the manifest.
 
+## Dependency Discovery
+
+Before the real configure, the backend runs a throwaway one that records every package your project looks for. It installs a [dependency provider](https://cmake.org/cmake/help/latest/command/cmake_language.html#dependency-providers), a CMake callback invoked ahead of each `find_package()` search, through `CMAKE_PROJECT_TOP_LEVEL_INCLUDES`. No file of yours is touched: the provider lives in the `pixi-discovery` directory next to the build tree.
+
+For each request the provider repeats the search CMake would have done, notes whether it succeeded, and stands in for whatever is missing so the run reaches the end. One pass therefore reports every missing package rather than stopping at the first:
+
+```
+pixi-build-cmake: SomeOptionalThing (optional) was not found
+pixi-build-cmake: MustHaveThis (required) was not found
+```
+
+The real configure then runs in its own directory with no provider at all, so nothing about your build changes. A required package that is genuinely missing still fails there, with CMake's own error, exactly as before. The discovery run only happens for the first configure of a build tree.
+
+The full record is left in `pixi-discovery/pixi-find-package.log`, one line per package:
+
+```
+found required ZLIB
+missing optional SomeOptionalThing
+```
+
 ## Toolchain File
 
 The conda compiler packages export the compiler they installed through environment variables such as `CC` and `CXX`. Instead of leaving it to CMake to pick those up, the backend writes a toolchain file that names them explicitly and passes it to the configure step. This keeps the compiler choice visible in the build directory and propagates it to sub-builds that inherit `CMAKE_TOOLCHAIN_FILE`, such as `ExternalProject` and `FetchContent`.
