@@ -22,6 +22,9 @@ pub struct CMakeMetadataProvider {
     /// The parsed call, read on first use. The outer `Option` tracks whether
     /// the file was looked at, the inner one whether it declares a project.
     declaration: Option<Option<ProjectDeclaration>>,
+    /// The `VERSION` the `project()` call declares, when it could not be used.
+    /// Kept so a build left without any version can say why.
+    unusable_version: Option<String>,
 }
 
 impl CMakeMetadataProvider {
@@ -29,6 +32,7 @@ impl CMakeMetadataProvider {
         Self {
             cmake_lists: manifest_root.join("CMakeLists.txt"),
             declaration: None,
+            unusable_version: None,
         }
     }
 
@@ -74,6 +78,17 @@ impl CMakeMetadataProvider {
         }
 
         self.declaration.as_ref().and_then(Option::as_ref)
+    }
+
+    /// The `VERSION` of the `project()` call that could not become a package
+    /// version, if there was one.
+    pub fn unusable_version(&self) -> Option<&str> {
+        self.unusable_version.as_deref()
+    }
+
+    /// The `CMakeLists.txt` the metadata was read from.
+    pub fn cmake_lists(&self) -> &Path {
+        &self.cmake_lists
     }
 
     /// Returns a declared value, unless it holds a reference this backend
@@ -126,15 +141,25 @@ impl MetadataProvider for CMakeMetadataProvider {
     /// A version CMake accepts always parses here, so a version that does not
     /// is left to CMake to reject when it configures the project.
     fn version(&mut self) -> Result<Option<Version>, Self::Error> {
+        let declared = self
+            .declaration()
+            .and_then(|declaration| declaration.version.clone());
+
         let Some(version) = self.resolved(|declaration| declaration.version.as_ref()) else {
+            self.unusable_version = declared;
             return Ok(None);
         };
 
-        Ok(Version::from_str(&version)
+        let parsed = Version::from_str(&version)
             .inspect_err(|err| {
                 tracing::debug!("ignoring the project() version `{version}`: {err}");
             })
-            .ok())
+            .ok();
+        if parsed.is_none() {
+            self.unusable_version = Some(version);
+        }
+
+        Ok(parsed)
     }
 
     fn description(&mut self) -> Result<Option<String>, Self::Error> {

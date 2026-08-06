@@ -48,6 +48,30 @@ fn fallback_input_globs() -> BTreeSet<String> {
     .collect()
 }
 
+/// Says why the `project()` call could not supply the version, when that is
+/// what the recipe turns out to be missing.
+///
+/// The failure otherwise reports only that no version was defined, which
+/// leaves a project computing its version with nothing to go on.
+fn explain_missing_version(
+    error: miette::Report,
+    metadata: &CMakeMetadataProvider,
+) -> miette::Report {
+    let Some(version) = metadata.unusable_version() else {
+        return error;
+    };
+
+    if !error.to_string().contains("version") {
+        return error;
+    }
+
+    error.wrap_err(format!(
+        "{} declares VERSION {version}, which CMake only settles while it configures the project. \
+         Declare the version in the pixi manifest instead.",
+        metadata.cmake_lists().display()
+    ))
+}
+
 #[async_trait::async_trait]
 impl GenerateRecipe for CMakeGenerator {
     type Config = CMakeBackendConfig;
@@ -84,8 +108,9 @@ impl GenerateRecipe for CMakeGenerator {
 
         let mut metadata = CMakeMetadataProvider::new(&manifest_root);
 
-        let mut generated_recipe =
-            GeneratedRecipe::from_model(model.clone(), &mut metadata).into_diagnostic()?;
+        let mut generated_recipe = GeneratedRecipe::from_model(model.clone(), &mut metadata)
+            .into_diagnostic()
+            .map_err(|err| explain_missing_version(err, &metadata))?;
 
         // The recipe reads the project() call, so its metadata changes with
         // the file, including when the file appears or disappears.
@@ -721,6 +746,49 @@ mod tests {
             .as_concrete()
             .expect("the version should be concrete")
             .to_string()
+    }
+
+    /// A project computing its version leaves the recipe without one, and the
+    /// bare "no version defined" says nothing about CMake. The failure has to
+    /// name the call it came from and what to do instead.
+    #[tokio::test]
+    async fn test_an_unresolvable_version_is_explained() {
+        let manifest_root = tempfile::tempdir().expect("Failed to create temp dir");
+        fs::write(
+            manifest_root.path().join("CMakeLists.txt"),
+            "project(demo VERSION ${DEMO_VERSION} LANGUAGES C)",
+        )
+        .await
+        .expect("Failed to write CMakeLists.txt");
+
+        let Err(error) = CMakeGenerator::default()
+            .generate_recipe(
+                &project_fixture!({"name": "demo"}),
+                &CMakeBackendConfig::default(),
+                manifest_root.path().to_path_buf(),
+                Platform::Linux64,
+                None,
+                &HashSet::default(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        else {
+            panic!("a recipe was produced with no version at all");
+        };
+
+        let reported = format!("{error:?}");
+        assert!(
+            reported.contains("VERSION ${DEMO_VERSION}"),
+            "the failure does not quote the call: {reported}"
+        );
+        assert!(
+            reported.contains("pixi manifest"),
+            "the failure does not say what to do instead: {reported}"
+        );
     }
 
     /// Even when ninja has nothing to say, for instance because the build
