@@ -233,7 +233,18 @@ pixi-build-cmake: MustHaveThis (required) was not found
 
 The real configure then runs in its own directory with no provider at all, so nothing about your build changes. A required package that is genuinely missing still fails there, with CMake's own error, exactly as before. The discovery run only happens for the first configure of a build tree.
 
-The full record is left in `pixi-discovery/pixi-find-package.log`, one line per package:
+The backend reads the result back after the build and repeats it as a warning, so it is visible in pixi's own output and not only in the build log:
+
+```
+WARN the build looked for packages that the environment does not have:
+     MustHaveThis (required), SomeOptionalThing (optional). Add the ones the
+     package needs to host-dependencies; the full record is in
+     .../work/pixi-discovery/pixi-find-package.log
+```
+
+A missing optional package is the one worth reading twice: nothing fails, the feature it guards is simply left out of the package you ship.
+
+The full record is that log, one line per package, kept in the work directory:
 
 ```
 found required ZLIB

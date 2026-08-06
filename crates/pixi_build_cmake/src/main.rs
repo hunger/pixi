@@ -1,6 +1,7 @@
 mod build_script;
 mod cmake_lists;
 mod config;
+mod discovery;
 mod file_api;
 mod inputs;
 mod metadata;
@@ -131,7 +132,7 @@ impl GenerateRecipe for CMakeGenerator {
             extra_args: config.extra_args.clone(),
             build_dir: inputs::NINJA_BUILD_DIR,
             toolchain_file_lines: build_script::toolchain_file_lines(&compilers),
-            provider_file_lines: build_script::provider_file_lines(
+            provider_file_lines: discovery::provider_file_lines(
                 "${CMAKE_CURRENT_LIST_DIR}/pixi-find-package.log",
             ),
             file_api_client: file_api::CLIENT,
@@ -164,6 +165,10 @@ impl GenerateRecipe for CMakeGenerator {
         _editable: bool,
     ) -> miette::Result<Vec<String>> {
         let workdir = workdir.as_ref();
+
+        // Tell the user about anything the project looked for and did not
+        // find, which a missing optional dependency makes easy to overlook.
+        discovery::report_missing_packages(workdir);
 
         // Ninja knows the headers every compiled translation unit pulled in,
         // which is the one thing the file API cannot report. It only knows
