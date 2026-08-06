@@ -43,6 +43,7 @@ The backend automatically includes the following build tools:
 
 - `cmake` - The CMake build system
 - `ninja` - Fast build system used by CMake
+- `pkg-config` - Used by CMake's `FindPkgConfig` module, so a project that looks for it finds the build environment's copy rather than the machine's
 - Platform-specific C++ compilers (e.g., `gcc_linux-64`, `clang_osx-64`)
 
 You can add these to your [`build-dependencies`](https://pixi.sh/latest/build/dependency_types/) if you need specific versions:
@@ -276,10 +277,10 @@ CMake searches the machine it runs on, and a native build is not confined to the
 After the build the backend reads `CMakeCache.txt` and reports every path the configure run settled on that belongs to neither the conda environment nor your own source tree:
 
 ```
-⚠ warning cmake took PKG_CONFIG_EXECUTABLE from outside the environment: /usr/bin/pkg-config
+⚠ warning cmake took DOXYGEN_EXECUTABLE from outside the environment: /usr/bin/doxygen
 ```
 
-The fix is to add the package that provides it, here `pkg-config`, to `build-dependencies`.
+The fix is to add the package that provides it, here `doxygen`, to `build-dependencies`. `pkg-config` is common enough that the backend [installs it for you](#required-dependencies).
 
 Programs leak more easily than libraries. The conda compiler activation sets `CMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY`, which keeps library searches inside the prefixes, but `CMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER`, which lets tool searches reach the whole machine.
 

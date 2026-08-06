@@ -116,7 +116,7 @@ impl GenerateRecipe for CMakeGenerator {
         );
 
         // add necessary build tools
-        for tool in ["cmake", "ninja"] {
+        for tool in ["cmake", "ninja", "pkg-config"] {
             requirements.build.push(Item::Value(Value::new_concrete(
                 SerializableMatchSpec::from(tool),
                 None,
