@@ -40,6 +40,7 @@ if not exist build\build.ninja (
         -S "my-prefix-dir" ^
         -B pixi-discovery ^
         -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="%CD%\pixi-discovery\pixi-provider.cmake" > pixi-discovery\configure.log 2>&1
+    if errorlevel 1 echo stopped>> pixi-discovery\pixi-find-package.log
     findstr /b "missing" pixi-discovery\pixi-find-package.log > nul 2>&1 && echo pixi-build-cmake: packages the project looked for and did not find: & findstr /b "missing" pixi-discovery\pixi-find-package.log
 )
 

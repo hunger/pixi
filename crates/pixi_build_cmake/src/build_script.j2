@@ -81,6 +81,7 @@ if not exist {{ build_dir }}\build.ninja (
     {{ ">" if loop.first else ">>" }}{{ provider_file }} echo {{ line | replace("(", "^(") | replace(")", "^)") | replace("|", "^|") }}
 {%- endfor %}
     cmake {{ discovery_args | join(" ^\n        ") }} > {{ discovery_dir }}\configure.log 2>&1
+    if errorlevel 1 echo stopped>> {{ find_log }}
     findstr /b "missing" {{ find_log }} > nul 2>&1 && echo pixi-build-cmake: packages the project looked for and did not find: & findstr /b "missing" {{ find_log }}
 )
 {% else -%}
@@ -89,7 +90,8 @@ if [ ! -f "{{ build_dir }}/build.ninja" ]; then
     cat > {{ provider_file }} <<'EOF'
 {% for line in provider_file_lines %}{{ line }}
 {% endfor %}EOF
-    cmake {{ discovery_args | join(" \\\n        ") }} > {{ discovery_dir }}/configure.log 2>&1 || true
+    cmake {{ discovery_args | join(" \\\n        ") }} > {{ discovery_dir }}/configure.log 2>&1 \
+        || echo "stopped" >> {{ find_log }}
     grep '^missing ' {{ find_log }} 2>/dev/null \
         | sed 's/^missing \([^ ]*\) \(.*\)/pixi-build-cmake: \2 (\1) was not found/'
 fi

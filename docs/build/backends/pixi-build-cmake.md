@@ -277,6 +277,20 @@ WARN the build looked for packages that the environment does not have:
 
 A missing optional package is the one worth reading twice: nothing fails, the feature it guards is simply left out of the package you ship.
 
+### When the list is cut short
+
+The provider stands in for a missing package with an imported target and a `<name>_FOUND` variable. What it cannot supply are the *commands* a package's config file defines, such as `pybind11_add_module` or `protobuf_generate`. A call to one of those ends the configure run, and anything your project looks for after that point is never reached.
+
+The backend notices that the run stopped and says so, rather than passing a partial list off as the whole story:
+
+```
+WARN the search for dependencies stopped early, so there may be more missing
+     than the 1 named above. Add those, then build again to see the rest;
+     .../work/pixi-discovery/configure.log has the details
+```
+
+Adding the packages it did find and building again gets you the next batch. A missing package that only contributes targets does not cut the run short, because CMake defers the check on an unknown target to the end of the configure.
+
 The full record is that log, one line per package, kept in the work directory:
 
 ```

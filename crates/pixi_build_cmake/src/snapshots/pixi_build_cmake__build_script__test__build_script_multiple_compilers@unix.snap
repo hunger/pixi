@@ -43,7 +43,8 @@ EOF
         -GNinja \
         -S "my-prefix-dir" \
         -B pixi-discovery \
-        -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="$(pwd)/pixi-discovery/pixi-provider.cmake" > pixi-discovery/configure.log 2>&1 || true
+        -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="$(pwd)/pixi-discovery/pixi-provider.cmake" > pixi-discovery/configure.log 2>&1 \
+        || echo "stopped" >> pixi-discovery/pixi-find-package.log
     grep '^missing ' pixi-discovery/pixi-find-package.log 2>/dev/null \
         | sed 's/^missing \([^ ]*\) \(.*\)/pixi-build-cmake: \2 (\1) was not found/'
 fi
