@@ -14,6 +14,10 @@ pub struct BuildScriptContext {
     pub toolchain_file_lines: Vec<String>,
     /// Contents of the CMake file that registers the dependency provider.
     pub provider_file_lines: Vec<String>,
+    /// Directory the discovery run builds in.
+    pub discovery_dir: &'static str,
+    /// Name of the record the discovery run leaves in that directory.
+    pub find_log_name: &'static str,
     /// Client name of the CMake file API query the build script leaves behind.
     pub file_api_client: &'static str,
     /// The CMake file API query itself.
@@ -88,26 +92,42 @@ mod test {
     use rstest::*;
 
     use super::*;
-    use crate::inputs;
+    use crate::{discovery, file_api, inputs};
+
+    /// A context for a project built from `source_dir` with `compilers`,
+    /// carrying the discovery and file API settings the backend always passes.
+    fn context(
+        build_platform: BuildPlatform,
+        source_dir: &str,
+        extra_args: Vec<String>,
+        compilers: &[String],
+    ) -> BuildScriptContext {
+        BuildScriptContext {
+            build_platform,
+            source_dir: String::from(source_dir),
+            extra_args,
+            build_dir: inputs::NINJA_BUILD_DIR,
+            toolchain_file_lines: toolchain_file_lines(compilers),
+            provider_file_lines: discovery::provider_file_lines(),
+            discovery_dir: discovery::DISCOVERY_DIR,
+            find_log_name: discovery::FIND_LOG,
+            file_api_client: file_api::CLIENT,
+            file_api_query: file_api::QUERY,
+        }
+    }
 
     #[rstest]
     fn test_build_script(
         #[values(BuildPlatform::Windows, BuildPlatform::Unix)] build_platform: BuildPlatform,
         #[values(vec![String::from("test-arg")], vec![])] extra_args: Vec<String>,
     ) {
-        let context = BuildScriptContext {
+        let script = context(
             build_platform,
-            source_dir: String::from("my-prefix-dir"),
-            extra_args: extra_args.clone(),
-            build_dir: inputs::NINJA_BUILD_DIR,
-            toolchain_file_lines: toolchain_file_lines(&[String::from("cxx")]),
-            provider_file_lines: crate::discovery::provider_file_lines(
-                "${CMAKE_CURRENT_LIST_DIR}/pixi-find-package.log",
-            ),
-            file_api_client: crate::file_api::CLIENT,
-            file_api_query: crate::file_api::QUERY,
-        };
-        let script = context.render();
+            "my-prefix-dir",
+            extra_args.clone(),
+            &[String::from("cxx")],
+        )
+        .render();
 
         let mut settings = insta::Settings::clone_current();
         settings.set_snapshot_suffix(format!(
@@ -129,19 +149,7 @@ mod test {
         #[values(BuildPlatform::Windows, BuildPlatform::Unix)] build_platform: BuildPlatform,
     ) {
         let compilers = ["c", "cxx", "fortran", "cuda"].map(String::from);
-        let context = BuildScriptContext {
-            build_platform,
-            source_dir: String::from("my-prefix-dir"),
-            extra_args: vec![],
-            build_dir: crate::inputs::NINJA_BUILD_DIR,
-            toolchain_file_lines: toolchain_file_lines(&compilers),
-            provider_file_lines: crate::discovery::provider_file_lines(
-                "${CMAKE_CURRENT_LIST_DIR}/pixi-find-package.log",
-            ),
-            file_api_client: crate::file_api::CLIENT,
-            file_api_query: crate::file_api::QUERY,
-        };
-        let script = context.render();
+        let script = context(build_platform, "my-prefix-dir", vec![], &compilers).render();
 
         let mut settings = insta::Settings::clone_current();
         settings.set_snapshot_suffix(build_platform.to_string());
@@ -156,20 +164,9 @@ mod test {
     fn test_build_script_without_compilers(
         #[values(BuildPlatform::Windows, BuildPlatform::Unix)] build_platform: BuildPlatform,
     ) {
-        let context = BuildScriptContext {
-            build_platform,
-            source_dir: String::from("my-prefix-dir"),
-            extra_args: vec![],
-            build_dir: crate::inputs::NINJA_BUILD_DIR,
-            toolchain_file_lines: toolchain_file_lines(&[]),
-            provider_file_lines: crate::discovery::provider_file_lines(
-                "${CMAKE_CURRENT_LIST_DIR}/pixi-find-package.log",
-            ),
-            file_api_client: crate::file_api::CLIENT,
-            file_api_query: crate::file_api::QUERY,
-        };
+        let script = context(build_platform, "my-prefix-dir", vec![], &[]).render();
 
-        assert!(!context.render().contains("conda-toolchain.cmake"));
+        assert!(!script.contains("conda-toolchain.cmake"));
     }
 
     #[test]
@@ -188,19 +185,7 @@ mod test {
     /// Renders the script for a platform, with a toolchain file and the file
     /// API query.
     fn render(build_platform: BuildPlatform) -> String {
-        BuildScriptContext {
-            build_platform,
-            source_dir: String::from("/src/demo"),
-            extra_args: vec![],
-            build_dir: inputs::NINJA_BUILD_DIR,
-            toolchain_file_lines: toolchain_file_lines(&[String::from("cxx")]),
-            provider_file_lines: crate::discovery::provider_file_lines(
-                "${CMAKE_CURRENT_LIST_DIR}/pixi-find-package.log",
-            ),
-            file_api_client: crate::file_api::CLIENT,
-            file_api_query: crate::file_api::QUERY,
-        }
-        .render()
+        context(build_platform, "/src/demo", vec![], &[String::from("cxx")]).render()
     }
 
     /// An install prefix holding a space must reach cmake as one argument, so
@@ -384,7 +369,9 @@ mod test {
             "the discovery run does not register the provider: {discovery:?}"
         );
         assert!(
-            discovery.contains(&"pixi-discovery".to_string()),
+            discovery
+                .iter()
+                .any(|argument| argument == discovery::DISCOVERY_DIR),
             "the discovery run shares the real build directory: {discovery:?}"
         );
         assert!(
@@ -407,7 +394,9 @@ mod test {
     fn test_the_discovery_run_is_skipped_once_the_build_tree_exists() {
         for platform in [BuildPlatform::Unix, BuildPlatform::Windows] {
             let script = render(platform);
-            let discovery = script.find("pixi-discovery").expect("a discovery run");
+            let discovery = script
+                .find(discovery::DISCOVERY_DIR)
+                .expect("a discovery run");
             let guard = script
                 .find("build.ninja")
                 .expect("a guard on the build tree");

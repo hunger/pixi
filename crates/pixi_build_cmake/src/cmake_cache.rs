@@ -13,6 +13,9 @@ use std::{
 
 use crate::inputs::cmake_build_dir;
 
+/// The file CMake records its cache in, at the root of a build tree.
+pub const CACHE_FILE: &str = "CMakeCache.txt";
+
 /// Cache entries CMake fills with an install destination rather than
 /// something it found. `/usr/include` as `CMAKE_INSTALL_OLDINCLUDEDIR` says
 /// nothing about what the build used.
@@ -22,7 +25,7 @@ const DESTINATION_PREFIX: &str = "CMAKE_INSTALL_";
 const SYSTEM_SDK: &str = "CMAKE_OSX_SYSROOT";
 
 /// Where CMake records the source directory it configured.
-const SOURCE_DIRECTORY_KEY: &str = "CMAKE_HOME_DIRECTORY";
+pub const SOURCE_DIRECTORY_KEY: &str = "CMAKE_HOME_DIRECTORY";
 
 /// A path the build took from outside the conda environment.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,7 +42,7 @@ pub struct SystemPath {
 /// build prefix and the sysroot are all created there. The project's own
 /// source tree is not a dependency either, wherever it sits.
 pub fn system_dependencies(workdir: &Path) -> io::Result<Vec<SystemPath>> {
-    let cache = fs_err::read_to_string(cmake_build_dir(workdir).join("CMakeCache.txt"))?;
+    let cache = fs_err::read_to_string(cmake_build_dir(workdir).join(CACHE_FILE))?;
     Ok(system_paths_in(&cache, workdir))
 }
 
@@ -76,7 +79,7 @@ fn parse_entry(line: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// The value of one cache entry, whatever its type.
-fn entry<'a>(cache: &'a str, key: &str) -> Option<&'a str> {
+pub fn entry<'a>(cache: &'a str, key: &str) -> Option<&'a str> {
     cache
         .lines()
         .filter_map(parse_entry)
@@ -116,8 +119,8 @@ pub fn report_system_dependencies(workdir: &Path) {
 
     if !paths.is_empty() {
         tracing::warn!(
-            "{} path(s) above come from the machine rather than the package's dependencies",
-            paths.len()
+            "the paths above come from the machine rather than the package's dependencies; \
+             add the packages that provide them to build-dependencies"
         );
     }
 }

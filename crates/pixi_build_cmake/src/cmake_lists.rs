@@ -95,14 +95,17 @@ fn compiler_for_language(language: &str) -> Option<&'static str> {
 
 /// Returns the arguments of the first `project()` call in `cmake_lists`.
 fn project_arguments(cmake_lists: &str) -> Option<Vec<String>> {
-    let mut rest = cmake_lists;
+    // Lowercasing per ASCII keeps the offsets identical to the original, so
+    // the copy and the quote map are built once and shared by every search.
+    let lowercased = cmake_lists.to_ascii_lowercase();
+    let quoted = quoted_regions(&lowercased);
+    let mut search_from = 0;
 
-    while let Some(offset) = find_command(rest, "project") {
-        let arguments = &rest[offset..];
-        match split_arguments(arguments) {
+    while let Some(offset) = find_command(&lowercased, &quoted, search_from, "project") {
+        match split_arguments(&cmake_lists[offset..]) {
             Some(arguments) if !arguments.is_empty() => return Some(arguments),
             // A `project()` call without a name is invalid CMake, keep looking.
-            _ => rest = arguments,
+            _ => search_from = offset,
         }
     }
 
@@ -110,16 +113,17 @@ fn project_arguments(cmake_lists: &str) -> Option<Vec<String>> {
 }
 
 /// Returns the offset just past the opening parenthesis of the next `name`
-/// command in `cmake_lists`.
+/// command at or after `search_from`, given the file lowercased per ASCII and
+/// the map of its quoted bytes.
 ///
 /// Command names are case insensitive and may be separated from their opening
 /// parenthesis by whitespace.
-fn find_command(cmake_lists: &str, name: &str) -> Option<usize> {
-    // Lowercasing per ASCII keeps the offsets of both strings identical.
-    let lowercased = cmake_lists.to_ascii_lowercase();
-    let quoted = quoted_regions(&lowercased);
-    let mut search_from = 0;
-
+fn find_command(
+    lowercased: &str,
+    quoted: &[bool],
+    mut search_from: usize,
+    name: &str,
+) -> Option<usize> {
     while let Some(offset) = lowercased[search_from..].find(name) {
         let start = search_from + offset;
         let end = start + name.len();

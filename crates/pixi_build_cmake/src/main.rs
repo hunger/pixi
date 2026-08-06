@@ -133,9 +133,9 @@ impl GenerateRecipe for CMakeGenerator {
             extra_args: config.extra_args.clone(),
             build_dir: inputs::NINJA_BUILD_DIR,
             toolchain_file_lines: build_script::toolchain_file_lines(&compilers),
-            provider_file_lines: discovery::provider_file_lines(
-                "${CMAKE_CURRENT_LIST_DIR}/pixi-find-package.log",
-            ),
+            provider_file_lines: discovery::provider_file_lines(),
+            discovery_dir: discovery::DISCOVERY_DIR,
+            find_log_name: discovery::FIND_LOG,
             file_api_client: file_api::CLIENT,
             file_api_query: file_api::QUERY,
         }
@@ -481,19 +481,8 @@ mod tests {
 
         // The compiler template is emitted regardless of the manifest
         // dependencies; a user-pinned compiler package coexists with it.
-        let has_cxx_compiler = generated_recipe
-            .recipe
-            .requirements
-            .build
-            .iter()
-            .any(|item| match item {
-                Item::Value(value) => value
-                    .as_template()
-                    .is_some_and(|t| t.to_string() == "${{ compiler('cxx') }}"),
-                _ => false,
-            });
         assert!(
-            has_cxx_compiler,
+            requested_compilers(&generated_recipe).contains(&"${{ compiler('cxx') }}".to_string()),
             "cxx compiler template should be added even when gxx is a build dependency"
         );
     }
@@ -701,7 +690,7 @@ mod tests {
         });
 
         let manifest_root = tempfile::tempdir().expect("Failed to create temp dir");
-        let generated_recipe = recipe_for(
+        let generated_recipe = recipe_for_manifest_root(
             manifest_root.path(),
             CMakeBackendConfig {
                 compilers: Some(vec!["c".to_string(), "cxx".to_string(), "cuda".to_string()]),
@@ -783,7 +772,8 @@ mod tests {
             .collect()
     }
 
-    async fn recipe_for(
+    /// Generates a recipe for a manifest root, whatever it holds.
+    async fn recipe_for_manifest_root(
         manifest_root: &Path,
         config: CMakeBackendConfig,
         project_model: ProjectModel,
@@ -818,7 +808,7 @@ mod tests {
             .await
             .expect("Failed to write CMakeLists.txt");
 
-        recipe_for(manifest_root.path(), config, project_model).await
+        recipe_for_manifest_root(manifest_root.path(), config, project_model).await
     }
 
     #[tokio::test]
@@ -941,19 +931,12 @@ mod tests {
     /// assumes the languages CMake itself enables by default.
     #[tokio::test]
     async fn test_default_compilers_without_cmake_lists() {
-        let project_model = project_fixture!({
-            "name": "foobar",
-            "version": "0.1.0",
-        });
-
         let manifest_root = tempfile::tempdir().expect("Failed to create temp dir");
-        let generated_recipe = recipe_for(
+
+        let generated_recipe = recipe_for_manifest_root(
             manifest_root.path(),
-            CMakeBackendConfig {
-                compilers: None,
-                ..Default::default()
-            },
-            project_model,
+            CMakeBackendConfig::default(),
+            project_fixture!({"name": "foobar", "version": "0.1.0"}),
         )
         .await;
 

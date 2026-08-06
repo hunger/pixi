@@ -32,10 +32,11 @@ use std::{
     process::{Command, Output},
 };
 
+use crate::cmake_cache;
+
 pub const NINJA_BUILD_DIR: &str = "build";
 const PIXI_CACHE_DIR: &str = ".pixi";
-const CMAKE_HOME_DIRECTORY_KEY: &str = "CMAKE_HOME_DIRECTORY:INTERNAL=";
-const CMAKE_MAKE_PROGRAM_KEY: &str = "CMAKE_MAKE_PROGRAM:FILEPATH=";
+const CMAKE_MAKE_PROGRAM_KEY: &str = "CMAKE_MAKE_PROGRAM";
 const VERIFY_GLOBS_FILE: &str = "CMakeFiles/VerifyGlobs.cmake";
 
 /// Returns the exact set of source-relative input paths that drove this CMake
@@ -50,18 +51,22 @@ pub fn exact_inputs_from_ninja(workdir: &Path) -> io::Result<BTreeSet<String>> {
         ));
     }
 
-    let cache = fs_err::read_to_string(build_dir.join("CMakeCache.txt"))?;
-    let source_dir = read_cache_value(&cache, CMAKE_HOME_DIRECTORY_KEY)
+    let cache = fs_err::read_to_string(build_dir.join(cmake_cache::CACHE_FILE))?;
+    let source_dir = cmake_cache::entry(&cache, cmake_cache::SOURCE_DIRECTORY_KEY)
         .map(PathBuf::from)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "CMAKE_HOME_DIRECTORY not found in CMakeCache.txt",
+                format!(
+                    "{} not found in {}",
+                    cmake_cache::SOURCE_DIRECTORY_KEY,
+                    cmake_cache::CACHE_FILE
+                ),
             )
         })?;
     // The build env's ninja typically isn't on PATH for the backend process;
     // CMake records the binary it picked, so we use that.
-    let ninja_binary = read_cache_value(&cache, CMAKE_MAKE_PROGRAM_KEY)
+    let ninja_binary = cmake_cache::entry(&cache, CMAKE_MAKE_PROGRAM_KEY)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("ninja"));
     let ninja = Ninja::new(ninja_binary, build_dir.clone());
@@ -102,12 +107,6 @@ pub fn exact_inputs_from_ninja(workdir: &Path) -> io::Result<BTreeSet<String>> {
 /// and the cmake script does `pushd build` from there.
 pub(crate) fn cmake_build_dir(workdir: &Path) -> PathBuf {
     workdir.join("work").join(NINJA_BUILD_DIR)
-}
-
-/// Returns the value of a `KEY:TYPE=value` entry from a parsed
-/// `CMakeCache.txt`, or `None` if the key isn't present.
-fn read_cache_value<'a>(cache: &'a str, key: &str) -> Option<&'a str> {
-    cache.lines().find_map(|l| l.strip_prefix(key))
 }
 
 /// Decode ninja stdout as UTF-8. Ninja writes UTF-8 in practice; if it ever

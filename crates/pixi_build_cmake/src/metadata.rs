@@ -37,21 +37,24 @@ impl CMakeMetadataProvider {
     /// Falls back to the languages CMake enables by default when the file is
     /// missing, unreadable, or has no `project()` call to read them from.
     pub fn compilers(&mut self) -> Vec<String> {
-        let cmake_lists = self.cmake_lists.clone();
+        // Bind the languages before logging, so the borrow of `self` the
+        // lookup takes ends before `self.cmake_lists` is read.
+        let languages = self
+            .declaration()
+            .map(|declaration| declaration.languages.clone());
 
-        let Some(declaration) = self.declaration() else {
+        let Some(languages) = languages else {
             tracing::debug!(
                 "no project() languages found in {}, assuming the CMake default",
-                cmake_lists.display()
+                self.cmake_lists.display()
             );
             // The languages CMake enables for a project() call that names none.
             return vec!["c".to_string(), "cxx".to_string()];
         };
 
-        let languages = declaration.languages.clone();
         tracing::debug!(
             "{} enables the languages: {}",
-            cmake_lists.display(),
+            self.cmake_lists.display(),
             languages.join(", ")
         );
 
