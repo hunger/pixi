@@ -68,5 +68,14 @@ if not exist build.ninja (
     @if errorlevel 1 exit 1
 )
 
+if exist build.ninja (
+    ninja -t query install > nul 2>&1
+    if errorlevel 1 (
+        echo pixi-build-cmake: the project has no install^(^) rules, so the package would hold no files. 1>&2
+        echo pixi-build-cmake: add an install^(^) call to CMakeLists.txt naming what the package should ship. 1>&2
+        exit 1
+    )
+)
+
 cmake --build . --target install
 @if errorlevel 1 exit 1

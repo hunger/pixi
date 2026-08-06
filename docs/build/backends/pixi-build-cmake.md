@@ -196,8 +196,26 @@ The CMake backend follows this build process:
    - `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`: Export compile commands for tooling
    - `-DBUILD_SHARED_LIBS=ON`: Build shared libraries by default
    - `-DPython_EXECUTABLE=$PYTHON`: Added by a runtime check in the build script when a python interpreter is present in the host environment (e.g. through a `python` host dependency, conditional or not).
-4. **Build**: Executes `cmake --build` to compile the project
-5. **Install**: Installs the built artifacts to the conda package
+4. **Install Check**: Verifies the configured project has an `install` target, see [Install Rules](#install-rules) below
+5. **Build**: Executes `cmake --build` to compile the project
+6. **Install**: Installs the built artifacts to the conda package
+
+## Install Rules
+
+The backend packages what `cmake --build . --target install` puts in the prefix, so your `CMakeLists.txt` has to say what to install:
+
+```cmake
+install(TARGETS demo)
+```
+
+CMake only generates an `install` target once the project asks for something to be installed. Without one, the build would run to completion and then stop on Ninja's `unknown target 'install'`, which says nothing about the cause. The backend checks for the target after configuring instead, so the problem is reported before anything is compiled:
+
+```
+pixi-build-cmake: the project has no install() rules, so the package would hold no files.
+pixi-build-cmake: add an install() call to CMakeLists.txt naming what the package should ship.
+```
+
+Every other target the backend drives is one CMake always provides, so `install` is the only one it checks for. The check is skipped when [`extra-args`](#extra-args) selects a generator other than Ninja, since there is then no Ninja build tree to ask.
 
 ## Package Metadata
 

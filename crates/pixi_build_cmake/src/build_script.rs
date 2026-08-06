@@ -202,13 +202,40 @@ mod test {
         );
     }
 
+    /// A cmake that records its arguments and leaves behind the `build.ninja`
+    /// a real configure with the ninja generator would.
+    #[cfg(unix)]
+    const CMAKE_NINJA: &str = "#!/bin/sh\n{ echo '--- invocation'; for arg in \"$@\"; do echo \"$arg\"; done; } >> \"$ARGV_RECORD\"\n: > build.ninja\nexit 0\n";
+
+    /// A cmake configuring some other generator, which extra-args can still
+    /// ask for. It leaves no `build.ninja` behind, and records nothing, as
+    /// only its exit status is of interest.
+    #[cfg(unix)]
+    const CMAKE_OTHER_GENERATOR: &str = "#!/bin/sh\nexit 0\n";
+
+    /// A ninja that answers every query, as one does for a project whose
+    /// CMakeLists.txt installs something.
+    #[cfg(unix)]
+    const NINJA_WITH_INSTALL: &str = "#!/bin/sh\nexit 0\n";
+
+    /// A ninja that knows no `install` target, which is what CMake generates
+    /// for a project that installs nothing.
+    #[cfg(unix)]
+    const NINJA_WITHOUT_INSTALL: &str =
+        "#!/bin/sh\ncase \"$*\" in *'-t query install'*) exit 1 ;; esac\nexit 0\n";
+
     /// Runs a rendered script with stubs on PATH instead of a real toolchain,
-    /// and returns the arguments of every configure call it made.
+    /// and returns what the script did: its output and every cmake call.
     ///
     /// This is what proves the quoting works rather than merely being present:
     /// the shell, not a string comparison, decides where the arguments split.
     #[cfg(unix)]
-    fn configure_invocations(prefix: &str, python: Option<&str>) -> Vec<Vec<String>> {
+    fn run_script(
+        cmake: &str,
+        ninja: &str,
+        prefix: &str,
+        python: Option<&str>,
+    ) -> (std::process::Output, Vec<Vec<String>>) {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("failed to create a temp dir");
@@ -221,11 +248,8 @@ mod test {
             permissions.set_mode(0o755);
             fs_err::set_permissions(&path, permissions).expect("failed to chmod a stub");
         };
-        write_stub(
-            "cmake",
-            "#!/bin/sh\n{ echo '--- invocation'; for arg in \"$@\"; do echo \"$arg\"; done; } >> \"$ARGV_RECORD\"\nexit 0\n",
-        );
-        write_stub("ninja", "#!/bin/sh\nexit 0\n");
+        write_stub("cmake", cmake);
+        write_stub("ninja", ninja);
 
         let script = dir.path().join("build.sh");
         fs_err::write(&script, render(BuildPlatform::Unix)).expect("failed to write the script");
@@ -251,16 +275,9 @@ mod test {
             )
             .output()
             .expect("failed to run the script");
-        assert!(
-            output.status.success(),
-            "the script failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
 
-        // Configure calls are the invocations that name a source directory.
-        // The discovery run comes first, the real configure after it.
-        let recorded = fs_err::read_to_string(&record).expect("the stub recorded nothing");
-        recorded
+        let recorded = fs_err::read_to_string(&record).unwrap_or_default();
+        let invocations = recorded
             .split("--- invocation\n")
             .map(|invocation| {
                 invocation
@@ -268,6 +285,25 @@ mod test {
                     .map(str::to_string)
                     .collect::<Vec<String>>()
             })
+            .collect();
+
+        (output, invocations)
+    }
+
+    /// The arguments of every configure call, which are the invocations that
+    /// name a source directory. The discovery run comes first, the real
+    /// configure after it.
+    #[cfg(unix)]
+    fn configure_invocations(prefix: &str, python: Option<&str>) -> Vec<Vec<String>> {
+        let (output, invocations) = run_script(CMAKE_NINJA, NINJA_WITH_INSTALL, prefix, python);
+        assert!(
+            output.status.success(),
+            "the script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        invocations
+            .into_iter()
             .filter(|arguments| arguments.iter().any(|argument| argument == "-S"))
             .collect()
     }
@@ -347,6 +383,54 @@ mod test {
         assert!(
             !arguments.iter().any(|argument| argument.is_empty()),
             "an empty argument reached cmake: {arguments:?}"
+        );
+    }
+
+    /// CMake emits no install target for a project that installs nothing, and
+    /// the build would fail on ninja's `unknown target install`. The script
+    /// has to say what is actually wrong, and say it before building.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_project_that_installs_nothing_is_told_so() {
+        let (output, invocations) =
+            run_script(CMAKE_NINJA, NINJA_WITHOUT_INSTALL, "/tmp/prefix", None);
+
+        assert!(
+            !output.status.success(),
+            "the build was allowed to produce a package with no files"
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("install()"),
+            "the message does not name what is missing: {stderr}"
+        );
+
+        assert!(
+            !invocations
+                .iter()
+                .any(|arguments| arguments.iter().any(|argument| argument == "--build")),
+            "the project was built before the missing install target was reported"
+        );
+    }
+
+    /// A generator other than ninja, which extra-args can still ask for,
+    /// leaves no build.ninja to query. The check has to stand aside there
+    /// rather than fail a build that works.
+    #[cfg(unix)]
+    #[test]
+    fn test_another_generator_is_left_alone() {
+        let (output, _) = run_script(
+            CMAKE_OTHER_GENERATOR,
+            NINJA_WITHOUT_INSTALL,
+            "/tmp/prefix",
+            None,
+        );
+
+        assert!(
+            output.status.success(),
+            "the install check fired without a ninja build tree to query: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

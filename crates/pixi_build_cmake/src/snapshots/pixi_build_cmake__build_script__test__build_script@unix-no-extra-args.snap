@@ -74,4 +74,10 @@ EOF
         ${PYTHON_ARG:+"$PYTHON_ARG"}
 fi
 
+if [ -f "build.ninja" ] && ! ninja -t query install > /dev/null 2>&1; then
+    echo "pixi-build-cmake: the project has no install() rules, so the package would hold no files." >&2
+    echo "pixi-build-cmake: add an install() call to CMakeLists.txt naming what the package should ship." >&2
+    exit 1
+fi
+
 cmake --build . --target install

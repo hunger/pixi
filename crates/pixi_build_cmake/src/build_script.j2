@@ -113,6 +113,11 @@ cat > {{ query_dir }}/query.json <<'EOF'
 {{ file_api_query }}
 EOF
 {% endif %}
+{# Both branches below configure, then check for the install target before
+   building. CMake emits that target only once the project installs
+   something, and ninja's `unknown target install` after a full build would
+   otherwise be the first sign that install() is missing. The check needs a
+   ninja build tree to query, so it stands aside for another generator. -#}
 {# Windows -#}
 {% if is_cmd_exe -%}
 if not exist build.ninja (
@@ -121,6 +126,15 @@ if not exist build.ninja (
 {%- endfor %}
     cmake {{ cmake_args | join(" ^\n        ") }}
     @if errorlevel 1 exit 1
+)
+
+if exist build.ninja (
+    ninja -t query install > nul 2>&1
+    if errorlevel 1 (
+        echo pixi-build-cmake: the project has no install^(^) rules, so the package would hold no files. 1>&2
+        echo pixi-build-cmake: add an install^(^) call to CMakeLists.txt naming what the package should ship. 1>&2
+        exit 1
+    )
 )
 
 cmake --build . --target install
@@ -135,6 +149,12 @@ if [ ! -f "build.ninja" ]; then
 {% endfor %}EOF
 {%- endif %}
     cmake {{ cmake_args | join(" \\\n        ") }}
+fi
+
+if [ -f "build.ninja" ] && ! ninja -t query install > /dev/null 2>&1; then
+    echo "pixi-build-cmake: the project has no install() rules, so the package would hold no files." >&2
+    echo "pixi-build-cmake: add an install() call to CMakeLists.txt naming what the package should ship." >&2
+    exit 1
 fi
 
 cmake --build . --target install
