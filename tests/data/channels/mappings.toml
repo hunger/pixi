@@ -22,5 +22,6 @@
 "virtual_packages/cuda-arch-sm100.yaml" = "virtual_packages"
 "virtual_packages/cuda-arch-sm120.yaml" = "virtual_packages"
 "virtual_packages/cuda-arch-sm90.yaml" = "virtual_packages"
+"virtual_packages/microarch.yaml" = "virtual_packages"
 "virtual_packages/no-deps.yaml" = "virtual_packages"
 "virtual_packages/noarch_package.yaml" = "virtual_packages"

@@ -1,0 +1,9 @@
+package:
+  name: microarch
+  version: 0.1.0
+build:
+  # x86-64 microarchitecture names make no sense on the arm subdirs.
+  skip: osx
+requirements:
+  run:
+    - __archspec 1.*[build="^(x86_64_v3|haswell|skylake|zen4)$"]

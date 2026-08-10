@@ -4,8 +4,9 @@ Each test asserts the intended behaviour for a bug that pixi used to get
 wrong; they guard against regressions now that those bugs are fixed.
 
 All tests stay network-free: they use the in-repo ``virtual_packages`` channel
-(its ``cuda`` package depends on ``__cuda >=12``) and gate themselves on the
-host platform where the requirement only makes sense.
+(its ``cuda`` package depends on ``__cuda >=12``, its ``microarch`` package on
+a CEP-29 ``__archspec`` regex) and gate themselves on the host platform where
+the requirement only makes sense.
 """
 
 from __future__ import annotations
@@ -16,12 +17,17 @@ import pytest
 
 from .common import CURRENT_PLATFORM, ExitCode, verify_cli_command
 
-# The virtual_packages channel only ships the cuda package for these subdirs.
+# The virtual_packages channel only ships the cuda and microarch packages for
+# these subdirs.
 CUDA_CHANNEL_SUBDIRS = {"linux-64", "win-64"}
 
 requires_cuda_channel = pytest.mark.skipif(
     CURRENT_PLATFORM not in CUDA_CHANNEL_SUBDIRS,
     reason="virtual_packages channel ships the cuda package only for linux-64 and win-64",
+)
+requires_microarch_package = pytest.mark.skipif(
+    CURRENT_PLATFORM not in CUDA_CHANNEL_SUBDIRS,
+    reason="virtual_packages channel ships the microarch package only for linux-64 and win-64",
 )
 linux_only = pytest.mark.skipif(
     not CURRENT_PLATFORM.startswith("linux"),
@@ -112,6 +118,52 @@ cuda = "*"
         ExitCode.FAILURE,
         env={"CONDA_OVERRIDE_CUDA": "10"},
         stderr_contains="__cuda >=12",
+    )
+
+
+@requires_microarch_package
+def test_archspec_lock_reuse_checks_the_microarchitecture(
+    pixi: Path, tmp_pixi_workspace: Path, virtual_packages_channel: str
+) -> None:
+    """The ``microarch`` package requires ``__archspec 1.* ^(x86_64_v3|...)$``,
+    the CEP-29 shape conda-forge's microarch metapackages use. Reusing a lock
+    that carries it must match the spec as written: ``broadwell`` satisfies the
+    declared ``haswell`` platform but is absent from the regex, so the install
+    is refused up front -- it used to install happily and die with SIGILL at
+    run time."""
+    manifest = _write(
+        tmp_pixi_workspace / "pixi.toml",
+        f"""
+[workspace]
+name = "microarch-floor"
+channels = ["{virtual_packages_channel}"]
+platforms = [
+  {{ name = "fast", platform = "{CURRENT_PLATFORM}", archspec = "haswell" }},
+]
+
+[dependencies]
+microarch = "*"
+""",
+    )
+    # Solve, lock and install on a satisfying host.
+    verify_cli_command(
+        [pixi, "install", "--manifest-path", manifest],
+        ExitCode.SUCCESS,
+        env={"CONDA_OVERRIDE_ARCHSPEC": "haswell"},
+    )
+    # A host that satisfies the declared platform but not the locked
+    # requirement must not reuse the lock.
+    verify_cli_command(
+        [pixi, "install", "--manifest-path", manifest],
+        ExitCode.FAILURE,
+        env={"CONDA_OVERRIDE_ARCHSPEC": "broadwell"},
+        stderr_contains="__archspec",
+    )
+    # A microarchitecture the regex names still installs from that lock.
+    verify_cli_command(
+        [pixi, "install", "--manifest-path", manifest],
+        ExitCode.SUCCESS,
+        env={"CONDA_OVERRIDE_ARCHSPEC": "skylake"},
     )
 
 
