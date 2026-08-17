@@ -115,7 +115,8 @@ fn compute_renames(lock_file: &LockFile, manifest: &WorkspaceManifest) -> HashMa
             .any(|wp| wp.name().as_str() == locked_name);
 
         let mut matching = workspace_platforms.iter().filter(|wp| {
-            wp.subdir() == locked.subdir() && workspace_customisations(wp) == locked_identity
+            wp.subdir() == locked.subdir()
+                && platform::same_virtual_packages(&workspace_customisations(wp), &locked_identity)
         });
         let first = matching.next();
         let second = matching.next();
@@ -152,31 +153,26 @@ fn compute_renames(lock_file: &LockFile, manifest: &WorkspaceManifest) -> HashMa
 /// subdir defaults so only user-set customisations participate in the match.
 fn workspace_customisations(platform: &PixiPlatform) -> Vec<GenericVirtualPackage> {
     let subdir = platform.subdir();
-    let mut customised: Vec<GenericVirtualPackage> = platform
+    platform
         .declared_virtual_packages()
         .iter()
         .filter(|gvp| !platform::is_subdir_default(gvp, subdir))
         .cloned()
-        .collect();
-    customised.sort_by(|a, b| a.name.as_normalized().cmp(b.name.as_normalized()));
-    customised
+        .collect()
 }
 
 /// Identity-matching VPs for a locked platform: parse the lockfile's
-/// `__name=version[=build]` strings back into [`GenericVirtualPackage`]s, drop
-/// the entries that match the subdir's defaults, and sort by name. Strings
-/// that don't parse are dropped -- the workspace side can't have a
-/// corresponding entry anyway.
+/// `__name=version[=build]` strings back into [`GenericVirtualPackage`]s and
+/// drop the entries that match the subdir's defaults. Strings that don't parse
+/// are dropped -- the workspace side can't have a corresponding entry anyway.
 fn locked_customisations(locked: &rattler_lock::Platform<'_>) -> Vec<GenericVirtualPackage> {
     let subdir = locked.subdir();
-    let mut customised: Vec<GenericVirtualPackage> = locked
+    locked
         .virtual_packages()
         .iter()
         .filter_map(|raw| platform::parse_locked_virtual_package(raw))
         .filter(|gvp| !platform::is_subdir_default(gvp, subdir))
-        .collect();
-    customised.sort_by(|a, b| a.name.as_normalized().cmp(b.name.as_normalized()));
-    customised
+        .collect()
 }
 
 #[derive(Debug, Error)]

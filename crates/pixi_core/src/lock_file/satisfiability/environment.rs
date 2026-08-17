@@ -12,7 +12,7 @@ use pixi_manifest::{
 };
 use pixi_pypi_spec::PixiPypiSource;
 use pypi_modifiers::Tags;
-use rattler_conda_types::{ChannelUrl, NamedChannelOrUrl, Platform};
+use rattler_conda_types::{ChannelUrl, GenericVirtualPackage, NamedChannelOrUrl, Platform};
 use rattler_lock::{LockedPackage, PypiIndexes, UrlOrPath};
 use url::Url;
 use uv_distribution_filename::{DistExtension, ExtensionError, SourceDistExtension, WheelFilename};
@@ -137,11 +137,31 @@ pub fn verify_environment_satisfiability(
         // changed (e.g. adding/removing `__cuda` or pinning `__glibc` to
         // a non-default version).
         let workspace_subdir = workspace_platform.subdir();
-        let expected_vps: Vec<String> = workspace_platform
+        let expected_customised: Vec<GenericVirtualPackage> = workspace_platform
             .declared_virtual_packages()
             .iter()
             .filter(|gvp| !pixi_manifest::platform::is_subdir_default(gvp, workspace_subdir))
-            .map(|vp| vp.to_string())
+            .cloned()
+            .collect();
+        // `None` when an entry doesn't parse: it can never match a
+        // manifest-rendered one, so it counts as a changed definition.
+        let locked_customised: Option<Vec<GenericVirtualPackage>> = locked
+            .virtual_packages
+            .iter()
+            .map(|raw| pixi_manifest::platform::parse_locked_virtual_package(raw))
+            .collect::<Option<Vec<_>>>()
+            .map(|parsed| {
+                parsed
+                    .into_iter()
+                    .filter(|gvp| {
+                        !pixi_manifest::platform::is_subdir_default(gvp, workspace_subdir)
+                    })
+                    .collect()
+            });
+
+        let expected_vps: Vec<String> = expected_customised
+            .iter()
+            .map(ToString::to_string)
             .collect();
         let locked_vps: Vec<String> = locked
             .virtual_packages
@@ -154,15 +174,11 @@ pub fn verify_environment_satisfiability(
             .cloned()
             .collect();
         let same_subdir = workspace_subdir == locked.subdir;
-        // Compare VPs as multisets: lockfile ordering is not part of the
-        // platform's identity for satisfiability purposes.
-        let same_vps = {
-            let mut a = expected_vps.clone();
-            let mut b = locked_vps.clone();
-            a.sort();
-            b.sort();
-            a == b
-        };
+        // Capability multisets: neither lockfile ordering nor the CEP 30
+        // `__archspec` provenance version is part of a platform's identity.
+        let same_vps = locked_customised.is_some_and(|locked| {
+            pixi_manifest::platform::same_virtual_packages(&expected_customised, &locked)
+        });
         if !same_subdir || !same_vps {
             return Err(EnvironmentUnsat::PlatformDefinitionChanged(
                 PlatformDefinitionChanged {

@@ -1,0 +1,7 @@
+[workspace]
+channels = ["https://prefix.dev/conda-forge"]
+name = "legacy-archspec-version"
+platforms = [{ name = "fast", platform = "linux-64", archspec = "skylake" }]
+
+[dependencies]
+_r-mutex = "*"
