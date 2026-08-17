@@ -603,6 +603,50 @@ mod test {
         );
     }
 
+    /// Two platforms asking for different microarchitectures are two unmet
+    /// requirements. Pooling them by name and version alone drops one, because
+    /// the microarchitecture lives in the build string and CEP 30 gives every
+    /// database-known one the same version.
+    #[test]
+    fn unsatisfied_requirements_keep_distinct_microarchitectures() {
+        use std::collections::HashSet;
+
+        use rattler_conda_types::Platform;
+
+        use crate::PixiPlatformName;
+
+        let workspace = TomlWorkspace::from_toml_str(
+            r#"
+            channels = []
+            platforms = [
+              { name = "v4", platform = "linux-64", archspec = "x86_64_v4" },
+              { name = "zen4", platform = "linux-64", archspec = "zen4" },
+            ]
+            "#,
+        )
+        .unwrap()
+        .into_workspace(ExternalWorkspaceProperties::default(), Path::new(""))
+        .unwrap()
+        .value;
+        let env_platforms: HashSet<PixiPlatformName> = ["v4", "zen4"]
+            .into_iter()
+            .map(|name| PixiPlatformName::try_from(name).unwrap())
+            .collect();
+
+        let requirements: Vec<String> = workspace
+            .unsatisfied_platform_requirements(Platform::Linux64, &[], &env_platforms)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            requirements,
+            vec![
+                "__archspec=1=x86_64_v4".to_string(),
+                "__archspec=1=zen4".to_string()
+            ],
+        );
+    }
+
     /// A workspace that declares no microarchitecture must not be warned about
     /// one, however many platforms it has. The materialised subdir baseline looks
     /// like a declaration to a per-record check, and warning about it both

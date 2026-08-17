@@ -17,7 +17,10 @@ use url::Url;
 use super::pypi::pypi_options::PypiOptions;
 use crate::{
     PixiPlatform, PixiPlatformName, PrioritizedChannel, S3Options, TargetSelector, Targets,
-    platform::{capability_satisfied_by, is_subdir_default, warn_once_if_archspec_undetectable},
+    platform::{
+        capability_satisfied_by, is_subdir_default, same_virtual_package,
+        warn_once_if_archspec_undetectable,
+    },
     preview::Preview,
 };
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
@@ -232,9 +235,13 @@ impl Workspace {
             .filter(|d| d.subdir_matches_host)
         {
             for declared in diagnosis.unsatisfied_virtual_packages {
+                // By capability, not by name and version: `__archspec` carries
+                // its microarchitecture in the build string, and CEP 30 gives
+                // every one the database knows the same version, so two
+                // platforms asking for different CPUs would collapse into one.
                 if !unsatisfied
                     .iter()
-                    .any(|u| u.name == declared.name && u.version == declared.version)
+                    .any(|seen| same_virtual_package(seen, &declared))
                 {
                     unsatisfied.push(declared);
                 }
