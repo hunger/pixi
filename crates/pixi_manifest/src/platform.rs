@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::str::FromStr;
+use std::sync::{LazyLock, Mutex};
 
 use archspec::cpu::Microarchitecture;
 use itertools::Itertools;
@@ -10,8 +12,7 @@ use pixi_default_versions::{
 };
 use rattler_conda_types::{GenericVirtualPackage, PackageName, Platform, StringMatcher, Version};
 use rattler_virtual_packages::{
-    Archspec, DetectVirtualPackageError, EnvOverride, Override, VirtualPackageOverrides,
-    VirtualPackages,
+    Archspec, DetectVirtualPackageError, Override, VirtualPackageOverrides, VirtualPackages,
 };
 
 use crate::TargetSelector;
@@ -421,7 +422,7 @@ impl PixiPlatform {
     ) -> Result<Self, PixiPlatformError> {
         let declared_virtual_packages = normalize_virtual_packages(declared_virtual_packages);
         if name.as_str() == subdir.as_str()
-            && !same_virtual_packages(
+            && !is_same_virtual_packages(
                 &declared_virtual_packages,
                 &subdir_default_virtual_packages(subdir),
             )
@@ -950,30 +951,50 @@ pub fn archspec_undetectable(
         })
 }
 
-/// Report -- once per process, since platform matching runs many times per
-/// command -- that a declared `__archspec` cannot be verified because `system`
-/// does not name its own microarchitecture.
+/// The microarchitecture `platform` declares that `system` cannot verify because
+/// it does not report its own, if there is one.
+///
+/// Subdir defaults are excluded: nobody declared the baseline, and running the
+/// subdir implies it, so it is nothing to report.
+pub fn undetectable_archspec<'p>(
+    platform: &'p PixiPlatform,
+    system: &[GenericVirtualPackage],
+) -> Option<&'p str> {
+    platform
+        .declared_virtual_packages()
+        .iter()
+        .filter(|declared| !is_subdir_default(declared, platform.subdir()))
+        .find(|declared| archspec_undetectable(declared, system))
+        .and_then(archspec_microarchitecture_of)
+}
+
+/// Report that a microarchitecture `platform` declares cannot be verified here,
+/// once per microarchitecture per process.
+///
+/// Once, because platform matching runs many times per command and the machine
+/// does not change in between; per microarchitecture rather than once overall, so
+/// a workspace declaring several is not reduced to whichever one it lists first.
 pub fn warn_once_if_archspec_undetectable(
-    declared: &[GenericVirtualPackage],
+    platform: &PixiPlatform,
     system: &[GenericVirtualPackage],
 ) {
-    static REPORTED: std::sync::Once = std::sync::Once::new();
+    static REPORTED: LazyLock<Mutex<HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
 
-    let Some(required) = declared
-        .iter()
-        .find(|declared| archspec_undetectable(declared, system))
-    else {
+    let Some(microarchitecture) = undetectable_archspec(platform, system) else {
         return;
     };
-    REPORTED.call_once(|| {
-        tracing::warn!(
-            "This machine does not report a CPU microarchitecture, so the declared \
-             '__archspec' of '{}' cannot be verified; assuming it is available. Set \
-             {} to name the microarchitecture explicitly.",
-            required.build_string,
-            Archspec::DEFAULT_ENV_NAME,
-        );
-    });
+    let Ok(mut reported) = REPORTED.lock() else {
+        return;
+    };
+    if !reported.insert(microarchitecture.to_string()) {
+        return;
+    }
+    tracing::warn!(
+        "Platform '{}' declares the microarchitecture '{microarchitecture}', but this machine \
+         reports none to compare it against; assuming it is available.",
+        platform.name(),
+    );
 }
 
 /// The entries of `required` that `system` does not provide, in order.
@@ -1506,6 +1527,33 @@ mod tests {
         // A host that does name one is verifiable, met or not.
         assert!(!archspec_undetectable(&declared, &[archspec(1, "zen4")]));
         assert!(!archspec_undetectable(&declared, &[]));
+    }
+
+    /// The report is about what a user declared, so the materialised subdir
+    /// baseline must not trigger it: a workspace declaring no microarchitecture
+    /// anywhere has nothing to be told, and one that does declare a
+    /// microarchitecture must hear about *that* one whatever order its platforms
+    /// are in.
+    #[test]
+    fn undetectable_report_ignores_the_materialised_baseline() {
+        let unknown_host = [archspec(1, "0")];
+        let subdir_platform = PixiPlatform::from_subdir(Platform::Linux64);
+        let declares_v4 = PixiPlatform::new_with_defaults(
+            PixiPlatformName::try_from("fast").unwrap(),
+            Platform::Linux64,
+            vec![archspec(0, "x86_64_v4")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            undetectable_archspec(&subdir_platform, &unknown_host),
+            None,
+            "the linux-64 baseline is not a declared microarchitecture"
+        );
+        assert_eq!(
+            undetectable_archspec(&declares_v4, &unknown_host),
+            Some("x86_64_v4"),
+        );
     }
 
     #[test]

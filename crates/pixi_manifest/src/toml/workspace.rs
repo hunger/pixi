@@ -603,6 +603,46 @@ mod test {
         );
     }
 
+    /// A workspace that declares no microarchitecture must not be warned about
+    /// one, however many platforms it has. The materialised subdir baseline looks
+    /// like a declaration to a per-record check, and warning about it both
+    /// invents a requirement the user never wrote and -- being reported once per
+    /// process -- hides the declaration that really cannot be verified.
+    #[tracing_test::traced_test]
+    #[test]
+    fn undetectable_archspec_is_reported_for_declarations_only() {
+        use rattler_conda_types::{GenericVirtualPackage, PackageName, Platform, Version};
+
+        let unknown_host = [GenericVirtualPackage {
+            name: PackageName::try_from("__archspec").unwrap(),
+            version: Version::major(1),
+            build_string: "0".to_string(),
+        }];
+        let workspace = |platforms: &str| {
+            TomlWorkspace::from_toml_str(&format!("channels = []\nplatforms = [{platforms}]"))
+                .unwrap()
+                .into_workspace(ExternalWorkspaceProperties::default(), Path::new(""))
+                .unwrap()
+                .value
+        };
+
+        // Nothing declared: the linux-64 baseline `__archspec=1=x86_64` is not a
+        // declaration and must not be reported.
+        workspace(r#""linux-64""#).possible_pixi_platforms(Platform::Linux64, &unknown_host);
+        assert!(
+            !logs_contain("x86_64"),
+            "a workspace declaring no microarchitecture was warned about one"
+        );
+
+        // Declared, listed after the bare subdir: still reported, so the message
+        // does not depend on manifest order.
+        workspace(
+            r#""linux-64", { name = "fast", platform = "linux-64", archspec = "x86_64_v4" }"#,
+        )
+        .possible_pixi_platforms(Platform::Linux64, &unknown_host);
+        assert!(logs_contain("x86_64_v4"));
+    }
+
     #[test]
     fn test_platform_match_diagnostics_and_unsatisfied_requirements() {
         use std::collections::HashSet;

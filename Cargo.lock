@@ -7074,6 +7074,7 @@ dependencies = [
  "toml-span",
  "toml_edit",
  "tracing",
+ "tracing-test",
  "url",
  "xxhash-rust",
 ]

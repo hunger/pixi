@@ -166,10 +166,7 @@ impl Workspace {
         // CI on a different host, etc.). Only the user-customised VPs
         // need to be satisfied by the host.
         let satisfies_system = |p: &&PixiPlatform| {
-            warn_once_if_archspec_undetectable(
-                p.declared_virtual_packages(),
-                system_virtual_packages,
-            );
+            warn_once_if_archspec_undetectable(p, system_virtual_packages);
             p.declared_virtual_packages()
                 .iter()
                 .filter(|declared| !is_subdir_default(declared, p.subdir()))
