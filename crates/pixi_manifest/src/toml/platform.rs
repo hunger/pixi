@@ -1445,6 +1445,23 @@ mod test {
         );
     }
 
+    /// A nameless entry that spells out nothing beyond the subdir baseline is
+    /// the bare subdir platform, not an error. The two placeholder build-string
+    /// spellings (absent and `"0"`) mean the same thing, so a raw entry using
+    /// the other one from the baseline still matches it.
+    #[test]
+    fn test_platform_declaring_only_subdir_defaults_collapses_to_the_subdir() {
+        for input in [
+            r#"platform = { platform = "linux-64", __unix = "0" }"#,
+            r#"platform = { platform = "linux-64", __glibc = "2.28=0" }"#,
+        ] {
+            let parsed = TopLevel::from_toml_str(input)
+                .unwrap_or_else(|error| panic!("'{input}' must parse: {error:?}"));
+            assert_eq!(parsed.platform.name().as_str(), "linux-64");
+            assert!(parsed.platform.is_subdir_platform());
+        }
+    }
+
     #[test]
     fn test_workspace_platform_archspec_requires_value() {
         let input = r#"platform = { platform = "linux-64", archspec = "" }"#;

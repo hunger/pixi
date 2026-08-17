@@ -421,7 +421,10 @@ impl PixiPlatform {
     ) -> Result<Self, PixiPlatformError> {
         let declared_virtual_packages = normalize_virtual_packages(declared_virtual_packages);
         if name.as_str() == subdir.as_str()
-            && declared_virtual_packages != subdir_default_virtual_packages(subdir)
+            && !same_virtual_packages(
+                &declared_virtual_packages,
+                &subdir_default_virtual_packages(subdir),
+            )
         {
             return Err(PixiPlatformError::IsSubdirPlatform);
         }
@@ -441,19 +444,22 @@ impl PixiPlatform {
     /// `user_declared` keeps that version even though the subdir defaults
     /// would otherwise inject `__glibc = "2.28"`.
     ///
-    /// When `name == subdir` and `user_declared` is empty, this returns the
-    /// subdir platform produced by [`Self::from_subdir`] (which carries the
-    /// subdir defaults). Customising a subdir-named entry is rejected with
-    /// [`PixiPlatformError::IsSubdirPlatform`] -- the subdir baseline is
-    /// fixed, callers that want to customise must give the platform a
-    /// name distinct from its subdir.
+    /// When `name == subdir` and `user_declared` customises nothing -- it is
+    /// empty, or every entry restates a subdir default -- this returns the subdir
+    /// platform produced by [`Self::from_subdir`]. Actually *customising* a
+    /// subdir-named entry is rejected with
+    /// [`PixiPlatformError::IsSubdirPlatform`]: the subdir baseline is fixed, and
+    /// callers that want to customise must give the platform its own name.
     pub fn new_with_defaults(
         name: PixiPlatformName,
         subdir: Platform,
         user_declared: Vec<GenericVirtualPackage>,
     ) -> Result<Self, PixiPlatformError> {
         if name.as_str() == subdir.as_str() {
-            if !user_declared.is_empty() {
+            if user_declared
+                .iter()
+                .any(|declared| !is_subdir_default(declared, subdir))
+            {
                 return Err(PixiPlatformError::IsSubdirPlatform);
             }
             return Ok(Self::from_subdir(subdir));
