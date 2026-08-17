@@ -2,12 +2,17 @@ use crate::workspace::errors::spec_override_hint;
 use fancy_display::FancyDisplay;
 use itertools::Itertools;
 use miette::Diagnostic;
-use pixi_manifest::{EnvironmentName, PixiPlatform, PixiPlatformName};
+use pixi_manifest::{
+    EnvironmentName, PixiPlatform, PixiPlatformName,
+    platform::{
+        archspec_requirement_is_subdir_baseline, archspec_requirement_satisfied, is_archspec,
+    },
+};
 use pypi_modifiers::pypi_tags::{PyPITagError, get_tags_from_machine, is_python_record};
 use rattler_conda_types::ParseMatchSpecError;
 use rattler_conda_types::ParseStrictness::Lenient;
 use rattler_conda_types::{
-    GenericVirtualPackage, MatchSpec, Matches, Platform, Version, VersionSpec,
+    GenericVirtualPackage, MatchSpec, Matches, Platform, StringMatcher, Version, VersionSpec,
 };
 use rattler_lock::{CondaPackageData, ConversionError, LockFile, PypiPackageData};
 use rattler_virtual_packages::{
@@ -21,7 +26,14 @@ use uv_distribution_filename::WheelFilename;
 /// Define accepted virtual packages as a constant set
 /// These packages will be checked against the system virtual packages
 const ACCEPTED_VIRTUAL_PACKAGES: &[&str] = &[
-    "__glibc", "__musl", "__eglibc", "__cuda", "__osx", "__win", "__linux",
+    "__glibc",
+    "__musl",
+    "__eglibc",
+    "__cuda",
+    "__osx",
+    "__win",
+    "__linux",
+    "__archspec",
 ];
 
 #[derive(Debug, Error, Diagnostic)]
@@ -104,9 +116,13 @@ pub(crate) fn get_required_virtual_packages_from_depends(
 }
 
 /// The requirements in `specs` that `system` does not satisfy, in order.
+///
+/// `target` is the subdir the requirements were resolved for; an `__archspec`
+/// requirement is read relative to it.
 pub(crate) fn unmet_requirements(
     specs: &[MatchSpec],
     system: &[GenericVirtualPackage],
+    target: Platform,
 ) -> Vec<MatchSpec> {
     let (checked, skipped): (Vec<&MatchSpec>, Vec<&MatchSpec>) = specs.iter().partition(|spec| {
         spec.name
@@ -122,9 +138,36 @@ pub(crate) fn unmet_requirements(
 
     checked
         .into_iter()
-        .filter(|spec| !system.iter().any(|provided| spec.matches(provided)))
+        .filter(|spec| !requirement_met(spec, system, target))
         .cloned()
         .collect()
+}
+
+/// Whether `system` meets the single requirement `spec`, which names a virtual
+/// package pixi knows how to evaluate.
+fn requirement_met(spec: &MatchSpec, system: &[GenericVirtualPackage], target: Platform) -> bool {
+    if spec.name.as_exact().is_some_and(is_archspec) {
+        return archspec_requirement_met(spec.build.as_ref(), system, target);
+    }
+    system.iter().any(|provided| spec.matches(provided))
+}
+
+/// Whether the machine meets an `__archspec` requirement whose build matcher is
+/// `required`. The version a `depends` entry carries is a CEP 30 provenance
+/// marker rather than a constraint, so only the microarchitecture is evaluated,
+/// and through the archspec DAG rather than as a literal.
+fn archspec_requirement_met(
+    required: Option<&StringMatcher>,
+    system: &[GenericVirtualPackage],
+    target: Platform,
+) -> bool {
+    if archspec_requirement_is_subdir_baseline(required, target) {
+        return true;
+    }
+    system
+        .iter()
+        .filter(|provided| is_archspec(&provided.name))
+        .any(|provided| archspec_requirement_satisfied(required, &provided.build_string))
 }
 
 /// The version literal a virtual-package match spec mentions, ignoring its
@@ -293,8 +336,12 @@ pub(crate) fn validate_system_meets_environment_requirements(
     );
 
     // Check if all the required virtual conda packages match the system virtual packages.
-    if let Some(unmet) =
-        unmet_requirements(&required_virtual_packages, &system_capabilities).first()
+    if let Some(unmet) = unmet_requirements(
+        &required_virtual_packages,
+        &system_capabilities,
+        platform.subdir(),
+    )
+    .first()
     {
         return Err(VirtualPackageNotFoundError::new(
             unmet,
@@ -490,27 +537,50 @@ packages:
             }]
         };
 
+        let unmet = |raw: &str, system: &[GenericVirtualPackage]| {
+            unmet_requirements(&[spec(raw)], system, Platform::Linux64)
+        };
+
         // A lower bound behaves as before: any newer machine satisfies it.
-        assert!(unmet_requirements(&[spec("__cuda >=12")], &cuda("12.4")).is_empty());
-        assert_eq!(
-            unmet_requirements(&[spec("__cuda >=12")], &cuda("11")).len(),
-            1
-        );
+        assert!(unmet("__cuda >=12", &cuda("12.4")).is_empty());
+        assert_eq!(unmet("__cuda >=12", &cuda("11")).len(), 1);
 
         // An exact pin is honored as a pin. The old `>=`-only comparison called
         // this satisfied.
-        assert_eq!(
-            unmet_requirements(&[spec("__cuda ==12")], &cuda("12.4")).len(),
-            1
-        );
+        assert_eq!(unmet("__cuda ==12", &cuda("12.4")).len(), 1);
 
         // A bare requirement only asks for presence.
-        assert!(unmet_requirements(&[spec("__cuda")], &cuda("11")).is_empty());
-        assert_eq!(unmet_requirements(&[spec("__cuda")], &[]).len(), 1);
+        assert!(unmet("__cuda", &cuda("11")).is_empty());
+        assert_eq!(unmet("__cuda", &[]).len(), 1);
     }
 
+    /// Build strings of accepted virtual packages are compared, and names pixi
+    /// cannot evaluate are skipped rather than failed -- pixi has never refused
+    /// an install over `__unix`.
     #[test]
     fn unmet_requirements_only_checks_accepted_virtual_packages() {
+        let spec = |raw: &str| {
+            MatchSpec::from_str(raw, rattler_conda_types::ParseStrictness::Lenient).unwrap()
+        };
+
+        assert!(unmet_requirements(&[spec("__unix")], &[], Platform::Linux64).is_empty());
+
+        let cuda = vec![GenericVirtualPackage {
+            name: rattler_conda_types::PackageName::try_from("__cuda").unwrap(),
+            version: rattler_conda_types::Version::major(12),
+            build_string: "real".to_string(),
+        }];
+        assert_eq!(
+            unmet_requirements(&[spec("__cuda 12 other")], &cuda, Platform::Linux64).len(),
+            1
+        );
+    }
+
+    /// An `__archspec` requirement names the baseline a package was built for,
+    /// so it is read through the microarchitecture DAG rather than as a literal
+    /// build string, and its version -- CEP 30 provenance -- is ignored.
+    #[test]
+    fn archspec_requirements_are_matched_through_the_dag() {
         let spec = |raw: &str| {
             MatchSpec::from_str(raw, rattler_conda_types::ParseStrictness::Lenient).unwrap()
         };
@@ -521,34 +591,35 @@ packages:
                 build_string: microarchitecture.to_string(),
             }]
         };
+        let unmet = |raw: &str, system: &[GenericVirtualPackage]| {
+            unmet_requirements(&[spec(raw)], system, Platform::Linux64)
+        };
 
-        // A specific host satisfies a baseline requirement...
-        assert!(unmet_requirements(&[spec("__archspec 1 x86_64")], &host("zen5")).is_empty());
-        // ...including through the CEP-29 regex spelling conda-forge's microarch
+        // A descendant host runs code built for an ancestor baseline...
+        assert!(unmet("__archspec 1 x86_64_v3", &host("skylake")).is_empty());
+        // ...including through the CEP 29 regex spelling conda-forge's microarch
         // metapackages use, whose enumeration cannot know future CPUs.
         assert!(
-            unmet_requirements(
-                &[spec("__archspec 1.* ^(x86_64_v3|skylake)$")],
-                &host("zen5")
-            )
-            .is_empty()
+            unmet("__archspec 1.* ^(x86_64_v3|skylake)$", &host("zen5")).is_empty(),
+            "a zen5 host descends from x86_64_v3"
         );
-        // A host that reports no microarchitecture at all is not a reason to
-        // refuse either.
-        assert!(unmet_requirements(&[spec("__archspec 1 x86_64")], &host("0")).is_empty());
-        // The same goes for any other name off the list -- pixi has never failed
-        // an install over `__unix`, and the fallback path must not either.
-        assert!(unmet_requirements(&[spec("__unix")], &[]).is_empty());
-        // Every accepted virtual package has its build string compared.
-        let cuda = vec![GenericVirtualPackage {
-            name: rattler_conda_types::PackageName::try_from("__cuda").unwrap(),
-            version: rattler_conda_types::Version::major(12),
-            build_string: "real".to_string(),
-        }];
+        // A host below the required baseline does not.
+        assert_eq!(unmet("__archspec 1 x86_64_v3", &host("nocona")).len(), 1);
         assert_eq!(
-            unmet_requirements(&[spec("__cuda 12 other")], &cuda).len(),
+            unmet("__archspec 1.* ^(x86_64_v4)$", &host("skylake")).len(),
             1
         );
+
+        // The subdir baseline is implied by running the subdir at all, which is
+        // what keeps an osx-64 environment working under Rosetta.
+        assert!(unmet("__archspec 1 x86_64", &host("m1")).is_empty());
+
+        // A host that reports no microarchitecture cannot verify the
+        // requirement, and is not a reason to refuse.
+        assert!(unmet("__archspec 1 x86_64_v3", &host("0")).is_empty());
+        // A machine with no `__archspec` at all is an ordinary missing virtual
+        // package.
+        assert_eq!(unmet("__archspec 1 x86_64_v3", &[]).len(), 1);
     }
 
     #[test]
@@ -764,8 +835,12 @@ packages:
         assert!(error.help.is_none(), "{:?}", error.help);
     }
 
+    /// The microarch metapackages conda-forge ships require the `linux-64`
+    /// baseline (`__archspec 1 x86_64`), which running `linux-64` at all
+    /// implies. Any host satisfies it, including one that reports an unrelated
+    /// microarchitecture because the environment runs under emulation.
     #[test]
-    fn test_archspec_skip() {
+    fn subdir_baseline_archspec_is_satisfied_by_any_host() {
         let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let lock_file_path = root_dir.join("../../tests/data/lock_files/archspec.lock");
         let lock_file = LockFile::from_path(&lock_file_path).unwrap();
@@ -773,8 +848,8 @@ packages:
 
         let mut overrides = VirtualPackageOverrides::default();
         overrides.libc = Some(Override::String("2.17".to_string()));
+        overrides.archspec = Some(Override::String("m1".to_string()));
 
-        // validate that the archspec is skipped
         validate_system_meets_environment_requirements(
             &lock_file,
             &platform,
@@ -782,6 +857,37 @@ packages:
             Some(overrides),
         )
         .unwrap();
+    }
+
+    /// A requirement above the subdir baseline is verified against the host: a
+    /// descendant microarchitecture runs the installed packages, one below the
+    /// baseline they were built for does not.
+    #[test]
+    fn archspec_requirement_above_the_baseline_is_verified() {
+        let lock_file = lock_requiring("__archspec 1 x86_64_v3");
+        let platform = pixi_manifest::PixiPlatform::from_subdir(Platform::Linux64);
+        let validate = |microarchitecture: &str| {
+            let mut overrides = VirtualPackageOverrides::default();
+            overrides.libc = Some(Override::String("2.17".to_string()));
+            overrides.archspec = Some(Override::String(microarchitecture.to_string()));
+            validate_system_meets_environment_requirements(
+                &lock_file,
+                &platform,
+                &EnvironmentName::default(),
+                Some(overrides),
+            )
+        };
+
+        validate("skylake").unwrap();
+
+        let result = validate("nocona");
+        assert!(
+            matches!(
+                result,
+                Err(MachineValidationError::VirtualPackageNotFound(_))
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]

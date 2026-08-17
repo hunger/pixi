@@ -5,7 +5,7 @@ use itertools::Itertools;
 use miette::{Diagnostic, LabeledSpan};
 use pixi_manifest::{
     EnvironmentName, PixiPlatformName, PlatformMatchDiagnosis, TaskName,
-    platform::{archspec_microarchitecture, is_archspec},
+    platform::{archspec_microarchitecture, archspec_override_suggestion, is_archspec},
 };
 use rattler_conda_types::{GenericVirtualPackage, MatchSpec, Platform, Version};
 use std::error::Error;
@@ -236,8 +236,13 @@ pub(crate) fn format_specs(specs: &[MatchSpec]) -> String {
 /// `CONDA_OVERRIDE_*` hint for an unmet requirement, `None` when the spec names
 /// no single virtual package or that package has no override `target` honors.
 pub(crate) fn spec_override_hint(spec: &MatchSpec, target: Platform) -> Option<String> {
+    let name = spec.name.as_exact()?;
+    if is_archspec(name) {
+        return archspec_override_suggestion(spec.build.as_ref())
+            .map(|microarchitecture| format!("CONDA_OVERRIDE_ARCHSPEC={microarchitecture}"));
+    }
     conda_override_hint(
-        spec.name.as_exact()?.as_normalized(),
+        name.as_normalized(),
         spec.version.as_ref().and_then(spec_version),
         target,
     )
@@ -282,14 +287,11 @@ fn override_applies_to(name: &str, target: Platform) -> bool {
     }
 }
 
-/// `CONDA_OVERRIDE_*` hint for a version-carrying virtual package the machine
-/// does not provide: the required version when known, a realistic example
-/// otherwise.
-///
-/// `None` when there is no such variable (e.g. `__unix`), or when `target` is a
-/// platform that ignores it. `__archspec` is not here: it is constrained by a
-/// microarchitecture name, so it is hinted at by
-/// [`capability_override_hint`].
+/// `CONDA_OVERRIDE_*` hint for a version-carrying virtual package the machine does
+/// not provide: the required version when known, a realistic example otherwise.
+/// `None` when there is no such variable (e.g. `__unix`) or `target` ignores it.
+/// `__archspec` is constrained by a microarchitecture instead, and hinted at by
+/// [`capability_override_hint`] and [`spec_override_hint`].
 fn conda_override_hint(name: &str, version: Option<&Version>, target: Platform) -> Option<String> {
     let env_var = match name {
         "__glibc" => "CONDA_OVERRIDE_GLIBC",
@@ -450,6 +452,26 @@ mod tests {
 
         let help = e.help().unwrap().to_string();
         assert!(help.contains("CONDA_OVERRIDE_GLIBC=2.28"), "{help}");
+        // The pattern is turned into a microarchitecture that would satisfy it,
+        // not echoed back as something to assign.
+        assert!(help.contains("CONDA_OVERRIDE_ARCHSPEC=skylake"), "{help}");
+    }
+
+    /// An `__archspec` requirement is hinted at with a name the archspec
+    /// database knows, or not at all -- a suggestion pixi can already tell will
+    /// fail again is worse than none.
+    #[test]
+    fn archspec_requirement_suggests_a_known_microarchitecture() {
+        let hint = |raw: &str| spec_override_hint(&spec(raw), Platform::Linux64);
+
+        assert_eq!(
+            hint("__archspec 1 x86_64_v3"),
+            Some("CONDA_OVERRIDE_ARCHSPEC=x86_64_v3".to_string())
+        );
+        assert_eq!(hint("__archspec 1 no_such_cpu"), None);
+        // A bare `__archspec` constrains no microarchitecture, so there is
+        // nothing to suggest.
+        assert_eq!(hint("__archspec"), None);
     }
 
     #[test]

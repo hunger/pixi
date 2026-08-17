@@ -8,7 +8,7 @@ use itertools::Itertools;
 use pixi_default_versions::{
     default_glibc_version, default_linux_version, default_mac_os_version, default_windows_version,
 };
-use rattler_conda_types::{GenericVirtualPackage, PackageName, Platform, Version};
+use rattler_conda_types::{GenericVirtualPackage, PackageName, Platform, StringMatcher, Version};
 use rattler_virtual_packages::{
     Archspec, DetectVirtualPackageError, EnvOverride, Override, VirtualPackageOverrides,
     VirtualPackages,
@@ -946,6 +946,76 @@ pub fn archspec_microarchitecture(build_string: &str) -> Option<&str> {
         None
     } else {
         Some(build_string)
+    }
+}
+
+/// Whether a host reporting `host_build_string` satisfies an `__archspec`
+/// *requirement* whose build matcher is `required`. The requirement names the
+/// baseline a package was built for, so any descendant host can run it: an exact
+/// name goes through the DAG, a pattern is tried against the host and its
+/// ancestors. No matcher constrains nothing; an unknown host matches.
+pub fn archspec_requirement_satisfied(
+    required: Option<&StringMatcher>,
+    host_build_string: &str,
+) -> bool {
+    let Some(required) = required else {
+        return true;
+    };
+    if matches!(
+        archspec_from_build_string(host_build_string),
+        Archspec::Unknown
+    ) {
+        return true;
+    }
+    match required {
+        StringMatcher::Exact(name) => archspec_from_build_string(host_build_string)
+            .is_compatible_with(&archspec_from_build_string(name)),
+        matcher => archspec_pattern_matches(matcher, host_build_string),
+    }
+}
+
+/// Whether `matcher` names the host microarchitecture or any baseline it
+/// descends from. Matching the host name alone would lock out every CPU released
+/// after the pattern was written: a CEP 29 regex enumerates the
+/// microarchitectures its author knew about, and that set only grows.
+fn archspec_pattern_matches(matcher: &StringMatcher, host_build_string: &str) -> bool {
+    if matcher.matches(host_build_string) {
+        return true;
+    }
+    let Archspec::Microarchitecture(host) = archspec_from_build_string(host_build_string) else {
+        return false;
+    };
+    host.ancestors()
+        .iter()
+        .any(|ancestor| matcher.matches(ancestor.name()))
+}
+
+/// Whether `subdir`'s own baseline microarchitecture already satisfies an
+/// `__archspec` requirement whose build matcher is `required`. Running `subdir`
+/// at all implies that baseline, natively or emulated, so such a requirement
+/// says nothing about the host: an Apple Silicon host running `osx-64` under
+/// Rosetta reports `m1`, which no DAG walk relates to `x86_64`.
+pub fn archspec_requirement_is_subdir_baseline(
+    required: Option<&StringMatcher>,
+    subdir: Platform,
+) -> bool {
+    Archspec::from_platform(subdir)
+        .is_some_and(|baseline| archspec_requirement_satisfied(required, baseline.as_str()))
+}
+
+/// A microarchitecture that would satisfy an `__archspec` requirement whose build
+/// matcher is `required`, for a `CONDA_OVERRIDE_ARCHSPEC` suggestion. `None` when
+/// the matcher names nothing the archspec database knows, so pixi suggests
+/// nothing rather than a value it can already tell will fail again. Candidates
+/// are considered in name order to keep the suggestion stable.
+pub fn archspec_override_suggestion(required: Option<&StringMatcher>) -> Option<String> {
+    match required? {
+        StringMatcher::Exact(name) => is_known_archspec_name(name).then(|| name.to_string()),
+        matcher => Microarchitecture::known_targets()
+            .keys()
+            .filter(|name| matcher.matches(name))
+            .min()
+            .cloned(),
     }
 }
 

@@ -474,6 +474,47 @@ def test_refusal_omits_an_override_the_host_platform_ignores(
 
 
 @pytest.mark.parametrize(
+    "requirement",
+    [
+        pytest.param("__archspec 1 x86_64_v3", id="exact"),
+        # The spelling conda-forge's microarch metapackages use.
+        pytest.param("__archspec 1.* ^(x86_64_v3|skylake)$", id="regex"),
+    ],
+)
+def test_run_verifies_an_archspec_requirement_through_the_dag(
+    pixi: Path, tmp_pixi_workspace: Path, dummy_channel_1: str, requirement: str
+) -> None:
+    """A recorded ``__archspec`` requirement is the baseline the installed
+    packages were built for, so the machine has to be that microarchitecture or
+    descend from it. A host below the baseline is refused, and told a
+    microarchitecture that would work."""
+    manifest = _bare_manifest(tmp_pixi_workspace, dummy_channel_1, deps='dummy-a = "*"')
+    _install(pixi, manifest)
+    _patch_marker(
+        tmp_pixi_workspace,
+        resolved_platform=_UNSATISFIABLE_RESOLVED,
+        minimum_supported_platform={
+            "subdir": CURRENT_PLATFORM,
+            "requirements": [requirement],
+        },
+    )
+
+    refusal = verify_cli_command(
+        [pixi, "run", "--manifest-path", manifest, "hello"],
+        ExitCode.FAILURE,
+        env={"CONDA_OVERRIDE_ARCHSPEC": "nocona"},
+        stderr_contains=["CONDA_OVERRIDE_ARCHSPEC="],
+    )
+    # Following the suggested microarchitecture has to unblock the run, so the
+    # hint names one that actually satisfies the requirement.
+    suggested = next(
+        line.strip() for line in refusal.stderr.splitlines() if "CONDA_OVERRIDE_ARCHSPEC=" in line
+    )
+    key, _, value = suggested.partition("=")
+    _run(pixi, manifest, ExitCode.SUCCESS, env={key: value}, stdout_contains="TASK-RAN")
+
+
+@pytest.mark.parametrize(
     ("name", "env_var"),
     [
         pytest.param("__cuda", "CONDA_OVERRIDE_CUDA", id="cuda"),

@@ -204,7 +204,7 @@ pub fn minimum_compatible_declared_platform<'p>(
         // only content is tasks still runs under an unsatisfiable requirement.
         let unsatisfied = required
             .get(subdir)
-            .map(|specs| unmet_requirements(specs, &system_virtual_packages))
+            .map(|specs| unmet_requirements(specs, &system_virtual_packages, *subdir))
             .unwrap_or_default();
         if unsatisfied.is_empty() {
             if let Some(declared) = declared_platforms
@@ -300,7 +300,8 @@ fn classify_run_platform(
     minimum: &RequiredPlatform,
 ) -> RunPlatformVerdict {
     let unmet_resolved = unsatisfied_capabilities(resolved.virtual_packages(), base_capabilities);
-    let unmet_minimum = unmet_requirements(minimum.requirements(), base_capabilities);
+    let unmet_minimum =
+        unmet_requirements(minimum.requirements(), base_capabilities, minimum.subdir());
     let meets_resolved = base_subdirs.contains(&resolved.subdir()) && unmet_resolved.is_empty();
     let meets_minimum = base_subdirs.contains(&minimum.subdir()) && unmet_minimum.is_empty();
 
