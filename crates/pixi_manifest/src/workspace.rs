@@ -18,7 +18,7 @@ use super::pypi::pypi_options::PypiOptions;
 use crate::{
     PixiPlatform, PixiPlatformName, PrioritizedChannel, S3Options, TargetSelector, Targets,
     platform::{
-        capability_satisfied_by, is_subdir_default, same_virtual_package,
+        capability_satisfied_by, is_same_virtual_package, is_subdir_default,
         warn_once_if_archspec_undetectable,
     },
     preview::Preview,
@@ -241,7 +241,7 @@ impl Workspace {
                 // platforms asking for different CPUs would collapse into one.
                 if !unsatisfied
                     .iter()
-                    .any(|seen| same_virtual_package(seen, &declared))
+                    .any(|seen| is_same_virtual_package(seen, &declared))
                 {
                     unsatisfied.push(declared);
                 }

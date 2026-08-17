@@ -868,40 +868,46 @@ pub fn normalize_virtual_packages(
         .collect()
 }
 
-/// Returns `true` when `a` and `b` declare the same capability
-/// `__archspec` compares by microarchitecture alone, since CEP 30 makes its
-/// version a provenance marker (`0` for a baseline pixi assumed
-/// from the subdir, `1` for one rattler detected on the host).
+/// Returns `true` when `a` and `b` declare the same capability -- the identity
+/// used for duplicate detection, subdir-default filtering and lock-file
+/// satisfiability. `__archspec` compares by microarchitecture alone, since CEP 30
+/// makes its version a provenance marker rather than a constraint.
 pub fn is_same_virtual_package(a: &GenericVirtualPackage, b: &GenericVirtualPackage) -> bool {
-    if a.name != b.name {
-        return false;
-    }
-    if is_archspec(&a.name) {
-        archspec_microarchitecture(&a.build_string) == archspec_microarchitecture(&b.build_string)
-    } else {
-        a.version == b.version
-            && (a.build_string == b.build_string
-                || is_placeholder_build_string(&a.build_string)
-                    && is_placeholder_build_string(&b.build_string))
-    }
+    virtual_package_identity(a) == virtual_package_identity(b)
 }
 
 /// Returns `true` when `a` and `b` declare the same capabilities, compared as
 /// multi-sets with [`is_same_virtual_package`]: order is never part of a platform's
 /// identity, in a manifest or in a lock file.
 pub fn is_same_virtual_packages(a: &[GenericVirtualPackage], b: &[GenericVirtualPackage]) -> bool {
-    fn by_name(packages: &[GenericVirtualPackage]) -> Vec<&GenericVirtualPackage> {
+    // Sorting by name alone leaves same-named entries in input order, which pairs
+    // them up wrongly, so compare the sorted identities instead.
+    fn identities(packages: &[GenericVirtualPackage]) -> Vec<String> {
         packages
             .iter()
-            .sorted_by(|a, b| a.name.as_normalized().cmp(b.name.as_normalized()))
+            .map(virtual_package_identity)
+            .sorted()
             .collect_vec()
     }
 
-    a.len() == b.len()
-        && by_name(a)
-            .into_iter()
-            .zip(by_name(b))
-            .all(|(a, b)| is_same_virtual_package(a, b))
+    a.len() == b.len() && identities(a) == identities(b)
+}
+
+/// The identity [`is_same_virtual_package`] compares: a string that is equal for
+/// two records exactly when they declare the same capability.
+fn virtual_package_identity(gvp: &GenericVirtualPackage) -> String {
+    let name = gvp.name.as_normalized();
+    if is_archspec(&gvp.name) {
+        // The microarchitecture is the whole identity; the CEP 30 version is
+        // provenance, and the two unknown spellings mean the same thing.
+        let microarchitecture =
+            archspec_microarchitecture(&gvp.build_string).unwrap_or(UNKNOWN_ARCHSPEC);
+        return format!("{name}={microarchitecture}");
+    }
+    if is_placeholder_build_string(&gvp.build_string) {
+        return format!("{name}={}", gvp.version);
+    }
+    format!("{name}={}={}", gvp.version, gvp.build_string)
 }
 
 /// Returns `true` when `system` provides the capability `required`.
@@ -1554,6 +1560,24 @@ mod tests {
             undetectable_archspec(&declares_v4, &unknown_host),
             Some("x86_64_v4"),
         );
+    }
+
+    /// `is_same_virtual_packages` says it compares multi-sets, so entries in a
+    /// different order have to compare equal even when two share a name -- a
+    /// pairwise walk over name-sorted lists does not give that on its own.
+    #[test]
+    fn is_same_virtual_packages_compares_multisets() {
+        let a = [gvp("__cuda", "11"), gvp("__cuda", "12")];
+        let b = [gvp("__cuda", "12"), gvp("__cuda", "11")];
+
+        assert!(is_same_virtual_packages(&a, &b));
+        assert!(is_same_virtual_packages(&b, &a));
+        // Still a comparison: a genuinely different multi-set is not equal.
+        assert!(!is_same_virtual_packages(
+            &a,
+            &[gvp("__cuda", "12"), gvp("__cuda", "13")]
+        ));
+        assert!(!is_same_virtual_packages(&a, &[gvp("__cuda", "11")]));
     }
 
     #[test]
