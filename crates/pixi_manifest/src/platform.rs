@@ -1001,7 +1001,8 @@ pub fn archspec_microarchitecture(build_string: &str) -> Option<&str> {
 /// *requirement* whose build matcher is `required`. The requirement names the
 /// baseline a package was built for, so any descendant host can run it: an exact
 /// name goes through the DAG, a pattern is tried against the host and its
-/// ancestors. No matcher constrains nothing; an unknown host matches.
+/// ancestors. No matcher constrains nothing; so does one naming nothing the
+/// archspec database knows, and so does an unknown host.
 pub fn archspec_requirement_satisfied(
     required: Option<&StringMatcher>,
     host_build_string: &str,
@@ -1009,6 +1010,9 @@ pub fn archspec_requirement_satisfied(
     let Some(required) = required else {
         return true;
     };
+    if !archspec_requirement_is_known(required) {
+        return true;
+    }
     let host = archspec_from_build_string(host_build_string);
     match host {
         Archspec::Unknown => true,
@@ -1018,6 +1022,24 @@ pub fn archspec_requirement_satisfied(
             }
             matcher => archspec_pattern_matches(matcher, host_build_string),
         },
+    }
+}
+
+/// Whether `required` names at least one microarchitecture the bundled archspec
+/// database knows.
+///
+/// A requirement that names none cannot be evaluated: pixi cannot tell a host
+/// that satisfies it from one that does not, and has no name to offer for
+/// `CONDA_OVERRIDE_ARCHSPEC`. Enforcing it would strand every install of a
+/// package built for a CPU newer than the database pixi ships. This is the one
+/// question both spellings must agree on -- otherwise `some_new_cpu` and
+/// `^(some_new_cpu)$` decide the same requirement differently.
+fn archspec_requirement_is_known(required: &StringMatcher) -> bool {
+    match required {
+        StringMatcher::Exact(name) => is_known_archspec_name(name),
+        matcher => Microarchitecture::known_targets()
+            .keys()
+            .any(|name| matcher.matches(name)),
     }
 }
 
@@ -1329,6 +1351,56 @@ mod tests {
             name: PackageName::try_from("__archspec").unwrap(),
             version: Version::major(version),
             build_string: microarchitecture.to_string(),
+        }
+    }
+
+    /// A requirement naming a microarchitecture the bundled database is too old
+    /// to know constrains nothing, whichever way it is spelled. The alternative
+    /// is a dead end: pixi cannot tell such a host from an incompatible one, and
+    /// has no `CONDA_OVERRIDE_ARCHSPEC` value to suggest.
+    #[test]
+    fn an_unknown_required_microarchitecture_constrains_nothing() {
+        let matcher = |raw: &str| StringMatcher::from_str(raw).unwrap();
+        let unknown = ["brand_new_cpu", "^(brand_new_cpu)$", "brand_new_cpu*"];
+
+        for raw in unknown {
+            let matcher = matcher(raw);
+            assert!(
+                archspec_requirement_satisfied(Some(&matcher), "skylake"),
+                "'{raw}' names nothing the archspec database knows, so it cannot refuse a host"
+            );
+            assert_eq!(
+                archspec_override_suggestion(Some(&matcher)),
+                None,
+                "'{raw}' has no satisfying microarchitecture to suggest"
+            );
+        }
+
+        // A requirement the database does know still discriminates, in both
+        // spellings.
+        for raw in ["x86_64_v4", "^(x86_64_v4)$"] {
+            let matcher = matcher(raw);
+            assert!(
+                !archspec_requirement_satisfied(Some(&matcher), "skylake"),
+                "'{raw}' is above what a skylake host provides"
+            );
+            assert!(archspec_requirement_satisfied(Some(&matcher), "zen5"));
+        }
+
+        // The invariant the two halves owe each other: a requirement pixi is
+        // willing to refuse always has a microarchitecture to suggest, so a
+        // refusal is never a dead end.
+        for raw in unknown
+            .iter()
+            .chain(&["x86_64_v4", "^(x86_64_v4)$", "zen*", "*"])
+        {
+            let matcher = matcher(raw);
+            if !archspec_requirement_satisfied(Some(&matcher), "skylake") {
+                assert!(
+                    archspec_override_suggestion(Some(&matcher)).is_some(),
+                    "'{raw}' is refused on a skylake host with nothing to suggest"
+                );
+            }
         }
     }
 
