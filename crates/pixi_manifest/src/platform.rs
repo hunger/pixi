@@ -794,11 +794,14 @@ pub fn subdir_default_virtual_packages(subdir: Platform) -> Vec<GenericVirtualPa
     if subdir.is_osx() {
         defaults.push(version_pkg("__osx", default_mac_os_version(subdir)));
     }
-    if let Some(spec) = Archspec::from_platform(subdir) {
+    // Only a baseline the archspec database models: pixi cannot compare an
+    // invented node against anything, and `validate_archspec_name` would reject
+    // the very name it materialised.
+    if let Some(baseline) = subdir_baseline_microarchitecture(subdir) {
         defaults.push(normalize_virtual_package(GenericVirtualPackage {
             name: PackageName::try_from("__archspec").expect("static virtual-package name"),
             version: Version::major(0),
-            build_string: spec.as_str().to_string(),
+            build_string: baseline.to_string(),
         }));
     }
 
@@ -1064,12 +1067,37 @@ fn archspec_pattern_matches(matcher: &StringMatcher, host_build_string: &str) ->
 /// at all implies that baseline, natively or emulated, so such a requirement
 /// says nothing about the host: an Apple Silicon host running `osx-64` under
 /// Rosetta reports `m1`, which no DAG walk relates to `x86_64`.
+///
+/// Answers `false` unless the requirement actually names a microarchitecture and
+/// the baseline is one the archspec database models, so the exemption can only
+/// ever discharge a requirement it has really compared.
 pub fn archspec_requirement_is_subdir_baseline(
     required: Option<&StringMatcher>,
     subdir: Platform,
 ) -> bool {
-    Archspec::from_platform(subdir)
-        .is_some_and(|baseline| archspec_requirement_satisfied(required, baseline.as_str()))
+    let Some(required) = required else {
+        return false;
+    };
+    subdir_baseline_microarchitecture(subdir)
+        .is_some_and(|baseline| archspec_requirement_satisfied(Some(required), baseline))
+}
+
+/// The baseline microarchitecture running `subdir` implies, when the archspec
+/// database models it.
+///
+/// `Archspec::from_platform` invents a parentless node for a name the database
+/// lacks (`s390x`, `riscv32`, `loongarch64`), which relates to nothing in the DAG
+/// and therefore cannot stand in for a real baseline. On those subdirs pixi has
+/// no microarchitecture to reason with, and says so by returning `None` rather
+/// than a node that silently matches everything.
+pub fn subdir_baseline_microarchitecture(subdir: Platform) -> Option<&'static str> {
+    let baseline = Archspec::from_platform(subdir)?;
+    let Archspec::Microarchitecture(baseline) = baseline else {
+        return None;
+    };
+    Microarchitecture::known_targets()
+        .get_key_value(baseline.name())
+        .map(|(name, _)| name.as_str())
 }
 
 /// A microarchitecture that would satisfy an `__archspec` requirement whose build

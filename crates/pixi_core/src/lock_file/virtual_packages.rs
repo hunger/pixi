@@ -576,6 +576,60 @@ packages:
         );
     }
 
+    /// The subdir-baseline exemption answers "does running this subdir already
+    /// imply the requirement?". A requirement that names no microarchitecture
+    /// implies nothing about the subdir, so it must fall through to the host and
+    /// be treated as a presence check, exactly as a bare `__cuda` is.
+    #[test]
+    fn bare_archspec_requirement_asks_for_presence() {
+        let spec = |raw: &str| {
+            MatchSpec::from_str(raw, rattler_conda_types::ParseStrictness::Lenient).unwrap()
+        };
+        let host = |name: &str, microarchitecture: &str| {
+            vec![GenericVirtualPackage {
+                name: rattler_conda_types::PackageName::try_from(name).unwrap(),
+                version: rattler_conda_types::Version::major(1),
+                build_string: microarchitecture.to_string(),
+            }]
+        };
+
+        assert!(
+            unmet_requirements(
+                &[spec("__archspec")],
+                &host("__archspec", "skylake"),
+                Platform::Linux64
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            unmet_requirements(&[spec("__archspec")], &[], Platform::Linux64).len(),
+            1,
+            "a machine reporting no `__archspec` at all does not provide one"
+        );
+        // The control: `__cuda` has always behaved this way.
+        assert_eq!(
+            unmet_requirements(&[spec("__cuda")], &[], Platform::Linux64).len(),
+            1
+        );
+    }
+
+    /// On a subdir whose baseline the archspec database does not model
+    /// (`linux-s390x`, `linux-riscv32`, `linux-loong64`), the exemption must not
+    /// swallow every requirement -- that would disable the check entirely, with
+    /// nothing said about it.
+    #[test]
+    fn unmodelled_subdir_baseline_does_not_exempt_every_requirement() {
+        let spec = |raw: &str| {
+            MatchSpec::from_str(raw, rattler_conda_types::ParseStrictness::Lenient).unwrap()
+        };
+
+        assert_eq!(
+            unmet_requirements(&[spec("__archspec 1 z15")], &[], Platform::LinuxS390X).len(),
+            1,
+            "an s390x baseline pixi cannot model must not wave the requirement through"
+        );
+    }
+
     /// An `__archspec` requirement names the baseline a package was built for,
     /// so it is read through the microarchitecture DAG rather than as a literal
     /// build string, and its version -- CEP 30 provenance -- is ignored.
