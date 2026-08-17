@@ -11,7 +11,9 @@ use fancy_display::FancyDisplay;
 use miette::Diagnostic;
 use pixi_manifest::{
     EnvironmentName, FeaturesExt, HasWorkspaceManifest, PixiPlatform, PixiPlatformName,
-    platform::{archspec_from_build_string, unsatisfied_capabilities},
+    platform::{
+        archspec_from_build_string, archspec_microarchitecture_of, unsatisfied_capabilities,
+    },
 };
 use rattler_conda_types::{GenericVirtualPackage, MatchSpec, Platform};
 use rattler_lock::LockFile;
@@ -348,11 +350,11 @@ fn describe_resolution_gap(
     let requirements = unmet
         .iter()
         .map(|required| {
-            format!(
-                "{} >={}",
-                required.name.as_normalized().trim_start_matches('_'),
-                required.version
-            )
+            let key = required.name.as_normalized().trim_start_matches('_');
+            match archspec_microarchitecture_of(required) {
+                Some(microarchitecture) => format!("{key} {microarchitecture}"),
+                None => format!("{key} >={}", required.version),
+            }
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -363,7 +365,8 @@ fn describe_resolution_gap(
                 Some(sys) => format!(
                     "only provides '{} {}'",
                     sys.name.as_normalized(),
-                    sys.version
+                    archspec_microarchitecture_of(sys)
+                        .map_or_else(|| sys.version.to_string(), ToString::to_string)
                 ),
                 None => format!("does not provide '{}'", required.name.as_normalized()),
             },

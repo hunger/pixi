@@ -949,6 +949,14 @@ pub fn archspec_microarchitecture(build_string: &str) -> Option<&str> {
     }
 }
 
+/// The microarchitecture an `__archspec` record names, or `None` for any other
+/// virtual package (and for an explicitly unknown microarchitecture).
+pub fn archspec_microarchitecture_of(package: &GenericVirtualPackage) -> Option<&str> {
+    is_archspec(&package.name)
+        .then(|| archspec_microarchitecture(&package.build_string))
+        .flatten()
+}
+
 /// Map an `__archspec` build string to rattler's typed [`Archspec`]. A name the
 /// archspec database doesn't know maps to [`Archspec::Unknown`].
 pub fn archspec_from_build_string(build_string: &str) -> Archspec {

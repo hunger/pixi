@@ -3,7 +3,10 @@ use crate::lock_file::virtual_packages::spec_version;
 use fancy_display::FancyDisplay;
 use itertools::Itertools;
 use miette::{Diagnostic, LabeledSpan};
-use pixi_manifest::{EnvironmentName, PixiPlatformName, PlatformMatchDiagnosis, TaskName};
+use pixi_manifest::{
+    EnvironmentName, PixiPlatformName, PlatformMatchDiagnosis, TaskName,
+    platform::{archspec_microarchitecture, is_archspec},
+};
 use rattler_conda_types::{GenericVirtualPackage, MatchSpec, Platform, Version};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -164,9 +167,10 @@ impl Diagnostic for UnsupportedPlatformError {
     fn help(&self) -> Option<Box<dyn Display + '_>> {
         // Both kinds can be mocked the same way, so the hints are pooled --
         // but each reads its own shape to find the name and version.
-        let declared = self.unsatisfied_requirements.iter().filter_map(|req| {
-            conda_override_hint(req.name.as_normalized(), Some(&req.version), self.platform)
-        });
+        let declared = self
+            .unsatisfied_requirements
+            .iter()
+            .filter_map(|req| capability_override_hint(req, self.platform));
         let required = self
             .unmet_requirements
             .iter()
@@ -199,17 +203,29 @@ impl Diagnostic for UnsupportedPlatformError {
 }
 
 fn format_requirements(reqs: &[GenericVirtualPackage]) -> String {
-    reqs.iter()
-        .map(|r| {
-            // Version 0 encodes a version-less requirement (a bare `__cuda`
-            // dependency): the package must be present at any version.
-            if r.version == Version::major(0) {
-                format!("{} (any version)", r.name.as_normalized())
-            } else {
-                format!("{} >= {}", r.name.as_normalized(), r.version)
-            }
-        })
-        .join(", ")
+    reqs.iter().map(format_requirement).join(", ")
+}
+
+/// Render one declared capability the machine does not provide.
+///
+/// `__archspec` reads as the microarchitecture it names -- its version is CEP 30
+/// provenance metadata, so rendering it as a version bound would name a
+/// constraint the platform never made.
+fn format_requirement(required: &GenericVirtualPackage) -> String {
+    let name = required.name.as_normalized();
+    if is_archspec(&required.name) {
+        return match archspec_microarchitecture(&required.build_string) {
+            Some(microarchitecture) => format!("{name} = {microarchitecture}"),
+            None => format!("{name} (unknown microarchitecture)"),
+        };
+    }
+    // Version 0 encodes a version-less requirement (a bare `__cuda`
+    // dependency): the package must be present at any version.
+    if required.version == Version::major(0) {
+        format!("{name} (any version)")
+    } else {
+        format!("{name} >= {}", required.version)
+    }
 }
 
 /// Render lock-derived requirements.
@@ -223,6 +239,24 @@ pub(crate) fn spec_override_hint(spec: &MatchSpec, target: Platform) -> Option<S
     conda_override_hint(
         spec.name.as_exact()?.as_normalized(),
         spec.version.as_ref().and_then(spec_version),
+        target,
+    )
+}
+
+/// `CONDA_OVERRIDE_*` hint for a declared capability the machine does not
+/// provide. `__archspec` is named by its microarchitecture rather than a
+/// version; everything else routes through [`conda_override_hint`].
+pub(crate) fn capability_override_hint(
+    required: &GenericVirtualPackage,
+    target: Platform,
+) -> Option<String> {
+    if is_archspec(&required.name) {
+        return archspec_microarchitecture(&required.build_string)
+            .map(|microarchitecture| format!("CONDA_OVERRIDE_ARCHSPEC={microarchitecture}"));
+    }
+    conda_override_hint(
+        required.name.as_normalized(),
+        Some(&required.version),
         target,
     )
 }
@@ -248,23 +282,21 @@ fn override_applies_to(name: &str, target: Platform) -> bool {
     }
 }
 
-/// `CONDA_OVERRIDE_*` hint for a virtual package the machine does not provide:
-/// the required version when known, a realistic example otherwise.
+/// `CONDA_OVERRIDE_*` hint for a version-carrying virtual package the machine
+/// does not provide: the required version when known, a realistic example
+/// otherwise.
 ///
 /// `None` when there is no such variable (e.g. `__unix`), or when `target` is a
-/// platform that ignores it
-pub(crate) fn conda_override_hint(
-    name: &str,
-    version: Option<&Version>,
-    target: Platform,
-) -> Option<String> {
+/// platform that ignores it. `__archspec` is not here: it is constrained by a
+/// microarchitecture name, so it is hinted at by
+/// [`capability_override_hint`].
+fn conda_override_hint(name: &str, version: Option<&Version>, target: Platform) -> Option<String> {
     let env_var = match name {
         "__glibc" => "CONDA_OVERRIDE_GLIBC",
         "__cuda" => "CONDA_OVERRIDE_CUDA",
         "__osx" => "CONDA_OVERRIDE_OSX",
         "__linux" => "CONDA_OVERRIDE_LINUX",
         "__win" => "CONDA_OVERRIDE_WIN",
-        "__archspec" => "CONDA_OVERRIDE_ARCHSPEC",
         _ => return None,
     };
     if !override_applies_to(name, target) {
@@ -357,6 +389,25 @@ mod tests {
         let help = e.help().unwrap().to_string();
         assert!(help.contains("CONDA_OVERRIDE_CUDA=11"), "{help}");
         assert!(help.contains("pixi install --platform"), "{help}");
+    }
+
+    /// A microarchitecture mismatch has to say which microarchitecture, and the
+    /// override that mocks it has to name one too -- the version an
+    /// `__archspec` record carries is provenance metadata, useless in both
+    /// places.
+    #[test]
+    fn missing_archspec_names_the_microarchitecture() {
+        let e = err(vec![GenericVirtualPackage {
+            build_string: "skylake".to_string(),
+            ..vp("__archspec", "0")
+        }]);
+        let display = e.to_string();
+        assert!(
+            display.contains("Unsatisfied requirements: __archspec = skylake"),
+            "{display}"
+        );
+        let help = e.help().unwrap().to_string();
+        assert!(help.contains("CONDA_OVERRIDE_ARCHSPEC=skylake"), "{help}");
     }
 
     #[test]
