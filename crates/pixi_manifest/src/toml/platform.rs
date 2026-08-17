@@ -105,8 +105,8 @@ enum VirtualPackageValueKind {
     /// `build_string` is left empty.
     Version,
     /// The value is a microarchitecture string and lands in `build_string`;
-    /// `version` is forced to `0`, the CEP 30 provenance marker for a
-    /// microarchitecture pixi was told about rather than one it detected.
+    /// `version` is the CEP 30 provenance marker
+    /// [`crate::platform::archspec_version`] derives from it.
     Microarch,
 }
 
@@ -427,7 +427,7 @@ fn build_friendly_virtual_package(
             })?;
             Ok(GenericVirtualPackage {
                 name: package_name,
-                version: Version::major(0),
+                version: crate::platform::archspec_version(&raw.value),
                 build_string: raw.value.clone(),
             })
         }
@@ -705,11 +705,24 @@ fn render_cuda_table(driver: &str, arch: &str) -> String {
 /// Render a classified `key`/`value` pair. A version-0 entry (`value == "0"`)
 /// renders as just the key (`__unix`, `glibc`); otherwise `key=value`.
 fn render_key_value(key: &str, value: &str) -> String {
-    if value == "0" {
+    if value == "0" && !value_zero_is_meaningful(key) {
         key.to_string()
     } else {
         format!("{key}={value}")
     }
+}
+
+/// Whether a `"0"` value carries meaning for `key` rather than standing in for
+/// "no version": `archspec = "0"` names the unknown microarchitecture, so it must
+/// not collapse to a bare key the way `__unix` does.
+fn value_zero_is_meaningful(key: &str) -> bool {
+    FRIENDLY_VIRTUAL_PACKAGES
+        .iter()
+        .filter(|entry| entry.key == key)
+        .any(|entry| match entry.kind {
+            VirtualPackageValueKind::Microarch => true,
+            VirtualPackageValueKind::Version => false,
+        })
 }
 
 /// Build the canonical auto-derived name for `(subdir, declared)`.
@@ -811,9 +824,7 @@ fn classify_virtual_packages(
             }
             // The version is CEP 30 provenance metadata, so a host-detected
             // `__archspec=1=zen4` still renders as `archspec = "zen4"`.
-            VirtualPackageValueKind::Microarch => {
-                crate::platform::archspec_microarchitecture(&package.build_string).is_some()
-            }
+            VirtualPackageValueKind::Microarch => true,
         };
         if !fits {
             // Odd shape: don't take the friendly slot; fall through to raw.
@@ -821,7 +832,13 @@ fn classify_virtual_packages(
         }
         let value = match entry.kind {
             VirtualPackageValueKind::Version => package.version.to_string(),
-            VirtualPackageValueKind::Microarch => package.build_string.clone(),
+            // An unknown microarchitecture is spelled `"0"`, the form the
+            // `archspec` key reads back as unknown.
+            VirtualPackageValueKind::Microarch => {
+                crate::platform::archspec_microarchitecture(&package.build_string)
+                    .unwrap_or(crate::platform::UNKNOWN_ARCHSPEC)
+                    .to_string()
+            }
         };
         consumed.insert(entry.conda_name);
         friendly.push((entry.key, value));
@@ -1120,7 +1137,7 @@ mod test {
                 "__glibc=2.28".to_string(),
                 "__unix=0".to_string(),
                 "__linux=4.18".to_string(),
-                "__archspec=0=x86_64".to_string(),
+                "__archspec=1=x86_64".to_string(),
             ]
         );
         // `glibc = "2.28"` matches the linux-64 default and is elided from the
@@ -1136,7 +1153,8 @@ mod test {
         .unwrap();
         let package = &parsed.platform.declared_virtual_packages()[0];
         assert_eq!(package.name.as_normalized(), "__archspec");
-        assert_eq!(package.version, Version::major(0));
+        // CEP 30: version 1 for a microarchitecture the database knows.
+        assert_eq!(package.version, Version::major(1));
         assert_eq!(package.build_string, "x86_64_v3");
         // The synthesised name sanitises the underscores into dashes.
         assert_eq!(
@@ -1204,7 +1222,7 @@ mod test {
                 "__unix=0".to_string(),
                 "__linux=4.18".to_string(),
                 "__glibc=2.28".to_string(),
-                "__archspec=0=aarch64".to_string(),
+                "__archspec=1=aarch64".to_string(),
             ]
         );
     }
@@ -1259,7 +1277,7 @@ mod test {
                 "__unix=0".to_string(),
                 "__linux=4.18".to_string(),
                 "__glibc=2.28".to_string(),
-                "__archspec=0=x86_64".to_string(),
+                "__archspec=1=x86_64".to_string(),
             ]
         );
         assert_eq!(parsed.platform.name().as_str(), "linux-64-future-pkg-1-2");
@@ -1282,7 +1300,7 @@ mod test {
                 "__unix=0".to_string(),
                 "__linux=4.18".to_string(),
                 "__glibc=2.28".to_string(),
-                "__archspec=0=x86_64".to_string(),
+                "__archspec=1=x86_64".to_string(),
             ]
         );
         assert_eq!(
@@ -1544,6 +1562,39 @@ mod test {
                 "platform": "linux-64",
                 "archspec": "x86_64_v3",
             }),
+        );
+    }
+
+    /// An explicitly unknown microarchitecture keeps the friendly key too, and
+    /// keeps its `"0"` -- collapsing it to a bare `archspec` the way a version-0
+    /// entry collapses would lose the value the key reads back.
+    #[test]
+    fn test_serialize_unknown_archspec_keeps_the_friendly_key() {
+        let platform = platform_with_packages(
+            "linux-64-archspec-0",
+            Platform::Linux64,
+            vec![archspec_virtual_package("0")],
+        );
+        let json = serde_json::to_value(TomlPixiPlatform(platform)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "platform": "linux-64",
+                "archspec": "0",
+            }),
+        );
+        let rendered = inline_virtual_package_specs(
+            platform_with_packages(
+                "linux-64-archspec-0",
+                Platform::Linux64,
+                vec![archspec_virtual_package("0")],
+            )
+            .declared_virtual_packages(),
+            Some(&subdir_default_virtual_packages(Platform::Linux64)),
+        );
+        assert_eq!(
+            rendered.iter().map(|e| e.rendered.clone()).collect_vec(),
+            vec!["archspec=0"]
         );
     }
 

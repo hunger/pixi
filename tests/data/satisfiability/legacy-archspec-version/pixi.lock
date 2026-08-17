@@ -1,14 +1,13 @@
 version: 7
 platforms:
-# `__archspec=1` is the CEP 30 provenance version rattler's detection stamps on
-# a microarchitecture it recognises, and what pixi wrote for a detected platform
-# before the manifest gained the friendly `archspec` key for it. The version is
-# not part of the platform's identity, so this lock still satisfies a manifest
-# declaring the same microarchitecture.
+# `__archspec=0=skylake` is what pixi wrote before it stamped the CEP 30
+# provenance version (`1` for a microarchitecture the archspec database knows).
+# The version is not part of a platform's identity, so this lock still satisfies
+# a manifest declaring the same microarchitecture and does not force a re-solve.
 - name: fast
   subdir: linux-64
   virtual-packages:
-  - __archspec=1=skylake
+  - __archspec=0=skylake
 environments:
   default:
     channels:

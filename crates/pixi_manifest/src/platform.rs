@@ -419,6 +419,7 @@ impl PixiPlatform {
         subdir: Platform,
         declared_virtual_packages: Vec<GenericVirtualPackage>,
     ) -> Result<Self, PixiPlatformError> {
+        let declared_virtual_packages = normalize_virtual_packages(declared_virtual_packages);
         if name.as_str() == subdir.as_str()
             && declared_virtual_packages != subdir_default_virtual_packages(subdir)
         {
@@ -469,6 +470,7 @@ impl PixiPlatform {
         subdir: Platform,
         virtual_packages: Vec<GenericVirtualPackage>,
     ) -> Self {
+        let virtual_packages = normalize_virtual_packages(virtual_packages);
         let name = PixiPlatformName(crate::toml::platform::synthesize_name_string(
             subdir,
             &virtual_packages,
@@ -492,6 +494,9 @@ impl PixiPlatform {
         subdir: Platform,
         customised_virtual_packages: Vec<GenericVirtualPackage>,
     ) -> Result<Self, PixiPlatformError> {
+        // Normalised up front so a detected `__archspec=1=zen4` synthesises the
+        // same name a manifest's `archspec = "zen4"` does.
+        let customised_virtual_packages = normalize_virtual_packages(customised_virtual_packages);
         let name = name.unwrap_or_else(|| {
             PixiPlatformName(crate::toml::platform::synthesize_name_string(
                 subdir,
@@ -530,7 +535,7 @@ impl PixiPlatform {
         if self.is_subdir_platform() {
             Err(PixiPlatformError::IsSubdirPlatform)
         } else {
-            self.declared_virtual_packages = declared_virtual_packages;
+            self.declared_virtual_packages = normalize_virtual_packages(declared_virtual_packages);
             Ok(())
         }
     }
@@ -635,6 +640,7 @@ impl PixiPlatform {
         }
 
         for upsert in edit.insert_or_update_virtual_packages {
+            let upsert = normalize_virtual_package(upsert);
             if let Some(existing) = self
                 .declared_virtual_packages
                 .iter_mut()
@@ -783,11 +789,11 @@ pub fn subdir_default_virtual_packages(subdir: Platform) -> Vec<GenericVirtualPa
         defaults.push(version_pkg("__osx", default_mac_os_version(subdir)));
     }
     if let Some(spec) = Archspec::from_platform(subdir) {
-        defaults.push(GenericVirtualPackage {
+        defaults.push(normalize_virtual_package(GenericVirtualPackage {
             name: PackageName::try_from("__archspec").expect("static virtual-package name"),
             version: Version::major(0),
             build_string: spec.as_str().to_string(),
-        });
+        }));
     }
 
     defaults
@@ -805,6 +811,10 @@ pub fn is_subdir_default(gvp: &GenericVirtualPackage, subdir: Platform) -> bool 
 /// build information
 const PLACEHOLDER_BUILD_STRING: &str = "0";
 
+/// The `archspec` value that spells "unknown microarchitecture", both in a
+/// manifest and as rattler's serialization of [`Archspec::Unknown`].
+pub const UNKNOWN_ARCHSPEC: &str = PLACEHOLDER_BUILD_STRING;
+
 /// `true` when `build_string` carries no build information.
 fn is_placeholder_build_string(build_string: &str) -> bool {
     build_string.is_empty() || build_string == PLACEHOLDER_BUILD_STRING
@@ -814,6 +824,38 @@ fn is_placeholder_build_string(build_string: &str) -> bool {
 /// microarchitecture instead of describing a build.
 pub fn is_archspec(name: &PackageName) -> bool {
     name.as_normalized() == "__archspec"
+}
+
+/// The version CEP 30 gives an `__archspec` record: `1` when its build string
+/// names a microarchitecture the archspec database knows, `0` when it encodes an
+/// unknown one. The version is provenance, never a constraint.
+pub fn archspec_version(build_string: &str) -> Version {
+    match archspec_microarchitecture(build_string) {
+        Some(name) if is_known_archspec_name(name) => Version::major(1),
+        _ => Version::major(0),
+    }
+}
+
+/// Stamp the CEP 30 version on an `__archspec` record and pass every other
+/// virtual package through untouched. Every way a record enters a
+/// [`PixiPlatform`] funnels through here, so the friendly `archspec = "skylake"`,
+/// a raw `__archspec = "0=skylake"` and rattler's detected `__archspec=1=skylake`
+/// all end up as one record.
+pub fn normalize_virtual_package(mut gvp: GenericVirtualPackage) -> GenericVirtualPackage {
+    if is_archspec(&gvp.name) {
+        gvp.version = archspec_version(&gvp.build_string);
+    }
+    gvp
+}
+
+/// [`normalize_virtual_package`] over a declared set.
+pub fn normalize_virtual_packages(
+    declared: Vec<GenericVirtualPackage>,
+) -> Vec<GenericVirtualPackage> {
+    declared
+        .into_iter()
+        .map(normalize_virtual_package)
+        .collect()
 }
 
 /// Returns `true` when `a` and `b` declare the same capability
@@ -961,16 +1003,15 @@ pub fn archspec_requirement_satisfied(
     let Some(required) = required else {
         return true;
     };
-    if matches!(
-        archspec_from_build_string(host_build_string),
-        Archspec::Unknown
-    ) {
-        return true;
-    }
-    match required {
-        StringMatcher::Exact(name) => archspec_from_build_string(host_build_string)
-            .is_compatible_with(&archspec_from_build_string(name)),
-        matcher => archspec_pattern_matches(matcher, host_build_string),
+    let host = archspec_from_build_string(host_build_string);
+    match host {
+        Archspec::Unknown => true,
+        Archspec::Microarchitecture(_) => match required {
+            StringMatcher::Exact(name) => {
+                host.is_compatible_with(&archspec_from_build_string(name))
+            }
+            matcher => archspec_pattern_matches(matcher, host_build_string),
+        },
     }
 }
 
@@ -1111,11 +1152,11 @@ pub fn parse_locked_virtual_package(raw: &str) -> Option<GenericVirtualPackage> 
     let build_string = parts.next().unwrap_or("").to_string();
     let name = PackageName::try_from(name_str).ok()?;
     let version = Version::from_str(version_str).ok()?;
-    Some(GenericVirtualPackage {
+    Some(normalize_virtual_package(GenericVirtualPackage {
         name,
         version,
         build_string,
-    })
+    }))
 }
 
 /// Insert any subdir default that is not already present in `declared` (by
@@ -1283,6 +1324,47 @@ mod tests {
             version: Version::major(version),
             build_string: microarchitecture.to_string(),
         }
+    }
+
+    /// CEP 30 ties an `__archspec` record's version to its build string: `1` for
+    /// a microarchitecture the database knows, `0` for an unknown one. Every
+    /// entry point stamps it, so the spellings a user can write collapse onto one
+    /// record instead of two platforms.
+    #[test]
+    fn archspec_version_follows_the_build_string() {
+        assert_eq!(archspec_version("skylake"), Version::major(1));
+        // Unknown, in each of its three encodings.
+        assert_eq!(archspec_version("0"), Version::major(0));
+        assert_eq!(archspec_version(""), Version::major(0));
+        assert_eq!(archspec_version("no_such_cpu"), Version::major(0));
+
+        // Whatever version a record arrives with, it leaves with the CEP 30 one.
+        let declared = |raw: &GenericVirtualPackage| {
+            PixiPlatform::new_with_defaults(
+                PixiPlatformName::try_from("rich").unwrap(),
+                Platform::Linux64,
+                vec![raw.clone()],
+            )
+            .unwrap()
+            .declared_virtual_packages()
+            .iter()
+            .find(|gvp| is_archspec(&gvp.name))
+            .unwrap()
+            .clone()
+        };
+        assert_eq!(declared(&archspec(0, "skylake")).version, Version::major(1));
+        assert_eq!(declared(&archspec(1, "skylake")).version, Version::major(1));
+        assert_eq!(declared(&archspec(1, "0")).version, Version::major(0));
+
+        // Including the subdir baseline, which pixi takes from the database.
+        assert_eq!(
+            subdir_default_virtual_packages(Platform::Linux64)
+                .iter()
+                .find(|gvp| is_archspec(&gvp.name))
+                .unwrap()
+                .version,
+            Version::major(1),
+        );
     }
 
     #[test]

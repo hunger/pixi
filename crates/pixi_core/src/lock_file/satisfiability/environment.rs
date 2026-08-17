@@ -177,7 +177,7 @@ pub fn verify_environment_satisfiability(
         // Capability multisets: neither lockfile ordering nor the CEP 30
         // `__archspec` provenance version is part of a platform's identity.
         let same_vps = locked_customised.is_some_and(|locked| {
-            pixi_manifest::platform::same_virtual_packages(&expected_customised, &locked)
+            pixi_manifest::platform::is_same_virtual_packages(&expected_customised, &locked)
         });
         if !same_subdir || !same_vps {
             return Err(EnvironmentUnsat::PlatformDefinitionChanged(

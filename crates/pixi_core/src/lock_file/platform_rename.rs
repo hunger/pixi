@@ -116,7 +116,10 @@ fn compute_renames(lock_file: &LockFile, manifest: &WorkspaceManifest) -> HashMa
 
         let mut matching = workspace_platforms.iter().filter(|wp| {
             wp.subdir() == locked.subdir()
-                && platform::same_virtual_packages(&workspace_customisations(wp), &locked_identity)
+                && platform::is_same_virtual_packages(
+                    &workspace_customisations(wp),
+                    &locked_identity,
+                )
         });
         let first = matching.next();
         let second = matching.next();

@@ -451,9 +451,10 @@ fn apply_archspec_override(packages: &mut Vec<GenericVirtualPackage>) {
         packages.retain(|p| p.name.as_normalized() != "__archspec");
         return;
     };
-    // CEP 30 reserves version 0 for a build string that echoes the subdir
-    // architecture. So replace version as well as build string.
-    let overridden = GenericVirtualPackage::from(overridden);
+    // Replace the version too: rattler stamps 1 unconditionally, where CEP 30
+    // reserves it for a microarchitecture the archspec database knows.
+    let overridden =
+        pixi_manifest::platform::normalize_virtual_package(GenericVirtualPackage::from(overridden));
     match packages
         .iter_mut()
         .find(|p| p.name.as_normalized() == "__archspec")
