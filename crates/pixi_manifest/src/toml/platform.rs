@@ -105,8 +105,8 @@ enum VirtualPackageValueKind {
     /// `build_string` is left empty.
     Version,
     /// The value is a microarchitecture string and lands in `build_string`;
-    /// `version` is forced to `0`. This is the shape upstream rattler expects
-    /// for `__archspec`.
+    /// `version` is forced to `0`, the CEP 30 provenance marker for a
+    /// microarchitecture pixi was told about rather than one it detected.
     Microarch,
 }
 
@@ -788,11 +788,9 @@ fn classify_virtual_packages(
         .iter()
         .filter(|gvp| {
             baseline.is_none_or(|base| {
-                !base.iter().any(|d| {
-                    d.name == gvp.name
-                        && d.version == gvp.version
-                        && d.build_string == gvp.build_string
-                })
+                !base
+                    .iter()
+                    .any(|default| crate::platform::is_same_virtual_package(default, gvp))
             })
         })
         .collect();
@@ -811,8 +809,10 @@ fn classify_virtual_packages(
             VirtualPackageValueKind::Version => {
                 package.build_string.is_empty() || package.build_string == "0"
             }
+            // The version is CEP 30 provenance metadata, so a host-detected
+            // `__archspec=1=zen4` still renders as `archspec = "zen4"`.
             VirtualPackageValueKind::Microarch => {
-                package.version == Version::major(0) && !package.build_string.is_empty()
+                crate::platform::archspec_microarchitecture(&package.build_string).is_some()
             }
         };
         if !fits {

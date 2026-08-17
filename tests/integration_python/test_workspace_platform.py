@@ -1331,6 +1331,73 @@ def test_list_respects_conda_override_cuda(pixi: Path, tmp_pixi_workspace: Path)
     assert "cuda=12.0" in out.stdout
 
 
+def _archspec_support_line(pixi: Path, workspace: Path, microarchitecture: str) -> str:
+    """The `list` row for the `needs-v3` platform with the host's
+    microarchitecture overridden to `microarchitecture`."""
+    out = verify_cli_command(
+        [
+            str(pixi),
+            "workspace",
+            "--manifest-path",
+            str(workspace / "pixi.toml"),
+            "platform",
+            "list",
+        ],
+        env={"CONDA_OVERRIDE_ARCHSPEC": microarchitecture},
+        strip_ansi=True,
+    )
+    line = next(
+        (line for line in out.stdout.splitlines() if line.startswith("needs-v3:")),
+        None,
+    )
+    assert line is not None, out.stdout
+    return line
+
+
+def test_list_matches_archspec_through_the_microarch_dag(
+    pixi: Path, tmp_pixi_workspace: Path
+) -> None:
+    """A declared microarchitecture is a baseline: a host that descends from
+    it in the archspec graph supports the platform, one below it does not."""
+    _seed_workspace(tmp_pixi_workspace)
+    _run_platform(
+        pixi,
+        tmp_pixi_workspace,
+        "add",
+        f"needs-v3={CURRENT_PLATFORM}",
+        "--archspec",
+        "x86_64_v3",
+        "--no-install",
+    )
+
+    marker = " (supported by current machine)"
+    # `skylake` descends from `x86_64_v3`.
+    assert _archspec_support_line(pixi, tmp_pixi_workspace, "skylake").endswith(marker)
+    # `nocona` predates it.
+    assert not _archspec_support_line(pixi, tmp_pixi_workspace, "nocona").endswith(marker)
+    # A host that reports no microarchitecture cannot rule the platform out.
+    assert _archspec_support_line(pixi, tmp_pixi_workspace, "0").endswith(marker)
+
+
+def test_list_reports_an_unknown_archspec_override(pixi: Path, tmp_pixi_workspace: Path) -> None:
+    """A microarchitecture the archspec database doesn't know is ignored with
+    a warning rather than silently producing a host nothing matches."""
+    _seed_workspace(tmp_pixi_workspace)
+    verify_cli_command(
+        [
+            str(pixi),
+            "workspace",
+            "--manifest-path",
+            str(tmp_pixi_workspace / "pixi.toml"),
+            "platform",
+            "list",
+        ],
+        env={"CONDA_OVERRIDE_ARCHSPEC": "x86-64-v3"},
+        stderr_contains=["CONDA_OVERRIDE_ARCHSPEC", "x86_64_v3"],
+        strip_ansi=True,
+    )
+
+
 def test_list_respects_conda_override_cuda_arch(pixi: Path, tmp_pixi_workspace: Path) -> None:
     """`CONDA_OVERRIDE_CUDA_ARCH` overrides host auto-detection of the
     `__cuda_arch` virtual package. rattler couples the two CUDA packages:

@@ -96,6 +96,27 @@ Each inline-table entry has:
   not `x86-64-v3`). A CPU newer than the bundled database can't be named until
   Pixi ships an updated archspec; set `archspec = "0"` to declare the
   microarchitecture explicitly unknown.
+
+    A declared `archspec` is a *baseline*, matched through the archspec
+    microarchitecture graph: the platform is available on any CPU that is the
+    named microarchitecture or descends from it, because a newer CPU runs code
+    built for an older baseline. A `skylake` host therefore matches
+    `archspec = "x86_64_v3"`, while a `haswell` host does not match
+    `archspec = "skylake"`. Microarchitectures of different families are never
+    compatible, so an `osx-64` platform declaring an x86 microarchitecture does
+    not match an Apple Silicon host running it under Rosetta; name one with
+    `CONDA_OVERRIDE_ARCHSPEC` to install anyway. A host that cannot report its
+    own microarchitecture at all matches any declared one, with a warning.
+
+    Platforms are selected in declaration order, so listing the most specific
+    microarchitecture first gives you automatic best-variant selection:
+
+    ```toml title="pixi.toml"
+    platforms = [
+      { name = "fast", platform = "linux-64", archspec = "x86_64_v4" },
+      { name = "portable", platform = "linux-64" },
+    ]
+    ```
 - `cuda` also accepts a `{ driver, arch }` table that declares the CUDA driver
   version (`__cuda`) together with the GPU compute capability (`__cuda_arch`):
 

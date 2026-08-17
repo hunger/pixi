@@ -17,7 +17,7 @@ use url::Url;
 use super::pypi::pypi_options::PypiOptions;
 use crate::{
     PixiPlatform, PixiPlatformName, PrioritizedChannel, S3Options, TargetSelector, Targets,
-    platform::{capability_satisfied_by, is_subdir_default},
+    platform::{capability_satisfied_by, is_subdir_default, warn_once_if_archspec_undetectable},
     preview::Preview,
 };
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
@@ -166,6 +166,10 @@ impl Workspace {
         // CI on a different host, etc.). Only the user-customised VPs
         // need to be satisfied by the host.
         let satisfies_system = |p: &&PixiPlatform| {
+            warn_once_if_archspec_undetectable(
+                p.declared_virtual_packages(),
+                system_virtual_packages,
+            );
             p.declared_virtual_packages()
                 .iter()
                 .filter(|declared| !is_subdir_default(declared, p.subdir()))

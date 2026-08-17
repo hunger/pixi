@@ -4,12 +4,14 @@ use std::ops::Deref;
 use std::str::FromStr;
 
 use archspec::cpu::Microarchitecture;
+use itertools::Itertools;
 use pixi_default_versions::{
     default_glibc_version, default_linux_version, default_mac_os_version, default_windows_version,
 };
 use rattler_conda_types::{GenericVirtualPackage, PackageName, Platform, Version};
 use rattler_virtual_packages::{
-    Archspec, DetectVirtualPackageError, Override, VirtualPackageOverrides, VirtualPackages,
+    Archspec, DetectVirtualPackageError, EnvOverride, Override, VirtualPackageOverrides,
+    VirtualPackages,
 };
 
 use crate::TargetSelector;
@@ -511,7 +513,7 @@ impl PixiPlatform {
         let overrides = overrides_from_declared(&self.declared_virtual_packages);
         let mut detected = VirtualPackages::detect_for_platform(self.subdir, &overrides)?;
         // rattler's libc override slot is glibc-only, so a declared `__musl`/
-        // `__eglibc` comes back labelled `glibc`. Relabel it to the declared
+        // `__eglibc` comes back labeled `glibc`. Relabel it to the declared
         // family so the configured libc survives into the detected output.
         if let Some(libc) = detected.libc.as_mut()
             && let Some(family) = declared_libc_family(&self.declared_virtual_packages)
@@ -537,15 +539,11 @@ impl PixiPlatform {
         &self.declared_virtual_packages
     }
 
-    /// The declared virtual packages with the subdir defaults filtered out --
-    /// the part of the platform that reflects user/machine intent rather than
-    /// pixi's per-subdir baseline. This is the set that defines a platform's
-    /// identity (see [`Self::has_same_definition`]).
+    /// The declared virtual packages with the subdir defaults filtered out
     ///
-    /// Build strings are canonicalised (`"0"` -> `""`): rattler's detection
-    /// uses `"0"` as the placeholder build for version-only virtual packages
-    /// (`__glibc`, `__linux`, ...), while the manifest's friendly form drops it
-    /// entirely, so the two must compare equal.
+    /// Placeholder build strings are canonicalized (`"0"` -> `""`) so a detected
+    /// record and the manifest's friendly form compare equal; `__archspec` keeps
+    /// its build string, where `"0"` means "unknown microarchitecture".
     pub fn customised_virtual_packages(&self) -> Vec<GenericVirtualPackage> {
         self.declared_virtual_packages
             .iter()
@@ -553,7 +551,9 @@ impl PixiPlatform {
             .map(|gvp| GenericVirtualPackage {
                 name: gvp.name.clone(),
                 version: gvp.version.clone(),
-                build_string: if gvp.build_string == "0" {
+                build_string: if is_archspec(&gvp.name) {
+                    gvp.build_string.clone()
+                } else if gvp.build_string == PLACEHOLDER_BUILD_STRING {
                     String::new()
                 } else {
                     gvp.build_string.clone()
@@ -563,18 +563,17 @@ impl PixiPlatform {
     }
 
     /// Two platforms share a *definition* when they target the same subdir and
-    /// declare the same customised virtual packages; names are irrelevant. This
+    /// declare the same customized virtual packages; names are irrelevant. This
     /// is what makes two differently-named entries duplicates of each other, and
     /// mirrors the comparison the lock-file satisfiability check uses.
     pub fn has_same_definition(&self, other: &PixiPlatform) -> bool {
         if self.subdir != other.subdir {
             return false;
         }
-        let mut a = self.customised_virtual_packages();
-        let mut b = other.customised_virtual_packages();
-        a.sort();
-        b.sort();
-        a == b
+        is_same_virtual_packages(
+            &self.customised_virtual_packages(),
+            &other.customised_virtual_packages(),
+        )
     }
 
     /// Apply an in-place edit to this platform.
@@ -794,27 +793,136 @@ pub fn subdir_default_virtual_packages(subdir: Platform) -> Vec<GenericVirtualPa
     defaults
 }
 
-/// Returns `true` if `gvp` is exactly the value `subdir_default_virtual_packages`
-/// would emit for `subdir`.
-///  Used by the TOML layer to elide default-matching
-/// virtual packages from synthesized names and on-disk serialization, and by
-/// the lock-file satisfiability check to compare only the user-customized
-/// virtual packages.
+/// Returns `true` if `gvp` declares the same capability as one of the values
+/// `subdir_default_virtual_packages` emits for `subdir`.
 pub fn is_subdir_default(gvp: &GenericVirtualPackage, subdir: Platform) -> bool {
-    subdir_default_virtual_packages(subdir).iter().any(|d| {
-        d.name == gvp.name && d.version == gvp.version && d.build_string == gvp.build_string
-    })
+    subdir_default_virtual_packages(subdir)
+        .iter()
+        .any(|default| is_same_virtual_package(default, gvp))
 }
 
-/// Returns `true` when `system` provides the capability `required` names: a
-/// virtual package of the same name at a version at least as high.
+/// The build string rattler's detection emits for a virtual package that has no
+/// build information
+const PLACEHOLDER_BUILD_STRING: &str = "0";
+
+/// `true` when `build_string` carries no build information.
+fn is_placeholder_build_string(build_string: &str) -> bool {
+    build_string.is_empty() || build_string == PLACEHOLDER_BUILD_STRING
+}
+
+/// `true` for the `__archspec` virtual package, whose build string names a CPU
+/// microarchitecture instead of describing a build.
+pub fn is_archspec(name: &PackageName) -> bool {
+    name.as_normalized() == "__archspec"
+}
+
+/// Returns `true` when `a` and `b` declare the same capability
+/// `__archspec` compares by microarchitecture alone, since CEP 30 makes its
+/// version a provenance marker (`0` for a baseline pixi assumed
+/// from the subdir, `1` for one rattler detected on the host).
+pub fn is_same_virtual_package(a: &GenericVirtualPackage, b: &GenericVirtualPackage) -> bool {
+    if a.name != b.name {
+        return false;
+    }
+    if is_archspec(&a.name) {
+        archspec_microarchitecture(&a.build_string) == archspec_microarchitecture(&b.build_string)
+    } else {
+        a.version == b.version
+            && (a.build_string == b.build_string
+                || is_placeholder_build_string(&a.build_string)
+                    && is_placeholder_build_string(&b.build_string))
+    }
+}
+
+/// Returns `true` when `a` and `b` declare the same capabilities, compared as
+/// multi-sets with [`is_same_virtual_package`]: order is never part of a platform's
+/// identity, in a manifest or in a lock file.
+pub fn is_same_virtual_packages(a: &[GenericVirtualPackage], b: &[GenericVirtualPackage]) -> bool {
+    fn by_name(packages: &[GenericVirtualPackage]) -> Vec<&GenericVirtualPackage> {
+        packages
+            .iter()
+            .sorted_by(|a, b| a.name.as_normalized().cmp(b.name.as_normalized()))
+            .collect_vec()
+    }
+
+    a.len() == b.len()
+        && by_name(a)
+            .into_iter()
+            .zip(by_name(b))
+            .all(|(a, b)| is_same_virtual_package(a, b))
+}
+
+/// Returns `true` when `system` provides the capability `required`.
 pub fn capability_satisfied_by(
     required: &GenericVirtualPackage,
     system: &[GenericVirtualPackage],
 ) -> bool {
-    system
+    let Some(provided) = system
         .iter()
-        .any(|provided| provided.name == required.name && provided.version >= required.version)
+        .find(|provided| provided.name == required.name)
+    else {
+        return false;
+    };
+    if is_archspec(&required.name) {
+        return archspec_capability_satisfied(&required.build_string, &provided.build_string);
+    }
+    provided.version >= required.version
+        && (is_placeholder_build_string(&required.build_string)
+            || provided.build_string == required.build_string)
+}
+
+/// Whether a host reporting the microarchitecture `host` can run code built for
+/// `required`, both as `__archspec` build strings. A host that cannot name its
+/// own matches permissively and callers report that case via
+/// [`archspec_undetectable`].
+fn archspec_capability_satisfied(required: &str, host: &str) -> bool {
+    match archspec_from_build_string(host) {
+        Archspec::Unknown => true,
+        host @ Archspec::Microarchitecture(_) => {
+            host.is_compatible_with(&archspec_from_build_string(required))
+        }
+    }
+}
+
+/// `true` when `required` names a microarchitecture but the system reports its
+/// own as unknown.
+/// A system with no `__archspec` at all is an ordinary missing virtual package.
+pub fn archspec_undetectable(
+    required: &GenericVirtualPackage,
+    system: &[GenericVirtualPackage],
+) -> bool {
+    is_archspec(&required.name)
+        && archspec_microarchitecture(&required.build_string).is_some()
+        && system.iter().any(|provided| {
+            provided.name == required.name
+                && archspec_microarchitecture(&provided.build_string).is_none()
+        })
+}
+
+/// Report -- once per process, since platform matching runs many times per
+/// command -- that a declared `__archspec` cannot be verified because `system`
+/// does not name its own microarchitecture.
+pub fn warn_once_if_archspec_undetectable(
+    declared: &[GenericVirtualPackage],
+    system: &[GenericVirtualPackage],
+) {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+
+    let Some(required) = declared
+        .iter()
+        .find(|declared| archspec_undetectable(declared, system))
+    else {
+        return;
+    };
+    REPORTED.call_once(|| {
+        tracing::warn!(
+            "This machine does not report a CPU microarchitecture, so the declared \
+             '__archspec' of '{}' cannot be verified; assuming it is available. Set \
+             {} to name the microarchitecture explicitly.",
+            required.build_string,
+            Archspec::DEFAULT_ENV_NAME,
+        );
+    });
 }
 
 /// The entries of `required` that `system` does not provide, in order.
@@ -834,7 +942,7 @@ pub fn unsatisfied_capabilities(
 /// serializes `Archspec::Unknown` as). The single owner of that encoding;
 /// validate and render through this rather than re-testing the strings.
 pub fn archspec_microarchitecture(build_string: &str) -> Option<&str> {
-    if build_string.is_empty() || build_string == "0" {
+    if is_placeholder_build_string(build_string) {
         None
     } else {
         Some(build_string)
@@ -1089,6 +1197,84 @@ mod tests {
             .declared_virtual_packages()
             .iter()
             .any(|gvp| gvp.name.as_normalized() == name)
+    }
+
+    fn archspec(version: u64, microarchitecture: &str) -> GenericVirtualPackage {
+        GenericVirtualPackage {
+            name: PackageName::try_from("__archspec").unwrap(),
+            version: Version::major(version),
+            build_string: microarchitecture.to_string(),
+        }
+    }
+
+    #[test]
+    fn declared_archspec_matches_a_descendant_host() {
+        let declared = archspec(0, "x86_64_v3");
+
+        assert!(capability_satisfied_by(
+            &declared,
+            &[archspec(1, "skylake")]
+        ));
+        assert!(capability_satisfied_by(
+            &declared,
+            &[archspec(1, "x86_64_v3")]
+        ));
+        // An older baseline is not enough...
+        assert!(!capability_satisfied_by(
+            &declared,
+            &[archspec(1, "x86_64_v2")]
+        ));
+        // ...and neither is a CPU from another family.
+        assert!(!capability_satisfied_by(&declared, &[archspec(1, "m1")]));
+        // No `__archspec` at all is an ordinary missing virtual package.
+        assert!(!capability_satisfied_by(&declared, &[]));
+    }
+
+    #[test]
+    fn undetectable_host_archspec_matches_and_is_reported() {
+        let declared = archspec(0, "skylake");
+        let unknown_host = [archspec(1, "0")];
+
+        assert!(capability_satisfied_by(&declared, &unknown_host));
+        assert!(archspec_undetectable(&declared, &unknown_host));
+        // A host that does name one is verifiable, met or not.
+        assert!(!archspec_undetectable(&declared, &[archspec(1, "zen4")]));
+        assert!(!archspec_undetectable(&declared, &[]));
+    }
+
+    #[test]
+    fn archspec_identity_ignores_the_provenance_version() {
+        assert!(is_same_virtual_package(
+            &archspec(0, "x86_64"),
+            &archspec(1, "x86_64")
+        ));
+        assert!(!is_same_virtual_package(
+            &archspec(1, "x86_64"),
+            &archspec(1, "zen4")
+        ));
+        assert!(is_subdir_default(&archspec(1, "x86_64"), Platform::Linux64));
+        assert!(!is_subdir_default(&archspec(1, "zen4"), Platform::Linux64));
+    }
+
+    #[test]
+    fn capability_matching_honors_build_strings() {
+        let with_build = |build: &str| GenericVirtualPackage {
+            build_string: build.to_string(),
+            ..gvp("__cuda", "12")
+        };
+
+        assert!(capability_satisfied_by(
+            &with_build("real"),
+            &[with_build("real")]
+        ));
+        assert!(!capability_satisfied_by(
+            &with_build("real"),
+            &[with_build("other")]
+        ));
+        assert!(capability_satisfied_by(
+            &gvp("__cuda", "12"),
+            &[with_build("real")]
+        ));
     }
 
     #[test]
