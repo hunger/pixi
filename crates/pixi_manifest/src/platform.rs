@@ -6,7 +6,6 @@ use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 
 use archspec::cpu::Microarchitecture;
-use itertools::Itertools;
 use pixi_default_versions::{
     default_glibc_version, default_linux_version, default_mac_os_version, default_windows_version,
 };
@@ -894,41 +893,47 @@ pub fn normalize_virtual_packages(
 /// satisfiability. `__archspec` compares by microarchitecture alone, since CEP 30
 /// makes its version a provenance marker rather than a constraint.
 pub fn is_same_virtual_package(a: &GenericVirtualPackage, b: &GenericVirtualPackage) -> bool {
-    virtual_package_identity(a) == virtual_package_identity(b)
+    if a.name != b.name {
+        return false;
+    }
+    if is_archspec(&a.name) {
+        // The microarchitecture is the whole identity; the CEP 30 version is
+        // provenance, and both unknown spellings mean the same thing.
+        return archspec_microarchitecture(&a.build_string)
+            == archspec_microarchitecture(&b.build_string);
+    }
+    // `Version`'s own equality, which is semantic: `2.28` and `2.28.0` are one
+    // version. Comparing rendered strings instead would split them.
+    a.version == b.version
+        && (a.build_string == b.build_string
+            || is_placeholder_build_string(&a.build_string)
+                && is_placeholder_build_string(&b.build_string))
 }
 
 /// Returns `true` when `a` and `b` declare the same capabilities, compared as
 /// multi-sets with [`is_same_virtual_package`]: order is never part of a platform's
 /// identity, in a manifest or in a lock file.
 pub fn is_same_virtual_packages(a: &[GenericVirtualPackage], b: &[GenericVirtualPackage]) -> bool {
-    // Sorting by name alone leaves same-named entries in input order, which pairs
-    // them up wrongly, so compare the sorted identities instead.
-    fn identities(packages: &[GenericVirtualPackage]) -> Vec<String> {
-        packages
+    if a.len() != b.len() {
+        return false;
+    }
+    // Pair each entry off against an unclaimed one rather than sorting: the
+    // element comparison is semantic, so no ordering key agrees with it. A
+    // platform declares a handful of virtual packages, so the quadratic walk
+    // costs nothing.
+    let mut unclaimed: Vec<&GenericVirtualPackage> = b.iter().collect();
+    a.iter().all(|left| {
+        match unclaimed
             .iter()
-            .map(virtual_package_identity)
-            .sorted()
-            .collect_vec()
-    }
-
-    a.len() == b.len() && identities(a) == identities(b)
-}
-
-/// The identity [`is_same_virtual_package`] compares: a string that is equal for
-/// two records exactly when they declare the same capability.
-fn virtual_package_identity(gvp: &GenericVirtualPackage) -> String {
-    let name = gvp.name.as_normalized();
-    if is_archspec(&gvp.name) {
-        // The microarchitecture is the whole identity; the CEP 30 version is
-        // provenance, and the two unknown spellings mean the same thing.
-        let microarchitecture =
-            archspec_microarchitecture(&gvp.build_string).unwrap_or(UNKNOWN_ARCHSPEC);
-        return format!("{name}={microarchitecture}");
-    }
-    if is_placeholder_build_string(&gvp.build_string) {
-        return format!("{name}={}", gvp.version);
-    }
-    format!("{name}={}={}", gvp.version, gvp.build_string)
+            .position(|right| is_same_virtual_package(left, right))
+        {
+            Some(index) => {
+                unclaimed.swap_remove(index);
+                true
+            }
+            None => false,
+        }
+    })
 }
 
 /// Returns `true` when `system` provides the capability `required`.
@@ -1709,6 +1714,38 @@ mod tests {
             undetectable_archspec(&declares_v4, &unknown_host),
             Some("x86_64_v4"),
         );
+    }
+
+    /// Conda versions compare semantically -- `2.28` and `2.28.0` are the same
+    /// version -- so they have to be the same capability. Rendering the version
+    /// into a string to compare quietly makes them different, which turns the
+    /// subdir baseline into something a user can restate and get a second,
+    /// identical platform out of.
+    #[test]
+    fn capability_identity_compares_versions_semantically() {
+        assert!(is_same_virtual_package(
+            &gvp("__glibc", "2.28"),
+            &gvp("__glibc", "2.28.0")
+        ));
+        assert!(is_same_virtual_packages(
+            &[gvp("__glibc", "2.28")],
+            &[gvp("__glibc", "2.28.0")]
+        ));
+        // `default_glibc_version()` is 2.28, so the padded spelling is just as
+        // much a subdir default as the bare one.
+        assert!(is_subdir_default(
+            &gvp("__glibc", "2.28"),
+            Platform::Linux64
+        ));
+        assert!(is_subdir_default(
+            &gvp("__glibc", "2.28.0"),
+            Platform::Linux64
+        ));
+        // A genuinely different version is still different.
+        assert!(!is_same_virtual_package(
+            &gvp("__glibc", "2.28"),
+            &gvp("__glibc", "2.28.1")
+        ));
     }
 
     /// `is_same_virtual_packages` says it compares multi-sets, so entries in a
