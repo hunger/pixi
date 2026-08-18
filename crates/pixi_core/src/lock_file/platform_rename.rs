@@ -105,7 +105,9 @@ fn compute_renames(lock_file: &LockFile, manifest: &WorkspaceManifest) -> HashMa
 
     for locked in lock_file.platforms() {
         let locked_name = locked.name().to_string();
-        let locked_identity = locked_customisations(&locked);
+        let Some(locked_identity) = locked_customisations(&locked) else {
+            continue;
+        };
 
         // Already named what some manifest platform asks for? Leave it alone:
         // a different manifest entry might match by identity, but renaming it
@@ -165,17 +167,28 @@ fn workspace_customisations(platform: &PixiPlatform) -> Vec<GenericVirtualPackag
 }
 
 /// Identity-matching VPs for a locked platform: parse the lockfile's
-/// `__name=version[=build]` strings back into [`GenericVirtualPackage`]s and
-/// drop the entries that match the subdir's defaults. Strings that don't parse
-/// are dropped -- the workspace side can't have a corresponding entry anyway.
-fn locked_customisations(locked: &rattler_lock::Platform<'_>) -> Vec<GenericVirtualPackage> {
+/// `__name=version[=build]` strings back into [`GenericVirtualPackage`]s and drop
+/// the entries that match the subdir's defaults.
+///
+/// `None` when any entry does not parse. Such a row has an unknown definition, so
+/// it must not match a manifest platform -- dropping the entry instead would let
+/// the row be renamed onto a name whose contents were never compared. This is the
+/// same verdict the satisfiability check reaches for the same input.
+fn locked_customisations(
+    locked: &rattler_lock::Platform<'_>,
+) -> Option<Vec<GenericVirtualPackage>> {
     let subdir = locked.subdir();
-    locked
+    let parsed: Option<Vec<GenericVirtualPackage>> = locked
         .virtual_packages()
         .iter()
-        .filter_map(|raw| platform::parse_locked_virtual_package(raw))
-        .filter(|gvp| !platform::is_subdir_default(gvp, subdir))
-        .collect()
+        .map(|raw| platform::parse_locked_virtual_package(raw))
+        .collect();
+    Some(
+        parsed?
+            .into_iter()
+            .filter(|gvp| !platform::is_subdir_default(gvp, subdir))
+            .collect(),
+    )
 }
 
 #[derive(Debug, Error)]
@@ -596,5 +609,38 @@ packages:
         );
         LockFile::from_str_with_base_directory(&rendered, Some(Path::new("/")))
             .expect("rebuilt lockfile should round-trip through the on-disk format");
+    }
+
+    /// A locked row carrying a virtual package pixi cannot parse has an unknown
+    /// definition, so it must not be adopted as a manifest platform. The
+    /// satisfiability check treats exactly this case as a changed definition; the
+    /// rename pass has to agree, or it renames a row onto a name whose contents it
+    /// never actually matched.
+    #[test]
+    fn an_unreadable_locked_virtual_package_blocks_the_rename() {
+        let manifest = manifest(
+            r#"
+            [workspace]
+            name = "unreadable"
+            channels = []
+            platforms = [{ name = "gpu", platform = "linux-64", cuda = "12.0" }]
+            "#,
+        );
+        let lock = lockfile_with(
+            "stale",
+            Platform::Linux64,
+            vec![
+                "__cuda=12.0".to_string(),
+                "this is not a virtual package".to_string(),
+            ],
+        );
+
+        let aligned = align_platform_names(lock, &manifest, Path::new("/"));
+
+        assert!(
+            aligned.platform("stale").is_some(),
+            "a row with an unreadable virtual package was adopted as the manifest's platform"
+        );
+        assert!(aligned.platform("gpu").is_none());
     }
 }
