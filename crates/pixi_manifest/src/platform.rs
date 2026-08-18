@@ -267,6 +267,14 @@ pub enum PixiPlatformError {
     IsSubdirPlatform,
     #[error("`__cuda_arch` requires `__cuda` to be declared as well")]
     CudaArchRequiresCuda,
+    #[error(
+        "'{microarchitecture}' belongs to the {family} CPU family, which no '{subdir}' machine reports"
+    )]
+    ArchspecFamilyMismatch {
+        microarchitecture: String,
+        family: String,
+        subdir: Platform,
+    },
 }
 
 /// `true` when the declared set names `__cuda_arch` but not `__cuda`. Conda's
@@ -432,6 +440,12 @@ impl PixiPlatform {
         if declares_cuda_arch_without_cuda(&declared_virtual_packages) {
             return Err(PixiPlatformError::CudaArchRequiresCuda);
         }
+        if let Some(mismatch) = declared_virtual_packages
+            .iter()
+            .find_map(|declared| archspec_subdir_family_mismatch(declared, subdir))
+        {
+            return Err(mismatch);
+        }
         Ok(Self {
             name,
             subdir,
@@ -503,7 +517,14 @@ impl PixiPlatform {
     ) -> Result<Self, PixiPlatformError> {
         // Normalised up front so a detected `__archspec=1=zen4` synthesises the
         // same name a manifest's `archspec = "zen4"` does.
-        let customised_virtual_packages = normalize_virtual_packages(customised_virtual_packages);
+        let mut customised_virtual_packages =
+            normalize_virtual_packages(customised_virtual_packages);
+        // Cross-compiling detects the host's microarchitecture while targeting
+        // another family's subdir. That says nothing about the target, so drop it
+        // rather than writing out a platform no machine can select.
+
+        customised_virtual_packages
+            .retain(|declared| archspec_subdir_family_mismatch(declared, subdir).is_none());
         let name = name.unwrap_or_else(|| {
             PixiPlatformName(crate::toml::platform::synthesize_name_string(
                 subdir,
@@ -1143,6 +1164,38 @@ pub fn archspec_override_suggestion(required: Option<&StringMatcher>) -> Option<
     }
 }
 
+/// The CPU family `name` belongs to (`x86_64`, `aarch64`, ...), for a
+/// microarchitecture the archspec database knows.
+///
+/// The database is a DAG with one root per family, and compatibility is a
+/// node-set superset test, so two microarchitectures from different families are
+/// never compatible in either direction.
+fn archspec_family(name: &str) -> Option<&'static str> {
+    Microarchitecture::known_targets()
+        .get(name)
+        .map(|microarchitecture| microarchitecture.family().name())
+}
+
+/// The family mismatch between `declared` and `subdir`'s own baseline, if any.
+///
+/// A declared microarchitecture from another family describes a machine that
+/// cannot run `subdir` at all, so the platform it defines is one nothing will ever
+/// select. `None` when there is nothing to object to: the record names no
+/// microarchitecture, or either side is a name the database does not model.
+pub fn archspec_subdir_family_mismatch(
+    declared: &GenericVirtualPackage,
+    subdir: Platform,
+) -> Option<PixiPlatformError> {
+    let microarchitecture = archspec_microarchitecture_of(declared)?;
+    let declared_family = archspec_family(microarchitecture)?;
+    let subdir_family = subdir_baseline_microarchitecture(subdir).and_then(archspec_family)?;
+    (declared_family != subdir_family).then(|| PixiPlatformError::ArchspecFamilyMismatch {
+        microarchitecture: microarchitecture.to_string(),
+        family: declared_family.to_string(),
+        subdir,
+    })
+}
+
 /// The microarchitecture an `__archspec` record names, or `None` for any other
 /// virtual package (and for an explicitly unknown microarchitecture).
 pub fn archspec_microarchitecture_of(package: &GenericVirtualPackage) -> Option<&str> {
@@ -1407,6 +1460,41 @@ mod tests {
             version: Version::major(version),
             build_string: microarchitecture.to_string(),
         }
+    }
+
+    /// Cross-compiling detects the host's microarchitecture against another
+    /// family's subdir. A declaration like that is rejected, but detection is not
+    /// the user's mistake, so the inapplicable record is dropped and the rest of
+    /// the detected platform survives.
+    #[test]
+    fn detection_drops_a_microarchitecture_from_another_family() {
+        let detected = |subdir| {
+            PixiPlatform::from_detection(
+                None,
+                subdir,
+                vec![archspec(1, "zen5"), gvp("__cuda", "12.0")],
+            )
+            .unwrap()
+        };
+
+        let microarchitecture = |platform: &PixiPlatform| {
+            platform
+                .declared_virtual_packages()
+                .iter()
+                .find(|gvp| is_archspec(&gvp.name))
+                .and_then(archspec_microarchitecture_of)
+                .map(ToString::to_string)
+        };
+
+        // The host's x86 microarchitecture is replaced by the subdir's own
+        // baseline, and everything else detected survives.
+        let cross = detected(Platform::LinuxAarch64);
+        assert_eq!(microarchitecture(&cross).as_deref(), Some("aarch64"));
+        assert!(declares(&cross, "__cuda"));
+
+        // On a subdir of the same family it is kept as detected.
+        let native = detected(Platform::Linux64);
+        assert_eq!(microarchitecture(&native).as_deref(), Some("zen5"));
     }
 
     /// A requirement naming a microarchitecture the bundled database is too old

@@ -95,7 +95,10 @@ Each inline-table entry has:
   cannot contain `-`, so the spelling uses underscores and dots (`x86_64_v3`,
   not `x86-64-v3`). A CPU newer than the bundled database can't be named until
   Pixi ships an updated archspec; set `archspec = "0"` to declare the
-  microarchitecture explicitly unknown.
+  microarchitecture explicitly unknown. The name also has to belong to the
+  subdir's own CPU family, the way `glibc` is only accepted on linux subdirs --
+  `archspec = "m1"` on a `linux-64` entry names a machine that cannot run
+  `linux-64` at all.
 
     A declared `archspec` is a *baseline*, matched through the archspec
     microarchitecture graph: the platform is available on any CPU that is the

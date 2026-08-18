@@ -1445,6 +1445,35 @@ mod test {
         );
     }
 
+    /// A microarchitecture from another CPU family describes a machine that can
+    /// never run the subdir, so the entry is rejected rather than written out as a
+    /// platform nothing selects. Mirrors the subdir gating `glibc`, `linux`,
+    /// `macos` and `windows` already get.
+    #[test]
+    fn test_workspace_platform_archspec_must_match_the_subdir_family() {
+        let rendered = format_parse_error(
+            r#"platform = { platform = "linux-64", archspec = "m1" }"#,
+            TopLevel::from_toml_str(r#"platform = { platform = "linux-64", archspec = "m1" }"#)
+                .unwrap_err(),
+        );
+        assert!(
+            rendered.contains("'m1'") && rendered.contains("aarch64"),
+            "expected a family mismatch naming the microarchitecture, got: {rendered}"
+        );
+
+        // Same family in either direction is fine, as is a microarchitecture on a
+        // subdir whose baseline the database does not model.
+        for input in [
+            r#"platform = { platform = "linux-64", archspec = "zen5" }"#,
+            r#"platform = { platform = "linux-aarch64", archspec = "m1" }"#,
+            r#"platform = { platform = "linux-s390x", archspec = "zen5" }"#,
+            r#"platform = { platform = "linux-64", archspec = "0" }"#,
+        ] {
+            TopLevel::from_toml_str(input)
+                .unwrap_or_else(|error| panic!("'{input}' must parse: {error:?}"));
+        }
+    }
+
     /// A nameless entry that spells out nothing beyond the subdir baseline is
     /// the bare subdir platform, not an error. The two placeholder build-string
     /// spellings (absent and `"0"`) mean the same thing, so a raw entry using
