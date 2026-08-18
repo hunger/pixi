@@ -105,11 +105,16 @@ Each inline-table entry has:
     named microarchitecture or descends from it, because a newer CPU runs code
     built for an older baseline. A `skylake` host therefore matches
     `archspec = "x86_64_v3"`, while a `haswell` host does not match
-    `archspec = "skylake"`. Microarchitectures of different families are never
-    compatible, so an `osx-64` platform declaring an x86 microarchitecture does
-    not match an Apple Silicon host running it under Rosetta; name one with
-    `CONDA_OVERRIDE_ARCHSPEC` to install anyway. A host that cannot report its
-    own microarchitecture at all matches any declared one, with a warning.
+    `archspec = "skylake"`.
+
+    Matching only ever *rules out* a host Pixi can actually compare. A host that
+    reports no microarchitecture, or one from another CPU family, matches any
+    declared microarchitecture, with a warning -- the graph has one root per
+    family, so it relates the two by nothing. That is the emulation case: an
+    Apple Silicon machine running an `osx-64` environment under Rosetta reports
+    `m1`, and what an emulator provides is not something Pixi can read off the
+    graph. Set `CONDA_OVERRIDE_ARCHSPEC` to the microarchitecture the emulator
+    presents if you want the check to apply.
 
     Platforms are selected in declaration order, so listing the most specific
     microarchitecture first gives you automatic best-variant selection:

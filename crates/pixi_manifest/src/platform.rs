@@ -951,21 +951,50 @@ pub fn capability_satisfied_by(
 }
 
 /// Whether a host reporting the microarchitecture `host` can run code built for
-/// `required`, both as `__archspec` build strings. A host that cannot name its
-/// own matches permissively and callers report that case via
-/// [`archspec_undetectable`].
+/// `required`, both as `__archspec` build strings. A host pixi cannot compare
+/// against -- see [`archspec_is_unverifiable_by`] -- matches permissively rather
+/// than being stranded, and callers report it via [`archspec_undetectable`].
 fn archspec_capability_satisfied(required: &str, host: &str) -> bool {
-    match archspec_from_build_string(host) {
-        Archspec::Unknown => true,
-        host @ Archspec::Microarchitecture(_) => {
-            host.is_compatible_with(&archspec_from_build_string(required))
-        }
+    if archspec_is_unverifiable_by(required, host) {
+        return true;
+    }
+    archspec_from_build_string(host).is_compatible_with(&archspec_from_build_string(required))
+}
+
+/// Whether a host reporting `host` gives pixi no basis to judge a `required`
+/// microarchitecture, so the only honest answer is to match and say so.
+///
+/// Two cases, and they are the same case: the host names no microarchitecture, or
+/// it names one from another CPU family. A cross-family pair means the host is
+/// emulating the subdir -- Rosetta on Apple Silicon, Prism on Windows on ARM --
+/// and the archspec graph has one root per family, so it relates the two by
+/// nothing. `false` there is not a comparison pixi made, it is the absence of one,
+/// and refusing on it strands environments the emulator can in fact run.
+///
+/// What each emulator actually provides is not something pixi can know: Rosetta 2
+/// covers `x86_64_v2` but not `x86_64_v3`, and Prism gained AVX2 in a Windows
+/// update. Hardcoding those tables would age exactly the way the bundled archspec
+/// database does.
+fn archspec_is_unverifiable_by(required: &str, host: &str) -> bool {
+    let (Some(required), Some(host)) = (
+        archspec_microarchitecture(required),
+        archspec_microarchitecture(host),
+    ) else {
+        // An unknown host cannot verify anything; an unconstrained requirement
+        // needs no verifying, and its caller already matched.
+        return true;
+    };
+    match (archspec_family(required), archspec_family(host)) {
+        (Some(required), Some(host)) => required != host,
+        // A name the database does not model has no family to compare.
+        _ => true,
     }
 }
 
-/// `true` when `required` names a microarchitecture but the system reports its
-/// own as unknown.
-/// A system with no `__archspec` at all is an ordinary missing virtual package.
+/// `true` when `required` names a microarchitecture the system gives pixi no way
+/// to check it against -- it reports none of its own, or one from another CPU
+/// family -- the case [`capability_satisfied_by`] matches permissively. A system
+/// with no `__archspec` at all is an ordinary missing virtual package.
 pub fn archspec_undetectable(
     required: &GenericVirtualPackage,
     system: &[GenericVirtualPackage],
@@ -974,7 +1003,7 @@ pub fn archspec_undetectable(
         && archspec_microarchitecture(&required.build_string).is_some()
         && system.iter().any(|provided| {
             provided.name == required.name
-                && archspec_microarchitecture(&provided.build_string).is_none()
+                && archspec_is_unverifiable_by(&required.build_string, &provided.build_string)
         })
 }
 
@@ -1018,8 +1047,8 @@ pub fn warn_once_if_archspec_undetectable(
         return;
     }
     tracing::warn!(
-        "Platform '{}' declares the microarchitecture '{microarchitecture}', but this machine \
-         reports none to compare it against; assuming it is available.",
+        "Platform '{}' declares the microarchitecture '{microarchitecture}', which cannot be \
+         compared against what this machine reports; assuming it is available.",
         platform.name(),
     );
 }
@@ -1053,7 +1082,7 @@ pub fn archspec_microarchitecture(build_string: &str) -> Option<&str> {
 /// baseline a package was built for, so any descendant host can run it: an exact
 /// name goes through the DAG, a pattern is tried against the host and its
 /// ancestors. No matcher constrains nothing; so does one naming nothing the
-/// archspec database knows, and so does an unknown host.
+/// archspec database knows, and so does a host pixi cannot compare against.
 pub fn archspec_requirement_satisfied(
     required: Option<&StringMatcher>,
     host_build_string: &str,
@@ -1064,15 +1093,17 @@ pub fn archspec_requirement_satisfied(
     if !archspec_requirement_is_known(required) {
         return true;
     }
-    let host = archspec_from_build_string(host_build_string);
-    match host {
-        Archspec::Unknown => true,
-        Archspec::Microarchitecture(_) => match required {
-            StringMatcher::Exact(name) => {
-                host.is_compatible_with(&archspec_from_build_string(name))
-            }
-            matcher => archspec_pattern_matches(matcher, host_build_string),
-        },
+    match required {
+        StringMatcher::Exact(name) => archspec_capability_satisfied(name, host_build_string),
+        matcher => {
+            // A pattern names a set of microarchitectures rather than one, so ask
+            // whether any of them is comparable against this host at all.
+            let comparable = Microarchitecture::known_targets()
+                .keys()
+                .filter(|name| matcher.matches(name))
+                .any(|name| !archspec_is_unverifiable_by(name, host_build_string));
+            !comparable || archspec_pattern_matches(matcher, host_build_string)
+        }
     }
 }
 
@@ -1462,6 +1493,36 @@ mod tests {
         }
     }
 
+    /// A host from another CPU family is emulating the subdir (Rosetta, Prism).
+    /// The graph relates the two by nothing, so pixi has no basis to refuse and
+    /// matches permissively -- the same stance it takes for a host that cannot name
+    /// its microarchitecture at all.
+    #[test]
+    fn an_emulating_host_is_not_refused() {
+        let declared = archspec(1, "x86_64_v2");
+        let rosetta = [archspec(1, "m1")];
+
+        assert!(
+            capability_satisfied_by(&declared, &rosetta),
+            "an Apple Silicon host running an x86_64 subdir under Rosetta is not a mismatch \
+             pixi can judge"
+        );
+        assert!(archspec_undetectable(&declared, &rosetta));
+        // Requirements read the same way.
+        let matcher = StringMatcher::from_str("^(x86_64_v2)$").unwrap();
+        assert!(archspec_requirement_satisfied(Some(&matcher), "m1"));
+
+        // Within one family it still discriminates.
+        assert!(!capability_satisfied_by(
+            &declared,
+            &[archspec(1, "nocona")]
+        ));
+        assert!(capability_satisfied_by(
+            &declared,
+            &[archspec(1, "skylake")]
+        ));
+    }
+
     /// Cross-compiling detects the host's microarchitecture against another
     /// family's subdir. A declaration like that is rejected, but detection is not
     /// the user's mistake, so the inapplicable record is dropped and the rest of
@@ -1605,8 +1666,8 @@ mod tests {
             &declared,
             &[archspec(1, "x86_64_v2")]
         ));
-        // ...and neither is a CPU from another family.
-        assert!(!capability_satisfied_by(&declared, &[archspec(1, "m1")]));
+        // A CPU from another family is a different story -- see
+        // `an_emulating_host_is_not_refused`.
         // No `__archspec` at all is an ordinary missing virtual package.
         assert!(!capability_satisfied_by(&declared, &[]));
     }
