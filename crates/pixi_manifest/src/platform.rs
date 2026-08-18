@@ -1207,9 +1207,17 @@ pub fn archspec_override_suggestion(required: Option<&StringMatcher>) -> Option<
 /// node-set superset test, so two microarchitectures from different families are
 /// never compatible in either direction.
 fn archspec_family(name: &str) -> Option<&'static str> {
-    Microarchitecture::known_targets()
+    let family = Microarchitecture::known_targets()
         .get(name)
-        .map(|microarchitecture| microarchitecture.family().name())
+        .map(|microarchitecture| microarchitecture.family().name())?;
+    // The database roots 32-bit `x86` separately from `x86_64`, but x86_64
+    // hardware executes x86 code -- which is why pixi treats `win-32` as runnable
+    // on a `win-64` host in `candidate_subdirs`. Fold the two into one lineage so
+    // a 32-bit subdir can name the microarchitecture its machines actually report.
+    Some(match family {
+        "x86" => "x86_64",
+        other => other,
+    })
 }
 
 /// The family mismatch between `declared` and `subdir`'s own baseline, if any.

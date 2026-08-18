@@ -1462,8 +1462,13 @@ mod test {
         );
 
         // Same family in either direction is fine, as is a microarchitecture on a
-        // subdir whose baseline the database does not model.
+        // subdir whose baseline the database does not model. A 32-bit x86 subdir
+        // runs on x86_64 hardware, so both spellings of that lineage are fine
+        // there too.
         for input in [
+            r#"platform = { platform = "win-32", archspec = "x86_64_v2" }"#,
+            r#"platform = { platform = "linux-32", archspec = "skylake" }"#,
+            r#"platform = { platform = "linux-64", archspec = "i686" }"#,
             r#"platform = { platform = "linux-64", archspec = "zen5" }"#,
             r#"platform = { platform = "linux-aarch64", archspec = "m1" }"#,
             r#"platform = { platform = "linux-s390x", archspec = "zen5" }"#,
