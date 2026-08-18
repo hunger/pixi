@@ -9,7 +9,6 @@ use pixi_manifest::{
     },
 };
 use pypi_modifiers::pypi_tags::{PyPITagError, get_tags_from_machine, is_python_record};
-use rattler_conda_types::ParseMatchSpecError;
 use rattler_conda_types::ParseStrictness::Lenient;
 use rattler_conda_types::{
     GenericVirtualPackage, MatchSpec, Matches, Platform, StringMatcher, Version, VersionSpec,
@@ -82,9 +81,6 @@ pub enum MachineValidationError {
     #[error(transparent)]
     RepodataConversionError(#[from] ConversionError),
 
-    #[error("Couldn't parse dependencies")]
-    DependencyParsingError(#[from] ParseMatchSpecError),
-
     #[error("Can't find environment: {0}")]
     EnvironmentNotFound(String),
 
@@ -102,17 +98,26 @@ pub enum MachineValidationError {
     NoPythonRecordFound(PixiPlatformName),
 }
 
-/// Get the required virtual packages from dependency strings.
-pub(crate) fn get_required_virtual_packages_from_depends(
-    depends: &[&str],
-) -> Result<Vec<MatchSpec>, MachineValidationError> {
+/// The virtual-package requirements `depends` places on the machine.
+///
+/// Read what can be read and drop the rest, loudly: an entry pixi cannot parse
+/// costs that entry only. Failing the whole set would turn one malformed line in
+/// a lock file into a host check that enforces nothing.
+pub(crate) fn get_required_virtual_packages_from_depends(depends: &[&str]) -> Vec<MatchSpec> {
     depends
         .iter()
         .filter(|dep| dep.starts_with("__"))
-        .map(|dep| MatchSpec::from_str(dep, Lenient))
         .dedup()
-        .collect::<Result<Vec<MatchSpec>, _>>()
-        .map_err(MachineValidationError::DependencyParsingError)
+        .filter_map(|dep| {
+            MatchSpec::from_str(dep, Lenient)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        "Ignoring unreadable virtual-package requirement '{dep}': {error}"
+                    );
+                })
+                .ok()
+        })
+        .collect()
 }
 
 /// The requirements in `specs` that `system` does not satisfy, in order.
@@ -223,11 +228,7 @@ pub(crate) fn compute_required_virtual_package_specs(
 /// The specs are kept verbatim rather than folded into one concrete virtual
 /// package per name.
 pub fn required_virtual_package_specs(depends: &[&str]) -> Vec<MatchSpec> {
-    let Ok(specs) = get_required_virtual_packages_from_depends(depends) else {
-        return Vec::new();
-    };
-
-    specs
+    get_required_virtual_packages_from_depends(depends)
         .into_iter()
         // A spec with a non-exact name matches nothing we can check.
         .filter(|spec| spec.name.as_exact().is_some())
@@ -295,7 +296,7 @@ pub(crate) fn validate_system_meets_environment_requirements(
         .collect_vec();
 
     // Get the virtual packages required by the conda records
-    let required_virtual_packages = get_required_virtual_packages_from_depends(&all_depends)?;
+    let required_virtual_packages = get_required_virtual_packages_from_depends(&all_depends);
 
     // Find the python package record (needed for wheel tag validation below).
     // This works for binary and full source packages; partial source records
@@ -412,7 +413,7 @@ mod test {
             .map(|s| s.as_str())
             .collect();
 
-        let virtual_matchspecs = get_required_virtual_packages_from_depends(&all_depends).unwrap();
+        let virtual_matchspecs = get_required_virtual_packages_from_depends(&all_depends);
 
         assert!(
             virtual_matchspecs
@@ -573,6 +574,27 @@ packages:
         assert_eq!(
             unmet_requirements(&[spec("__cuda 12 other")], &cuda, Platform::Linux64).len(),
             1
+        );
+    }
+
+    /// A `depends` entry pixi cannot parse costs that entry, not every other
+    /// requirement alongside it. Dropping the lot turns the whole host check into
+    /// a pass, which is the failure mode the marker path already guards against.
+    #[test]
+    fn one_unreadable_depends_entry_keeps_the_others() {
+        let depends = [
+            "__cuda >=12",
+            // Too large for a conda version component, so it cannot be read.
+            "__glibc >=99999999999999999999",
+            "__archspec 1 x86_64_v3",
+        ];
+
+        assert_eq!(
+            required_virtual_package_specs(&depends)
+                .iter()
+                .map(ToString::to_string)
+                .collect_vec(),
+            vec!["__archspec ==1 x86_64_v3", "__cuda >=12"],
         );
     }
 
