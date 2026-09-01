@@ -224,7 +224,7 @@ fn strip_comments(cmake_lists: &str) -> String {
         if escaped {
             stripped.push(character);
             escaped = false;
-        } else if character == '\\' && quoted {
+        } else if character == '\\' {
             stripped.push(character);
             escaped = true;
         } else if character == '"' {
@@ -399,6 +399,20 @@ project(demo LANGUAGES CXX)
     fn test_call_inside_a_string_is_ignored() {
         let cmake_lists =
             "set(HELP \"run project(fake LANGUAGES Fortran) first\")\nproject(demo LANGUAGES C)\n";
+
+        assert_eq!(languages(cmake_lists), Some(vec!["C".to_string()]));
+    }
+
+    /// An escaped quote in an unquoted argument does not open a string, so
+    /// the comment after it is still a comment.
+    #[test]
+    fn test_escaped_quote_in_an_unquoted_argument() {
+        let cmake_lists = concat!(
+            r#"add_definitions(-DGREETING=\"hello\")"#,
+            "\n",
+            "# project(fake LANGUAGES Fortran)\n",
+            "project(demo LANGUAGES C)\n"
+        );
 
         assert_eq!(languages(cmake_lists), Some(vec!["C".to_string()]));
     }
