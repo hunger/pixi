@@ -221,7 +221,13 @@ fn split_arguments(arguments: &str) -> Option<Vec<String>> {
 
     for character in arguments.chars() {
         if escaped {
-            token.push(character);
+            // CMake's encoded escapes; every other escape means the character.
+            token.push(match character {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                other => other,
+            });
             escaped = false;
         } else if character == '\\' {
             escaped = true;
@@ -521,6 +527,19 @@ project(demo LANGUAGES CXX)
         let declaration = parse_project(r#"project(demo DESCRIPTION "a;b" LANGUAGES C)"#)
             .expect("the call should be found");
         assert_eq!(declaration.description.as_deref(), Some("a;b"));
+    }
+
+    /// CMake reads `\n` as a newline and `\"` as a quote, not as `n` and `"`.
+    #[test]
+    fn test_escape_sequences_are_decoded() {
+        let declaration =
+            parse_project(r#"project(demo DESCRIPTION "one\ntwo \"quoted\"" LANGUAGES C)"#)
+                .expect("the call should be found");
+
+        assert_eq!(
+            declaration.description.as_deref(),
+            Some("one\ntwo \"quoted\"")
+        );
     }
 
     #[test]
