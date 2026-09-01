@@ -23,6 +23,8 @@ pub struct ProjectDeclaration {
 /// Returns what the `project()` call in `cmake_lists` declares, or `None` if
 /// the file contains no `project()` call.
 pub fn parse_project(cmake_lists: &str) -> Option<ProjectDeclaration> {
+    // A byte order mark would hide the first line from the line-based search.
+    let cmake_lists = cmake_lists.strip_prefix('\u{feff}').unwrap_or(cmake_lists);
     let arguments = project_arguments(&strip_comments(cmake_lists))?;
 
     // The first argument is the project name, the rest describes the project.
@@ -128,12 +130,14 @@ fn find_command(cmake_lists: &str, name: &str) -> Option<usize> {
             continue;
         }
 
-        // Reject identifiers that merely end in the command name.
-        let preceded_by_identifier = lowercased[..start]
+        // A command invocation only ever starts a line, so anything but
+        // whitespace before the name on its line makes it argument text.
+        let at_line_start = lowercased[..start]
             .chars()
-            .next_back()
-            .is_some_and(|character| character.is_alphanumeric() || character == '_');
-        if preceded_by_identifier {
+            .rev()
+            .take_while(|&character| character != '\n')
+            .all(char::is_whitespace);
+        if !at_line_start {
             continue;
         }
 
@@ -539,6 +543,28 @@ project(demo LANGUAGES CXX)
         assert_eq!(
             declaration.description.as_deref(),
             Some("one\ntwo \"quoted\"")
+        );
+    }
+
+    /// A command invocation only ever starts a line, so a `project(` inside
+    /// another call's arguments is argument text.
+    #[test]
+    fn test_call_inside_another_calls_arguments_is_ignored() {
+        let cmake_lists = "set(P C:\\project(x))\nproject(demo LANGUAGES C)";
+
+        assert_eq!(languages(cmake_lists), Some(vec!["C".to_string()]));
+
+        let cmake_lists = "cmake_parse_arguments(project (x))\nproject(demo LANGUAGES C)";
+
+        assert_eq!(languages(cmake_lists), Some(vec!["C".to_string()]));
+    }
+
+    /// A byte order mark does not keep the first line from holding a call.
+    #[test]
+    fn test_byte_order_mark_is_skipped() {
+        assert_eq!(
+            languages("\u{feff}project(demo LANGUAGES C)"),
+            Some(vec!["C".to_string()])
         );
     }
 
