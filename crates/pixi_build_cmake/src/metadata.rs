@@ -81,13 +81,40 @@ impl CMakeMetadataProvider {
     fn resolved(&mut self, field: fn(&ProjectDeclaration) -> Option<&String>) -> Option<String> {
         let value = self.declaration().and_then(field)?;
 
-        if value.contains("${") || value.contains('@') {
+        if value.contains("${") || contains_at_reference(value) {
             tracing::debug!("ignoring the unresolved project() value `{value}`");
             return None;
         }
 
         Some(value.clone())
     }
+}
+
+/// Says whether `value` holds an unexpanded `@VAR@` reference, which is a
+/// variable name between two `@` signs.
+fn contains_at_reference(value: &str) -> bool {
+    let mut rest = value;
+
+    while let Some(start) = rest.find('@') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('@') else {
+            return false;
+        };
+
+        let name = &rest[..end];
+        let is_variable_name = !name.is_empty()
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character));
+        if is_variable_name {
+            return true;
+        }
+
+        // The second `@` may still open a reference of its own.
+        rest = &rest[end..];
+    }
+
+    false
 }
 
 impl MetadataProvider for CMakeMetadataProvider {
@@ -182,6 +209,24 @@ mod tests {
             provider.homepage().unwrap().as_deref(),
             Some("https://example.com"),
             "a resolved value next to an unresolved one is still reported"
+        );
+    }
+
+    /// An `@` on its own does not make a value an unexpanded `@VAR@`
+    /// reference.
+    #[test]
+    fn test_a_lone_at_sign_is_not_a_reference() {
+        let (_root, mut provider) = provider(
+            r#"project(demo DESCRIPTION "maintained by @octocat" HOMEPAGE_URL "https://example.com/~user@2")"#,
+        );
+
+        assert_eq!(
+            provider.description().unwrap().as_deref(),
+            Some("maintained by @octocat")
+        );
+        assert_eq!(
+            provider.homepage().unwrap().as_deref(),
+            Some("https://example.com/~user@2")
         );
     }
 
