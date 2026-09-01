@@ -233,6 +233,11 @@ fn split_arguments(arguments: &str) -> Option<Vec<String>> {
             }
         } else if quoted {
             token.push(character);
+        } else if character == ';' {
+            // An unquoted semicolon separates the elements of a CMake list.
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
         } else if character.is_whitespace() || character == ')' {
             if !token.is_empty() {
                 tokens.push(std::mem::take(&mut token));
@@ -502,6 +507,20 @@ project(demo LANGUAGES CXX)
         let cmake_lists = "set(X [[a # b \"]])\nproject(demo LANGUAGES C)";
 
         assert_eq!(languages(cmake_lists), Some(vec!["C".to_string()]));
+    }
+
+    /// An unquoted `C;CXX` is a CMake list holding two languages, while a
+    /// quoted or escaped semicolon is just a character.
+    #[test]
+    fn test_semicolon_separated_language_list() {
+        assert_eq!(
+            languages("project(demo LANGUAGES C;CXX)"),
+            Some(vec!["C".to_string(), "CXX".to_string()])
+        );
+
+        let declaration = parse_project(r#"project(demo DESCRIPTION "a;b" LANGUAGES C)"#)
+            .expect("the call should be found");
+        assert_eq!(declaration.description.as_deref(), Some("a;b"));
     }
 
     #[test]
