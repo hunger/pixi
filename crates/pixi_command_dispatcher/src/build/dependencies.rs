@@ -215,6 +215,11 @@ impl Dependencies {
     ) -> Self {
         for (package_name, run_exports) in build_run_exports {
             for (name, spec) in run_exports.strong.iter_specs() {
+                // The same requirement exported by several packages, such as
+                // libgcc by both compilers, is one dependency.
+                if contains_spec(&self.dependencies, name, spec) {
+                    continue;
+                }
                 self.dependencies.insert(
                     name.clone(),
                     WithSource::new(spec.clone()).with_source(DependencySource::RunExport {
@@ -225,6 +230,9 @@ impl Dependencies {
             }
 
             for (name, spec) in run_exports.strong_constrains.iter_specs() {
+                if contains_spec(&self.constraints, name, spec) {
+                    continue;
+                }
                 self.constraints.insert(
                     name.clone(),
                     WithSource::new(spec.clone()).with_source(DependencySource::RunExport {
@@ -263,21 +271,19 @@ impl Dependencies {
             };
             ($target:expr, $run_exports:expr, $export_type:ident, $env:expr) => {
                 for (package_name, run_exports) in $run_exports.iter_mut() {
-                    $target.extend(
-                        std::mem::take(&mut run_exports.$export_type)
-                            .into_specs()
-                            .map(|(name, spec)| {
-                                (
-                                    name,
-                                    WithSource::new(spec).with_source(
-                                        DependencySource::RunExport {
-                                            name: package_name.clone(),
-                                            env: $env,
-                                        },
-                                    ),
-                                )
-                            }),
-                    );
+                    for (name, spec) in std::mem::take(&mut run_exports.$export_type).into_specs() {
+                        // The same requirement exported by several packages,
+                        // such as libgcc by both compilers, is one dependency.
+                        if !contains_spec(&$target, &name, &spec) {
+                            $target.insert(
+                                name,
+                                WithSource::new(spec).with_source(DependencySource::RunExport {
+                                    name: package_name.clone(),
+                                    env: $env,
+                                }),
+                            );
+                        }
+                    }
                 }
             };
         }
@@ -420,6 +426,17 @@ impl Dependencies {
 
         Ok(combined_run_exports)
     }
+}
+
+/// Says whether `map` already holds `spec` for `name`, no matter where that
+/// entry came from.
+fn contains_spec<T: Clone + Hash + Eq>(
+    map: &DependencyMap<PackageName, WithSource<T>>,
+    name: &PackageName,
+    spec: &T,
+) -> bool {
+    map.get(name)
+        .is_some_and(|specs| specs.iter().any(|existing| existing.value == *spec))
 }
 
 pub fn filter_match_specs<T: From<BinarySpec> + Clone + Hash + Eq + PartialEq>(
@@ -655,6 +672,45 @@ mod tests {
 
     use super::{Dependencies, PixiRunExports, convert_extra_dependencies, filter_match_specs};
     use pixi_record::PixiRecord;
+    use rattler_conda_types::Platform;
+
+    /// Two packages exporting the same requirement, such as the c and cxx
+    /// compilers both exporting `libgcc >=15`, must produce one run
+    /// dependency, not a duplicated `depends` entry.
+    #[test]
+    fn identical_run_exports_from_two_packages_are_merged() {
+        let ignore = CondaOutputIgnoreRunExports::default();
+        let strong_exports = |specs: &[String]| PixiRunExports {
+            strong: filter_match_specs(specs, &ignore),
+            ..Default::default()
+        };
+        let build_run_exports = vec![
+            (
+                PackageName::from_str("gcc_linux-64").unwrap(),
+                strong_exports(&["libgcc >=15".to_string()]),
+            ),
+            (
+                PackageName::from_str("gxx_linux-64").unwrap(),
+                strong_exports(&["libgcc >=15".to_string(), "libstdcxx >=15".to_string()]),
+            ),
+        ];
+
+        let run_dependencies = Dependencies::default().extend_with_run_exports_from_build_and_host(
+            vec![],
+            build_run_exports,
+            Platform::Linux64,
+        );
+
+        let libgcc_specs = run_dependencies
+            .dependencies
+            .get(&PackageName::from_str("libgcc").unwrap())
+            .expect("libgcc is a run dependency");
+        assert_eq!(
+            libgcc_specs.len(),
+            1,
+            "the identical exports must merge into one spec, got {libgcc_specs:?}"
+        );
+    }
 
     fn binary_record(name: &str, version: &str, run_exports: RunExportsJson) -> PixiRecord {
         let mut pr = PackageRecord::new(
