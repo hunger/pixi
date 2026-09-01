@@ -148,30 +148,67 @@ fn find_command(cmake_lists: &str, name: &str) -> Option<usize> {
     None
 }
 
-/// Marks every byte that sits inside a quoted argument.
+/// Marks every byte that sits inside a quoted or bracket argument.
 ///
-/// Used to keep a command name that appears inside a string, such as a help
-/// text mentioning `project(...)`, from being read as a call.
+/// Used to keep a command name that appears inside a string or a bracket
+/// argument, such as a help text mentioning `project(...)`, from being read
+/// as a call.
 fn quoted_regions(cmake_lists: &str) -> Vec<bool> {
     let mut quoted = vec![false; cmake_lists.len()];
     let mut inside = false;
     let mut escaped = false;
+    let mut offset = 0;
 
-    for (offset, character) in cmake_lists.char_indices() {
+    while let Some(character) = cmake_lists[offset..].chars().next() {
         if escaped {
             escaped = false;
         } else if character == '\\' {
             escaped = true;
         } else if character == '"' {
             inside = !inside;
+        } else if character == '['
+            && !inside
+            && let Some(length) = bracket_argument_length(&cmake_lists[offset..])
+        {
+            for flag in &mut quoted[offset..offset + length] {
+                *flag = true;
+            }
+            offset += length;
+            continue;
         }
 
-        for flag in quoted.iter_mut().skip(offset).take(character.len_utf8()) {
+        for flag in &mut quoted[offset..offset + character.len_utf8()] {
             *flag = inside;
         }
+        offset += character.len_utf8();
     }
 
     quoted
+}
+
+/// Returns the length of the bracket argument opening at the start of `text`,
+/// terminator included and running to the end when there is no terminator, or
+/// `None` when no bracket argument opens here.
+fn bracket_argument_length(text: &str) -> Option<usize> {
+    let mut characters = text.chars();
+    if characters.next() != Some('[') {
+        return None;
+    }
+    let mut equals_signs = 0;
+    loop {
+        match characters.next() {
+            Some('=') => equals_signs += 1,
+            Some('[') => break,
+            _ => return None,
+        }
+    }
+
+    let opening = 2 + equals_signs;
+    let terminator = format!("]{}]", "=".repeat(equals_signs));
+    let length = text[opening..]
+        .find(&terminator)
+        .map_or(text.len(), |position| opening + position + terminator.len());
+    Some(length)
 }
 
 /// Splits the arguments of a command whose opening parenthesis was already
@@ -212,8 +249,8 @@ fn split_arguments(arguments: &str) -> Option<Vec<String>> {
     None
 }
 
-/// Removes line comments and bracket comments, leaving quoted arguments and
-/// the overall line structure intact.
+/// Removes line comments and bracket comments, leaving quoted arguments,
+/// bracket arguments and the overall line structure intact.
 fn strip_comments(cmake_lists: &str) -> String {
     let mut stripped = String::with_capacity(cmake_lists.len());
     let mut characters = cmake_lists.chars().peekable();
@@ -232,12 +269,22 @@ fn strip_comments(cmake_lists: &str) -> String {
             stripped.push(character);
         } else if character == '#' && !quoted {
             match take_bracket_marker(&mut characters) {
-                Some(equals_signs) => skip_bracket_comment(&mut characters, equals_signs),
+                Some(equals_signs) => {
+                    take_bracket_body(&mut characters, equals_signs);
+                }
                 None => {
                     while characters.peek().is_some_and(|&next| next != '\n') {
                         characters.next();
                     }
                 }
+            }
+        } else if character == '[' && !quoted {
+            // A bracket argument is raw text, so it is copied verbatim.
+            stripped.push(character);
+            if let Some(equals_signs) = take_bracket_marker_rest(&mut characters) {
+                stripped.push_str(&"=".repeat(equals_signs));
+                stripped.push('[');
+                stripped.push_str(&take_bracket_body(&mut characters, equals_signs));
             }
         } else {
             stripped.push(character);
@@ -254,10 +301,21 @@ fn take_bracket_marker(characters: &mut std::iter::Peekable<std::str::Chars>) ->
         return None;
     }
 
-    // Only commit to a bracket comment once the whole marker is present, so
-    // scan it on a copy of the iterator first.
     let mut lookahead = characters.clone();
     lookahead.next();
+    let equals_signs = take_bracket_marker_rest(&mut lookahead)?;
+    *characters = lookahead;
+    Some(equals_signs)
+}
+
+/// Consumes the `=*[` remainder of a bracket marker whose opening `[` was
+/// already consumed and returns the number of equals signs it uses, leaving
+/// the iterator untouched when no marker follows.
+fn take_bracket_marker_rest(
+    characters: &mut std::iter::Peekable<std::str::Chars>,
+) -> Option<usize> {
+    // Only commit once the whole marker is present, so scan a copy first.
+    let mut lookahead = characters.clone();
     let mut equals_signs = 0;
     loop {
         match lookahead.next() {
@@ -271,20 +329,23 @@ fn take_bracket_marker(characters: &mut std::iter::Peekable<std::str::Chars>) ->
     Some(equals_signs)
 }
 
-/// Consumes a bracket comment up to and including its `]=*]` terminator.
-fn skip_bracket_comment(
+/// Consumes a bracket's body up to and including its `]=*]` terminator and
+/// returns everything consumed.
+fn take_bracket_body(
     characters: &mut std::iter::Peekable<std::str::Chars>,
     equals_signs: usize,
-) {
+) -> String {
     let terminator = format!("]{}]", "=".repeat(equals_signs));
-    let mut seen = String::new();
+    let mut body = String::new();
 
     for character in characters {
-        seen.push(character);
-        if seen.ends_with(&terminator) {
-            return;
+        body.push(character);
+        if body.ends_with(&terminator) {
+            break;
         }
     }
+
+    body
 }
 
 #[cfg(test)]
@@ -413,6 +474,32 @@ project(demo LANGUAGES CXX)
             "# project(fake LANGUAGES Fortran)\n",
             "project(demo LANGUAGES C)\n"
         );
+
+        assert_eq!(languages(cmake_lists), Some(vec!["C".to_string()]));
+    }
+
+    /// A bracket argument is raw text, so a `project()` mentioned inside one
+    /// is not a call.
+    #[test]
+    fn test_call_inside_a_bracket_argument_is_ignored() {
+        let cmake_lists = "message([[project(fake LANGUAGES Fortran)]])\nproject(demo LANGUAGES C)";
+
+        assert_eq!(languages(cmake_lists), Some(vec!["C".to_string()]));
+
+        let cmake_lists = "message([=[project(fake) and ]] too]=])\nproject(demo LANGUAGES C)";
+
+        assert_eq!(languages(cmake_lists), Some(vec!["C".to_string()]));
+    }
+
+    /// A lone quote or comment character inside a bracket argument is raw
+    /// text and must not affect the rest of the file.
+    #[test]
+    fn test_bracket_argument_content_does_not_leak() {
+        let cmake_lists = "set(X [[say \"hello]])\nproject(demo LANGUAGES C)";
+
+        assert_eq!(languages(cmake_lists), Some(vec!["C".to_string()]));
+
+        let cmake_lists = "set(X [[a # b \"]])\nproject(demo LANGUAGES C)";
 
         assert_eq!(languages(cmake_lists), Some(vec!["C".to_string()]));
     }
