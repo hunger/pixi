@@ -84,6 +84,12 @@ impl GenerateRecipe for CMakeGenerator {
         let mut generated_recipe =
             GeneratedRecipe::from_model(model.clone(), &mut metadata).into_diagnostic()?;
 
+        // The recipe reads the project() call, so its metadata changes with
+        // the file, including when the file appears or disappears.
+        generated_recipe
+            .metadata_input_globs
+            .push("CMakeLists.txt".to_string());
+
         // we need to add compilers
 
         let requirements = &mut generated_recipe.recipe.requirements;
@@ -271,6 +277,40 @@ mod tests {
         ".source[0].path" => "[ ... path ... ]",
         ".build.script" => "[ ... script ... ]",
         });
+    }
+
+    /// Changing the project() call must invalidate cached metadata, so the
+    /// file it is read from has to be one of the metadata inputs.
+    #[tokio::test]
+    async fn test_cmake_lists_is_a_metadata_input() {
+        let project_model = project_fixture!({
+            "name": "foobar",
+            "version": "0.1.0",
+            "targets": {}
+        });
+
+        let generated_recipe = CMakeGenerator::default()
+            .generate_recipe(
+                &project_model,
+                &CMakeBackendConfig::default(),
+                PathBuf::from("."),
+                Platform::Linux64,
+                None,
+                &HashSet::new(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to generate recipe");
+
+        assert!(
+            generated_recipe
+                .metadata_input_globs
+                .contains(&"CMakeLists.txt".to_string())
+        );
     }
 
     #[tokio::test]
